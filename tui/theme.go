@@ -1,0 +1,520 @@
+package tui
+
+import (
+	"strings"
+
+	"github.com/gdamore/tcell/v2"
+	"github.com/rivo/tview"
+)
+
+// floatingOverlay 在保留当前页面的同时，将内容绘制在居中的矩形内。
+// Pages 仍向浮窗提供完整终端区域，使其在终端尺寸变化后自动重新居中。
+type floatingOverlay struct {
+	tview.Primitive
+	x, y, width, height   int
+	preferredWidth        int
+	preferredHeight       int
+	opaqueBackground      bool
+	opaqueBackgroundColor tcell.Color
+}
+
+func newFloatingOverlay(content tview.Primitive, width, height int) *floatingOverlay {
+	return &floatingOverlay{
+		Primitive:       content,
+		preferredWidth:  width,
+		preferredHeight: height,
+	}
+}
+
+func (overlay *floatingOverlay) SetPreferredSize(width, height int) {
+	if overlay == nil {
+		return
+	}
+	overlay.preferredWidth = width
+	overlay.preferredHeight = height
+}
+
+func (overlay *floatingOverlay) SetOpaqueBackground(color tcell.Color) *floatingOverlay {
+	if overlay != nil {
+		overlay.opaqueBackground = true
+		overlay.opaqueBackgroundColor = color
+	}
+	return overlay
+}
+
+func (overlay *floatingOverlay) SetRect(x, y, width, height int) {
+	overlay.x = x
+	overlay.y = y
+	overlay.width = width
+	overlay.height = height
+}
+
+func (overlay *floatingOverlay) GetRect() (int, int, int, int) {
+	return overlay.x, overlay.y, overlay.width, overlay.height
+}
+
+// 浮窗是模态交互。点击窗外或空白区域不能落到底层页面，触发另一项操作。
+func (overlay *floatingOverlay) MouseHandler() func(tview.MouseAction, *tcell.EventMouse, func(tview.Primitive)) (bool, tview.Primitive) {
+	return func(action tview.MouseAction, event *tcell.EventMouse, focus func(tview.Primitive)) (bool, tview.Primitive) {
+		if handler := overlay.Primitive.MouseHandler(); handler != nil {
+			_, capture := handler(action, event, focus)
+			return true, capture
+		}
+		return true, nil
+	}
+}
+
+func (overlay *floatingOverlay) Draw(screen tcell.Screen) {
+	width := min(overlay.preferredWidth, overlay.width)
+	height := min(overlay.preferredHeight, overlay.height)
+	if overlay.width > 4 {
+		width = min(width, overlay.width-4)
+	}
+	if overlay.height > 2 {
+		height = min(height, overlay.height-2)
+	}
+	x := overlay.x + (overlay.width-width)/2
+	y := overlay.y + (overlay.height-height)/2
+	if overlay.opaqueBackground {
+		style := tcell.StyleDefault.
+			Background(overlay.opaqueBackgroundColor).
+			Foreground(tview.Styles.PrimaryTextColor)
+		// 终端里的全角字符会占两个单元格。只清理浮窗自身矩形时，紧贴
+		// 左右边缘的底层全角字符仍可能把延伸单元格画到边框上。
+		// 多清理左右各一列作为隔离带，不改变浮窗本身的位置和尺寸。
+		clearLeft := max(x-1, overlay.x)
+		clearRight := min(x+width+1, overlay.x+overlay.width)
+		for row := y; row < y+height; row++ {
+			for column := clearLeft; column < clearRight; column++ {
+				screen.SetContent(column, row, ' ', nil, style)
+			}
+		}
+	}
+	overlay.Primitive.SetRect(x, y, max(width, 1), max(height, 1))
+	overlay.Primitive.Draw(screen)
+}
+
+func applyTheme() {
+	if noColor {
+		defaultColor := tcell.ColorDefault
+		tview.Styles = tview.Theme{
+			PrimitiveBackgroundColor:    defaultColor,
+			ContrastBackgroundColor:     defaultColor,
+			MoreContrastBackgroundColor: defaultColor,
+			BorderColor:                 defaultColor,
+			TitleColor:                  defaultColor,
+			GraphicsColor:               defaultColor,
+			PrimaryTextColor:            defaultColor,
+			SecondaryTextColor:          defaultColor,
+			TertiaryTextColor:           defaultColor,
+			InverseTextColor:            defaultColor,
+			ContrastSecondaryTextColor:  defaultColor,
+		}
+		accentColor = defaultColor
+		accentActiveColor = defaultColor
+		buttonTextColor = defaultColor
+		buttonActiveTextColor = defaultColor
+		mutedColor = defaultColor
+		errorColor = defaultColor
+		panelColor = defaultColor
+		formFieldColor = defaultColor
+		formFieldFocusColor = defaultColor
+		formSelectColor = defaultColor
+		autocompleteColor = defaultColor
+		autocompleteSelectedColor = defaultColor
+		autocompleteTextColor = defaultColor
+		autocompleteSelectedTextColor = defaultColor
+		return
+	}
+	tview.Styles = tview.Theme{
+		PrimitiveBackgroundColor:    tcell.NewHexColor(0xfff1f5),
+		ContrastBackgroundColor:     tcell.NewHexColor(0xfff9fb),
+		MoreContrastBackgroundColor: tcell.NewHexColor(0xffdce8),
+		BorderColor:                 tcell.NewHexColor(0xe1a4b7),
+		TitleColor:                  tcell.NewHexColor(0xb65f7b),
+		GraphicsColor:               tcell.NewHexColor(0xe58da7),
+		PrimaryTextColor:            tcell.NewHexColor(0x57414b),
+		SecondaryTextColor:          tcell.NewHexColor(0x7d626d),
+		TertiaryTextColor:           tcell.NewHexColor(0xa78996),
+		InverseTextColor:            tcell.NewHexColor(0xfff9fb),
+		ContrastSecondaryTextColor:  tcell.NewHexColor(0x987585),
+	}
+	accentColor = tcell.NewHexColor(0xe98eaa)
+	accentActiveColor = tcell.NewHexColor(0xc6537d)
+	buttonTextColor = tcell.NewHexColor(0x5c3948)
+	buttonActiveTextColor = tcell.NewHexColor(0xfff9fb)
+	mutedColor = tcell.NewHexColor(0xa27f90)
+	errorColor = tcell.NewHexColor(0xd65e78)
+	panelColor = tcell.NewHexColor(0xfff7fa)
+	formFieldColor = tcell.NewHexColor(0xe9e4ea)
+	formFieldFocusColor = tcell.NewHexColor(0xd8cbd9)
+	formSelectColor = tcell.NewHexColor(0xf3eef3)
+	autocompleteColor = tcell.NewHexColor(0xffeef4)
+	autocompleteSelectedColor = tcell.NewHexColor(0xffc7d9)
+	autocompleteTextColor = tcell.NewHexColor(0x684c5a)
+	autocompleteSelectedTextColor = tcell.NewHexColor(0x4f3544)
+}
+
+var noColor bool
+
+// SetNoColor 设置整个界面是否使用终端默认颜色。
+func SetNoColor(disabled bool) { noColor = disabled }
+
+func actionButtonStyle(active bool) tcell.Style {
+	if noColor {
+		style := tcell.StyleDefault
+		if active {
+			style = style.Reverse(true).Bold(true)
+		}
+		return style
+	}
+	if active {
+		return tcell.StyleDefault.Background(accentActiveColor).Foreground(buttonActiveTextColor).Bold(true)
+	}
+	return tcell.StyleDefault.Background(accentColor).Foreground(buttonTextColor)
+}
+
+func selectedItemStyle() tcell.Style {
+	if noColor {
+		return tcell.StyleDefault.Reverse(true).Bold(true)
+	}
+	return tcell.StyleDefault.Background(accentActiveColor).Foreground(buttonActiveTextColor).Bold(true)
+}
+
+func inactiveSelectedItemStyle() tcell.Style {
+	if noColor {
+		return tcell.StyleDefault.
+			Foreground(tcell.ColorDefault).
+			Background(tcell.ColorDefault).
+			Dim(true)
+	}
+	return selectedItemStyle()
+}
+
+func choiceStyle(selected bool) tcell.Style {
+	if noColor {
+		if selected {
+			return tcell.StyleDefault.Reverse(true).Bold(true)
+		}
+		return tcell.StyleDefault
+	}
+	if selected {
+		return tcell.StyleDefault.Foreground(autocompleteSelectedTextColor).Background(autocompleteSelectedColor)
+	}
+	return tcell.StyleDefault.Foreground(autocompleteTextColor).Background(autocompleteColor)
+}
+
+func themeColor(color tcell.Color) tcell.Color {
+	if noColor {
+		return tcell.ColorDefault
+	}
+	return color
+}
+
+func setFocusBorder(box *tview.Box, focused bool) {
+	if !focused {
+		box.SetBorderColor(tview.Styles.BorderColor)
+		box.SetBorderAttributes(tcell.AttrNone)
+		return
+	}
+	if noColor {
+		box.SetBorderColor(tcell.ColorDefault)
+		box.SetBorderAttributes(tcell.AttrNone)
+		return
+	}
+	box.SetBorderColor(accentActiveColor)
+	box.SetBorderAttributes(tcell.AttrBold)
+}
+
+func configureTableFocusStyle(table *tview.Table) {
+	if !noColor {
+		table.SetSelectedStyle(selectedItemStyle())
+		return
+	}
+	table.SetSelectedStyle(inactiveSelectedItemStyle())
+	table.SetFocusFunc(func() { table.SetSelectedStyle(selectedItemStyle()) })
+	table.SetBlurFunc(func() { table.SetSelectedStyle(inactiveSelectedItemStyle()) })
+}
+
+var (
+	accentColor                   = tcell.NewHexColor(0xe98eaa)
+	accentActiveColor             = tcell.NewHexColor(0xc6537d)
+	buttonTextColor               = tcell.NewHexColor(0x5c3948)
+	buttonActiveTextColor         = tcell.NewHexColor(0xfff9fb)
+	mutedColor                    = tcell.NewHexColor(0xa27f90)
+	errorColor                    = tcell.NewHexColor(0xd65e78)
+	panelColor                    = tcell.NewHexColor(0xfff7fa)
+	formFieldColor                = tcell.NewHexColor(0xe9e4ea)
+	formFieldFocusColor           = tcell.NewHexColor(0xd8cbd9)
+	formSelectColor               = tcell.NewHexColor(0xf3eef3)
+	autocompleteColor             = tcell.NewHexColor(0xffeef4)
+	autocompleteSelectedColor     = tcell.NewHexColor(0xffc7d9)
+	autocompleteTextColor         = tcell.NewHexColor(0x684c5a)
+	autocompleteSelectedTextColor = tcell.NewHexColor(0x4f3544)
+)
+
+func pageHeader(title, subtitle string) *tview.TextView {
+	header := tview.NewTextView()
+	header.SetDynamicColors(true)
+	header.SetTextAlign(tview.AlignCenter)
+	header.SetBackgroundColor(tview.Styles.PrimitiveBackgroundColor)
+	header.SetText("[::b][" + accentColor.String() + "]♡[-] " + title + " [" + accentColor.String() + "]♡[-][::-]\n[" + mutedColor.String() + "]" + subtitle + "[-]")
+	return header
+}
+
+func pageFooter(text string) *tview.TextView {
+	footer := tview.NewTextView()
+	footer.SetDynamicColors(true)
+	footer.SetTextAlign(tview.AlignCenter)
+	footer.SetText("[" + mutedColor.String() + "]" + text + "[-]")
+	return footer
+}
+
+func workspaceHeader(title string) *tview.TextView {
+	header := tview.NewTextView()
+	header.SetDynamicColors(true)
+	header.SetTextAlign(tview.AlignCenter)
+	header.SetBackgroundColor(tview.Styles.PrimitiveBackgroundColor)
+	header.SetText("[::b][" + accentColor.String() + "]" + tview.Escape(title) + "[-][::-]")
+	return header
+}
+
+func centeredPage(header, body, footer tview.Primitive) tview.Primitive {
+	return centeredPageWithGrid(header, body, footer, -1, -3, -1)
+}
+
+func wideFormPage(header, body, footer tview.Primitive) tview.Primitive {
+	return centeredPageWithGrid(header, body, footer, -1, -8, -1)
+}
+
+// tallWideFormPage 给开播前的配置页更多垂直空间，减少字段和 OBS 分组的滚动。
+func tallWideFormPage(header, body, footer tview.Primitive) tview.Primitive {
+	return centeredPageWithGrid(header, body, footer, -1, -16, -1)
+}
+
+func centeredPageWithGrid(header, body, footer tview.Primitive, top, middle, bottom int) tview.Primitive {
+	center := tview.NewGrid()
+	center.SetRows(top, middle, bottom)
+	center.SetColumns(-1, -5, -1)
+	center.SetBackgroundColor(tview.Styles.PrimitiveBackgroundColor)
+	center.AddItem(cuteMascot(), 1, 0, 1, 1, 0, mascotWidth(), false)
+	center.AddItem(body, 1, 1, 1, 1, 0, 0, true)
+	center.AddItem(cuteMascot(), 1, 2, 1, 1, 0, mascotWidth(), false)
+
+	root := tview.NewFlex()
+	root.SetDirection(tview.FlexRow)
+	root.SetBackgroundColor(tview.Styles.PrimitiveBackgroundColor)
+	if header != nil {
+		root.AddItem(header, 3, 0, false)
+	}
+	root.AddItem(center, 0, 1, true)
+	root.AddItem(footer, 1, 0, false)
+	return root
+}
+
+func workspacePage(header, body, footer tview.Primitive) tview.Primitive {
+	root := tview.NewFlex()
+	root.SetDirection(tview.FlexRow)
+	root.SetBackgroundColor(tview.Styles.PrimitiveBackgroundColor)
+	root.AddItem(header, 1, 0, false)
+	root.AddItem(body, 0, 1, true)
+	if footer != nil {
+		root.AddItem(footer, 1, 0, false)
+	}
+	return root
+}
+
+func styleForm(form *tview.Form, title string) *tview.Form {
+	form.SetBackgroundColor(panelColor)
+	form.SetBorder(true)
+	form.SetBorderColor(tview.Styles.BorderColor)
+	form.SetTitle(" " + title + " ")
+	form.SetTitleColor(tview.Styles.TitleColor)
+	form.SetItemPadding(1)
+	form.SetButtonsAlign(tview.AlignCenter)
+	form.SetLabelColor(tview.Styles.SecondaryTextColor)
+	form.SetFieldBackgroundColor(formFieldColor)
+	form.SetFieldTextColor(tview.Styles.PrimaryTextColor)
+	form.SetButtonStyle(actionButtonStyle(false))
+	form.SetButtonActivatedStyle(actionButtonStyle(true))
+	return form
+}
+
+func styleModal(modal *tview.Modal) *tview.Modal {
+	// Modal.SetBackgroundColor 只设置内部框体，嵌入的 Box 负责覆盖下方页面的区域。
+	// 两者都显式设置，避免弹窗边框区域透出弹幕内容。
+	modal.Box.SetBackgroundColor(panelColor)
+	modal.Box.SetBorderColor(tview.Styles.BorderColor)
+	return modal.
+		SetBackgroundColor(panelColor).
+		SetTextColor(tview.Styles.PrimaryTextColor).
+		SetButtonStyle(actionButtonStyle(false)).
+		SetButtonActivatedStyle(actionButtonStyle(true))
+}
+
+// confirmModal 提供统一的悬浮确认弹窗，基于 floatingOverlay 实现全不透明背景遮罩，
+// 彻底解决传统 tview.Modal 在低高度窗口下与下方输入框、操作栏边框穿插遮挡的问题。
+type confirmModal struct {
+	*floatingOverlay
+	panel   *tview.Flex
+	content *tview.TextView
+	form    *buttonGrid
+	done    func(buttonIndex int, buttonLabel string)
+}
+
+func newConfirmModal(title string) *confirmModal {
+	content := tview.NewTextView()
+	content.SetDynamicColors(true)
+	content.SetTextAlign(tview.AlignCenter)
+	content.SetWordWrap(true)
+	content.SetBackgroundColor(panelColor)
+	content.SetTextColor(tview.Styles.PrimaryTextColor)
+	content.SetBorderPadding(1, 0, 2, 2)
+
+	form := newButtonGrid(buttonGridColumns)
+
+	panel := tview.NewFlex().SetDirection(tview.FlexRow)
+	panel.SetBackgroundColor(panelColor)
+	panel.SetBorder(true)
+	panel.SetBorderColor(tview.Styles.BorderColor)
+	if strings.TrimSpace(title) != "" {
+		panel.SetTitle(" " + strings.TrimSpace(title) + " ")
+		panel.SetTitleColor(tview.Styles.TitleColor)
+	}
+	panel.AddItem(content, 0, 1, false)
+
+	actionArea := tview.NewFlex().SetDirection(tview.FlexRow)
+	actionArea.SetBackgroundColor(panelColor)
+	actionArea.AddItem(nil, 1, 0, false)
+	actionArea.AddItem(form, 0, 1, true)
+	panel.AddItem(actionArea, 1, 0, true)
+
+	const defaultWidth = 48
+	const defaultHeight = 7
+	overlay := newFloatingOverlay(panel, defaultWidth, defaultHeight).SetOpaqueBackground(panelColor)
+
+	cm := &confirmModal{
+		floatingOverlay: overlay,
+		panel:           panel,
+		content:         content,
+		form:            form,
+	}
+	form.AddChangedFunc(func() {
+		panel.ResizeItem(actionArea, form.PreferredHeight()+1, 0)
+		cm.updateSize()
+	})
+
+	form.SetCancelFunc(func() {
+		if cm.done != nil {
+			cm.done(-1, "")
+		}
+	})
+
+	return cm
+}
+
+func (cm *confirmModal) SetText(text string) *confirmModal {
+	if cm == nil {
+		return nil
+	}
+	cm.content.SetText(text)
+	cm.updateSize()
+	return cm
+}
+
+func (cm *confirmModal) AddButtons(labels []string) *confirmModal {
+	if cm == nil {
+		return nil
+	}
+	for i, label := range labels {
+		index := i
+		btnLabel := label
+		cm.form.AddButton(label, func() {
+			if cm.done != nil {
+				cm.done(index, btnLabel)
+			}
+		})
+	}
+	return cm
+}
+
+func (cm *confirmModal) ClearButtons() *confirmModal {
+	if cm == nil {
+		return nil
+	}
+	cm.form.ClearButtons()
+	cm.updateSize()
+	return cm
+}
+
+func (cm *confirmModal) SetDoneFunc(handler func(buttonIndex int, buttonLabel string)) *confirmModal {
+	if cm == nil {
+		return nil
+	}
+	cm.done = handler
+	return cm
+}
+
+func (cm *confirmModal) HasFocus() bool {
+	if cm == nil {
+		return false
+	}
+	return cm.form.HasFocus() || cm.panel.HasFocus()
+}
+
+func (cm *confirmModal) Focus(delegate func(p tview.Primitive)) {
+	if cm == nil || delegate == nil {
+		return
+	}
+	delegate(cm.form)
+}
+
+func (cm *confirmModal) SetFocus(index int) *confirmModal {
+	if cm != nil {
+		cm.form.SetFocus(index)
+	}
+	return cm
+}
+
+func (cm *confirmModal) updateSize() {
+	if cm == nil {
+		return
+	}
+	width := max(46, cm.form.PreferredWidth()+6)
+	if width > 76 {
+		width = 76
+	}
+
+	contentWidth := max(width-6, 1)
+	text := cm.content.GetText(true)
+	rows := 0
+	for _, line := range strings.Split(text, "\n") {
+		lineWidth := tview.TaggedStringWidth(line)
+		rows += max(1, (lineWidth+contentWidth-1)/contentWidth)
+	}
+	height := min(max(rows+max(cm.form.PreferredHeight(), 1)+4, 7), 18)
+	cm.SetPreferredSize(width, height)
+}
+
+func equalizeButtonWidths(form *tview.Form) {
+	count := form.GetButtonCount()
+	if count < 2 {
+		return
+	}
+	maxWidth := 0
+	widths := make([]int, count)
+	for i := 0; i < count; i++ {
+		label := form.GetButton(i).GetLabel()
+		widths[i] = tview.TaggedStringWidth(label)
+		if widths[i] > maxWidth {
+			maxWidth = widths[i]
+		}
+	}
+	for i := 0; i < count; i++ {
+		padding := maxWidth - widths[i]
+		left := padding / 2
+		right := padding - left
+		button := form.GetButton(i)
+		button.SetLabel(strings.Repeat(" ", left) + button.GetLabel() + strings.Repeat(" ", right))
+	}
+}
