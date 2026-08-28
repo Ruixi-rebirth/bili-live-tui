@@ -1,0 +1,63 @@
+name: 自动构建发布
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency: release
+
+jobs:
+  release:
+    name: 构建并发布
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 配置 Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: 运行检查
+        run: |
+          go test ./...
+          go vet ./...
+
+      - name: 生成版本号
+        id: version
+        run: echo "tag=v$(TZ=Asia/Shanghai date +'%Y%m%d%H%M%S')" >> "$GITHUB_OUTPUT"
+
+      - name: 构建发布包
+        env:
+          CGO_ENABLED: "0"
+        run: |
+          mkdir dist
+          for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64; do
+            IFS=/ read -r goos goarch <<< "$target"
+            system="${goos/darwin/macos}"
+            binary=bili-live-tui
+            [[ "$goos" == windows ]] && binary+=.exe
+            GOOS="$goos" GOARCH="$goarch" go build -trimpath -ldflags="-s -w" -o "$binary" ./cmd/bili-live-tui
+            if [[ "$goos" == windows ]]; then
+              zip -9 "dist/bili-live-tui_${system}_${goarch}.zip" "$binary"
+            else
+              tar -czf "dist/bili-live-tui_${system}_${goarch}.tar.gz" "$binary"
+            fi
+          done
+          (cd dist && sha256sum * > checksums.txt)
+
+      - name: 创建 GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: ${{ steps.version.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          generate_release_notes: true
+          files: dist/*
