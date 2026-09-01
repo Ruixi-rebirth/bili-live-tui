@@ -11,6 +11,8 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+
+	"github.com/andybalholm/brotli"
 )
 
 func TestGetDanmakuInfoAndWebSocketURLs(t *testing.T) {
@@ -44,6 +46,26 @@ func TestGetDanmakuInfoAndWebSocketURLs(t *testing.T) {
 	urls := info.WebSocketURLs()
 	if len(urls) != 1 || urls[0] != "wss://chat.example.com:443/sub" {
 		t.Fatalf("WebSocketURLs() = %#v", urls)
+	}
+}
+
+func TestRotateDanmakuEndpointsAcrossReconnects(t *testing.T) {
+	client := NewClient(nil)
+	endpoints := []string{"wss://one.example/sub", "wss://two.example/sub", "wss://three.example/sub"}
+	first := client.rotateDanmakuEndpoints(endpoints)
+	second := client.rotateDanmakuEndpoints(endpoints)
+	third := client.rotateDanmakuEndpoints(endpoints)
+	if got, want := strings.Join(first, ","), "wss://one.example/sub,wss://two.example/sub,wss://three.example/sub"; got != want {
+		t.Fatalf("first endpoint order = %q, want %q", got, want)
+	}
+	if got, want := strings.Join(second, ","), "wss://two.example/sub,wss://three.example/sub,wss://one.example/sub"; got != want {
+		t.Fatalf("second endpoint order = %q, want %q", got, want)
+	}
+	if got, want := strings.Join(third, ","), "wss://three.example/sub,wss://one.example/sub,wss://two.example/sub"; got != want {
+		t.Fatalf("third endpoint order = %q, want %q", got, want)
+	}
+	if got := endpoints[0]; got != "wss://one.example/sub" {
+		t.Fatalf("rotateDanmakuEndpoints mutated input: %q", got)
 	}
 }
 
@@ -126,13 +148,14 @@ func TestResolveDanmakuIdentityAndWebSocketHeaders(t *testing.T) {
 		t.Fatalf("websocket Cookie = %q", got)
 	}
 	var payload struct {
-		UID   int64  `json:"uid"`
-		Buvid string `json:"buvid"`
+		UID      int64  `json:"uid"`
+		Buvid    string `json:"buvid"`
+		Protover int    `json:"protover"`
 	}
 	if err := json.Unmarshal(danmakuAuthPayload("token", "123", identity), &payload); err != nil {
 		t.Fatal(err)
 	}
-	if payload.UID != identity.UID || payload.Buvid != identity.Buvid {
+	if payload.UID != identity.UID || payload.Buvid != identity.Buvid || payload.Protover != 3 {
 		t.Fatalf("auth payload identity = %#v", payload)
 	}
 }
@@ -166,6 +189,46 @@ func TestParseDanmakuMessageGiftAndOnline(t *testing.T) {
 	}
 }
 
+func TestLiveSessionStatsObserveGift(t *testing.T) {
+	var stats LiveSessionStats
+	stats.Observe(DanmakuEvent{Kind: DanmakuEventGift, Message: DanmakuMessage{
+		GiftCount: 3,
+	}})
+	stats.Observe(DanmakuEvent{Kind: DanmakuEventGift, Message: DanmakuMessage{
+		GiftCount: 1,
+	}})
+	if stats.GiftEvents != 2 || stats.GiftCount != 4 {
+		t.Fatalf("gift stats = %#v", stats)
+	}
+}
+
+func TestParseLikeAndUnknownDanmakuCommands(t *testing.T) {
+	like := makeDanmakuPacket(danmakuOperationCommand, danmakuProtocolPlain, []byte(`{"cmd":"LIKE_INFO_V3_CLICK","data":{"uid":7,"uname":"点赞用户","click_count":3}}`))
+	unknown := makeDanmakuPacket(danmakuOperationCommand, danmakuProtocolPlain, []byte(`{"cmd":"ROOM_CHANGE","data":{"title":"新标题"}}`))
+	events, err := parseDanmakuPackets(append(like, unknown...))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 1 || events[0].Kind != DanmakuEventSystem || !strings.Contains(events[0].Message.Text, "×3") {
+		t.Fatalf("like events = %#v", events)
+	}
+}
+
+func TestParseGiftAcceptsStringNumbers(t *testing.T) {
+	packet := makeDanmakuPacket(danmakuOperationCommand, danmakuProtocolPlain, []byte(`{"cmd":"SEND_GIFT","data":{"uid":"7","uname":"送礼用户","giftName":"小花花","num":"2","total_coin":"100","coin_type":"gold","combo_num":"2"}}`))
+	events, err := parseDanmakuPackets(packet)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 1 || events[0].Kind != DanmakuEventGift {
+		t.Fatalf("gift events = %#v", events)
+	}
+	message := events[0].Message
+	if message.GiftCount != 2 || message.UserID != "7" {
+		t.Fatalf("gift message = %#v", message)
+	}
+}
+
 func TestParseSystemInteractionFiltersOrdinaryEntry(t *testing.T) {
 	entry := makeDanmakuPacket(danmakuOperationCommand, danmakuProtocolPlain, []byte(`{"cmd":"INTERACT_WORD","data":{"uid":100,"uname":"路人","msg_type":1}}`))
 	follow := makeDanmakuPacket(danmakuOperationCommand, danmakuProtocolPlain, []byte(`{"cmd":"INTERACT_WORD","data":{"uid":101,"uname":"新粉丝","msg_type":2}}`))
@@ -179,7 +242,7 @@ func TestParseSystemInteractionFiltersOrdinaryEntry(t *testing.T) {
 }
 
 func TestParseCompressedDanmakuPacket(t *testing.T) {
-	nested := makeDanmakuPacket(danmakuOperationCommand, danmakuProtocolPlain, []byte(`{"cmd":"SUPER_CHAT_MESSAGE","data":{"user_info":{"uid":7,"uname":"莓莓"},"message":"晚上好","price":30}}`))
+	nested := makeDanmakuPacket(danmakuOperationCommand, danmakuProtocolPlain, []byte(`{"cmd":"DANMU_MSG","info":[[0,0,0],"Zlib 弹幕",[7,"莓莓"],[]]}`))
 	var compressed bytes.Buffer
 	writer := zlib.NewWriter(&compressed)
 	_, _ = writer.Write(nested)
@@ -190,8 +253,49 @@ func TestParseCompressedDanmakuPacket(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parseDanmakuPackets() error = %v", err)
 	}
-	if len(events) != 1 || events[0].Kind != DanmakuEventSuperChat || !strings.Contains(events[0].Message.Text, "¥30") {
+	if len(events) != 1 || events[0].Kind != DanmakuEventMessage || events[0].Message.Text != "Zlib 弹幕" {
 		t.Fatalf("events = %#v", events)
+	}
+}
+
+func TestParseBrotliDanmakuPacket(t *testing.T) {
+	nested := makeDanmakuPacket(danmakuOperationCommand, danmakuProtocolPlain, []byte(`{"cmd":"DANMU_MSG","info":[[0,0,0],"Brotli 弹幕",[100,"测试用户"],[6,"草莓"]]}`))
+	var compressed bytes.Buffer
+	writer := brotli.NewWriter(&compressed)
+	if _, err := writer.Write(nested); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	events, err := parseDanmakuPackets(makeDanmakuPacket(danmakuOperationCommand, danmakuProtocolBrotli, compressed.Bytes()))
+	if err != nil {
+		t.Fatalf("parseDanmakuPackets() error = %v", err)
+	}
+	if len(events) != 1 || events[0].Kind != DanmakuEventMessage || events[0].Message.Text != "Brotli 弹幕" {
+		t.Fatalf("events = %#v", events)
+	}
+}
+
+func TestReadDanmakuDecodedRejectsOversizedPayload(t *testing.T) {
+	if _, err := readDanmakuDecodedLimit(strings.NewReader("12345"), 4); err == nil || !strings.Contains(err.Error(), "大小限制") {
+		t.Fatalf("oversized decoded payload error = %v", err)
+	}
+}
+
+func TestParseDanmakuPacketsRejectsExcessiveCompressionNesting(t *testing.T) {
+	packet := makeDanmakuPacket(danmakuOperationCommand, danmakuProtocolPlain, []byte(`{"cmd":"ROOM_CHANGE"}`))
+	for range danmakuPacketNestingLimit + 1 {
+		var compressed bytes.Buffer
+		writer := zlib.NewWriter(&compressed)
+		_, _ = writer.Write(packet)
+		if err := writer.Close(); err != nil {
+			t.Fatal(err)
+		}
+		packet = makeDanmakuPacket(danmakuOperationCommand, danmakuProtocolZlib, compressed.Bytes())
+	}
+	if _, err := parseDanmakuPackets(packet); err == nil || !strings.Contains(err.Error(), "嵌套层数") {
+		t.Fatalf("nested packet error = %v", err)
 	}
 }
 

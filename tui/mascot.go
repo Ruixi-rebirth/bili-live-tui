@@ -30,10 +30,6 @@ func mascotWidth() int {
 	return width
 }
 
-func mascotHeight() int {
-	return len(strings.Split(rabbitArt, "\n"))
-}
-
 func colorMascotLines(lines []string) string {
 	colored := make([]string, len(lines))
 	for i, line := range lines {

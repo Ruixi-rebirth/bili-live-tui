@@ -1,5 +1,7 @@
 github.com/andreykaipov/goobs v1.10.0 h1:MsbH7nY7KcXfW3+10KDsvIOlv3FvUCwSSmmA6HzZOP0=
 github.com/andreykaipov/goobs v1.10.0/go.mod h1:80iX/BkmvfDv6FbAivyG5fIrRWQsqWsZ0zDMwB8+k8s=
+github.com/andybalholm/brotli v1.2.3 h1:8H1qwOkl2LPfjf3YezB90JnCliZb6SInJ/OJkEbA5NQ=
+github.com/andybalholm/brotli v1.2.3/go.mod h1:rzTDkvFWvIrjDXZHkuS16NPggd91W3kUSvPlQ1pLaKY=
 github.com/buger/jsonparser v1.6.1 h1:I0phFv0PlbLHnM7TZAVjZ2MJ2/eWRTDyuO7GLR98IEs=
 github.com/buger/jsonparser v1.6.1/go.mod h1:6RYKKt7H4d4+iWqouImQ9R2FZql3VbhNgx27UK13J/0=
 github.com/gdamore/encoding v1.0.1 h1:YzKZckdBL6jVt2Gc+5p82qhrGiqMdG/eNs6Wy0u3Uhw=

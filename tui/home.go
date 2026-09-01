@@ -3,8 +3,6 @@ package tui
 import (
 	"context"
 	"fmt"
-	"io"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -18,74 +16,36 @@ import (
 
 const roomSnapshotRefreshInterval = 30 * time.Second
 
-type roomSnapshotLoader func() (api.RoomSnapshot, error)
-
-// RunHome 显示简洁的直播概览。仅当用户确认下播时返回 true，否则返回弹幕页。
-func RunHome(_ io.Reader, _ io.Writer) (bool, error) {
-	action, err := runHome(time.Now(), "", nil, nil, nil, false, "", nil, nil, nil, nil)
-	return action == HomeActionStop, err
+type displayOnlyPrimitive struct {
+	tview.Primitive
 }
 
-// RunHomeAt 是带开播时间的版本，用于用户在弹幕页停留后返回概览。
-// 保留 RunHome 包装函数，以兼容不记录开播时间的原有调用方。
-func RunHomeAt(startedAt time.Time, _ io.Reader, _ io.Writer) (bool, error) {
-	action, err := runHome(startedAt, "", nil, nil, nil, false, "", nil, nil, nil, nil)
-	return action == HomeActionStop, err
+func (primitive *displayOnlyPrimitive) InputHandler() func(*tcell.EventKey, func(tview.Primitive)) {
+	return nil
 }
 
-// RunHomeAtWithEditor 是直播主流程使用的增强概览入口。
-// 选择编辑按钮时返回 HomeActionEdit，由调用方打开表单并执行认证更新，避免嵌套终端应用。
-func RunHomeAtWithEditor(startedAt time.Time, settings api.LiveSettings, notice string, _ io.Reader, _ io.Writer) (HomeAction, error) {
-	return runHome(startedAt, "", &settings, nil, nil, true, notice, nil, nil, nil, nil)
+func (primitive *displayOnlyPrimitive) Focus(func(tview.Primitive)) {}
+
+func (primitive *displayOnlyPrimitive) HasFocus() bool {
+	return false
 }
 
-// RunHomeAtWithEditorAndInfo 是完整的直播概览入口。
-// 分区列表将内部编号转换为可读名称，可选快照提供当前公开房间指标。
-func RunHomeAtWithEditorAndInfo(startedAt time.Time, roomID string, settings api.LiveSettings, areas []api.LiveArea, snapshot *api.RoomSnapshot, notice string, _ io.Reader, _ io.Writer) (HomeAction, error) {
-	return runHome(startedAt, roomID, &settings, areas, snapshot, true, notice, nil, nil, nil, nil)
-}
-
-// RunHomeAtWithLiveStatus 是完整的直播概览入口。
-// 页面打开期间会定时调用加载器刷新房间指标，用户无需记忆刷新快捷键。
-func RunHomeAtWithLiveStatus(startedAt time.Time, roomID string, settings api.LiveSettings, areas []api.LiveArea, snapshot *api.RoomSnapshot, notice string, loader func() (api.RoomSnapshot, error), onSnapshot func(api.RoomSnapshot), _ io.Reader, _ io.Writer) (HomeAction, error) {
-	return runHome(startedAt, roomID, &settings, areas, snapshot, true, notice, loader, onSnapshot, nil, nil)
-}
-
-// RunHomeAtWithLiveStatusAndStats 还显示弹幕流收集的本场会话统计，例如本场收到的礼物数。
-func RunHomeAtWithLiveStatusAndStats(startedAt time.Time, roomID string, settings api.LiveSettings, areas []api.LiveArea, snapshot *api.RoomSnapshot, sessionStats api.LiveSessionStats, notice string, loader func() (api.RoomSnapshot, error), onSnapshot func(api.RoomSnapshot), _ io.Reader, _ io.Writer) (HomeAction, error) {
-	return runHome(startedAt, roomID, &settings, areas, snapshot, true, notice, loader, onSnapshot, &sessionStats, nil)
-}
-
-// RunHomeAtWithLiveStatusStatsAndHealth 是主流程的完整概览，
-// 同时包含 B 站房间指标和本地 OBS/FFmpeg 输出状态。
-func RunHomeAtWithLiveStatusStatsAndHealth(startedAt time.Time, roomID string, settings api.LiveSettings, areas []api.LiveArea, snapshot *api.RoomSnapshot, sessionStats api.LiveSessionStats, notice string, loader func() (api.RoomSnapshot, error), onSnapshot func(api.RoomSnapshot), healthLoader func() streamruntime.Health, _ io.Reader, _ io.Writer) (HomeAction, error) {
-	return RunHomeAtWithLiveStatusStatsAndHealthContext(context.Background(), startedAt, roomID, settings, areas, snapshot, sessionStats, notice, loader, onSnapshot, healthLoader, nil, nil)
-}
-
-// RunHomeAtWithLiveStatusStatsAndHealthContext 是主流程使用的信号感知概览。
-// 取消 ctx 会停止 TUI，使调用方即使收到 SIGTERM 也能执行 OBS 和 B 站清理。
-func RunHomeAtWithLiveStatusStatsAndHealthContext(ctx context.Context, startedAt time.Time, roomID string, settings api.LiveSettings, areas []api.LiveArea, snapshot *api.RoomSnapshot, sessionStats api.LiveSessionStats, notice string, loader func() (api.RoomSnapshot, error), onSnapshot func(api.RoomSnapshot), healthLoader func() streamruntime.Health, _ io.Reader, _ io.Writer) (HomeAction, error) {
-	return runHomeWithContext(ctx, startedAt, roomID, &settings, areas, snapshot, true, notice, loader, onSnapshot, &sessionStats, nil, healthLoader, nil)
-}
-
-// RunHomeAtWithLiveStatusStatsAndHealthContextAndEditor 在概览内执行资料编辑，避免网络操作期间退出终端界面。
-// 可选的 statsLoader 会定时读取长期弹幕连接的最新会话统计。
-func RunHomeAtWithLiveStatusStatsAndHealthContextAndEditor(ctx context.Context, startedAt time.Time, roomID string, settings *api.LiveSettings, areas []api.LiveArea, snapshot *api.RoomSnapshot, sessionStats api.LiveSessionStats, notice string, loader func() (api.RoomSnapshot, error), onSnapshot func(api.RoomSnapshot), healthLoader func() streamruntime.Health, edit func() error, _ io.Reader, _ io.Writer, statsLoaders ...func() api.LiveSessionStats) (HomeAction, error) {
-	var statsLoader func() api.LiveSessionStats
-	if len(statsLoaders) > 0 {
-		statsLoader = statsLoaders[0]
+func (primitive *displayOnlyPrimitive) MouseHandler() func(tview.MouseAction, *tcell.EventMouse, func(tview.Primitive)) (bool, tview.Primitive) {
+	return func(tview.MouseAction, *tcell.EventMouse, func(tview.Primitive)) (bool, tview.Primitive) {
+		return false, nil
 	}
-	return runHomeWithContext(ctx, startedAt, roomID, settings, areas, snapshot, true, notice, loader, onSnapshot, &sessionStats, statsLoader, healthLoader, edit)
 }
 
-func runHome(startedAt time.Time, roomID string, settings *api.LiveSettings, areas []api.LiveArea, snapshot *api.RoomSnapshot, showEdit bool, notice string, loader roomSnapshotLoader, onSnapshot func(api.RoomSnapshot), sessionStats *api.LiveSessionStats, healthLoader func() streamruntime.Health) (HomeAction, error) {
-	return runHomeWithContext(context.Background(), startedAt, roomID, settings, areas, snapshot, showEdit, notice, loader, onSnapshot, sessionStats, nil, healthLoader, nil)
+func (primitive *displayOnlyPrimitive) PasteHandler() func(string, func(tview.Primitive)) {
+	return nil
 }
 
-func runHomeWithContext(ctx context.Context, startedAt time.Time, roomID string, settings *api.LiveSettings, areas []api.LiveArea, snapshot *api.RoomSnapshot, showEdit bool, notice string, loader roomSnapshotLoader, onSnapshot func(api.RoomSnapshot), sessionStats *api.LiveSessionStats, statsLoader func() api.LiveSessionStats, healthLoader func() streamruntime.Health, edit func() error) (HomeAction, error) {
+// RunHome 显示直播概览，并在同一个 TUI 中处理资料编辑和直播预览。
+func RunHome(ctx context.Context, startedAt time.Time, roomID string, settings *api.LiveSettings, areas []api.LiveArea, snapshot *api.RoomSnapshot, sessionStats api.LiveSessionStats, notice string, loader func() (api.RoomSnapshot, error), onSnapshot func(api.RoomSnapshot), healthLoader func() streamruntime.Health, saveEdit func(api.LiveSettings) (api.LiveSettings, error), preview func() error, statsLoader func() api.LiveSessionStats) (HomeAction, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	currentSessionStats := &sessionStats
 	applyTheme()
 	app := tview.NewApplication().EnableMouse(true).EnablePaste(true).SetTitle("bili-live-tui")
 	var applicationRunning atomic.Bool
@@ -110,28 +70,48 @@ func runHomeWithContext(ctx context.Context, startedAt time.Time, roomID string,
 	status.SetBorderColor(tview.Styles.BorderColor)
 	status.SetTitle(" ♡ 直播概览 ♡ ")
 	status.SetTitleColor(tview.Styles.TitleColor)
+	noticeView := tview.NewTextView()
+	noticeView.SetDynamicColors(true)
+	noticeView.SetTextAlign(tview.AlignCenter)
+	noticeView.SetWrap(false)
+	noticeView.SetBackgroundColor(panelColor)
+	statusDisplay := &displayOnlyPrimitive{Primitive: status}
+	noticeDisplay := &displayOnlyPrimitive{Primitive: noticeView}
+	roomNotice := ""
 	currentSnapshot := snapshot
+	var body *tview.Flex
 	setStatusText := func() {
 		if statsLoader != nil {
 			latest := statsLoader()
-			sessionStats = &latest
+			currentSessionStats = &latest
 		}
 		statusText := fmt.Sprintf("[%s]直播中[-]\n\n开播时间  %s\n\n直播时长  %s", accentColor.String(), startedAt.Format("15:04:05"), formatLiveDuration(time.Since(startedAt)))
 		if settings != nil {
-			statusText += "\n\n" + liveInfoSummaryWithStats(roomID, *settings, areas, currentSnapshot, sessionStats)
+			statusText += "\n\n" + liveInfoSummaryWithStats(roomID, *settings, areas, currentSnapshot, currentSessionStats)
 		}
 		if healthLoader != nil {
 			statusText += "\n\n" + formatStreamHealth(healthLoader())
 		}
-		if message := strings.TrimSpace(notice); message != "" {
-			statusText += "\n\n[" + mutedColor.String() + "]" + tview.Escape(message) + "[-]"
-		}
 		status.SetText(statusText)
+		message := strings.TrimSpace(notice)
+		if message == "" {
+			message = strings.TrimSpace(roomNotice)
+		}
+		if message == "" {
+			noticeView.SetText("")
+		} else {
+			noticeView.SetText("[" + mutedColor.String() + "]" + tview.Escape(message) + "[-]")
+		}
+		if body != nil {
+			body.ResizeItem(noticeDisplay, noticeRowHeight(message), 0)
+		}
 	}
-	setStatusText()
 
 	pages := tview.NewPages()
 	var actionBar *tview.Flex
+	editing := false
+	var cancelEdit func()
+	var previewBusy atomic.Bool
 
 	confirm := styleModal(tview.NewModal()).
 		SetText("确定下播并退出吗？").
@@ -146,39 +126,103 @@ func runHomeWithContext(ctx context.Context, startedAt time.Time, roomID string,
 		app.SetFocus(actionBar)
 	})
 
-	buttons := make([]*tview.Button, 0, 3)
+	buttons := make([]*tview.Button, 0, 4)
 	buttons = append(buttons, newHomeActionButton("返回弹幕", stopApplication))
-	if showEdit {
-		buttons = append(buttons, newHomeActionButton("修改直播资料", func() {
-			if edit != nil {
-				app.Suspend(func() {
-					if err := edit(); err != nil {
-						notice = "保存直播资料失败：" + err.Error()
+	if preview != nil {
+		buttons = append(buttons, newHomeActionButton("预览直播", func() {
+			if !previewBusy.CompareAndSwap(false, true) {
+				return
+			}
+			notice = "正在等待直播画面……"
+			setStatusText()
+			go func() {
+				err := preview()
+				if !applicationRunning.Load() {
+					return
+				}
+				app.QueueUpdateDraw(func() {
+					previewBusy.Store(false)
+					if err != nil {
+						notice = err.Error()
 					} else {
-						notice = "直播资料已更新"
+						notice = ""
 					}
 					setStatusText()
 				})
-				return
-			}
-			action = HomeActionEdit
-			stopApplication()
+			}()
 		}))
 	}
-	buttons = append(buttons, newHomeActionButton("下播并退出", func() {
+	buttons = append(buttons, newHomeActionButton("修改资料", func() {
+		var saving atomic.Bool
+		var editPage *liveEditPage
+		closeEdit := func() {
+			if saving.Load() {
+				editPage.setStatus("正在保存，请稍候", false)
+				return
+			}
+			editing = false
+			cancelEdit = nil
+			app.SetBeforeDrawFunc(nil)
+			pages.RemovePage("edit")
+			pages.SwitchToPage("main")
+			app.SetFocus(actionBar)
+		}
+		editPage = newLiveEditPage(app, *settings, areas, func(edited api.LiveSettings) {
+			if edited == *settings {
+				editPage.setStatus(ErrLiveEditUnchanged.Error(), false)
+				return
+			}
+			if !saving.CompareAndSwap(false, true) {
+				return
+			}
+			editPage.setStatus("正在保存直播资料……", false)
+			go func() {
+				updated, err := saveEdit(edited)
+				if !applicationRunning.Load() {
+					return
+				}
+				app.QueueUpdateDraw(func() {
+					saving.Store(false)
+					if err != nil {
+						editPage.setStatus("保存失败："+err.Error(), true)
+						return
+					}
+					*settings = updated
+					if currentSnapshot != nil {
+						currentSnapshot.Title = updated.Title
+						currentSnapshot.Description = updated.Description
+						currentSnapshot.Tags = updated.Tags
+						currentSnapshot.AreaName = ""
+						currentSnapshot.ParentAreaName = ""
+						currentSnapshot.Cover = updated.CoverPath
+					}
+					notice = "直播资料更新请求已提交"
+					closeEdit()
+					setStatusText()
+				})
+			}()
+		}, closeEdit)
+		editing = true
+		cancelEdit = closeEdit
+		pages.AddAndSwitchToPage("edit", editPage.root, true)
+		app.SetFocus(editPage.form)
+	}))
+	buttons = append(buttons, newHomeActionButton("下播退出", func() {
 		pages.ShowPage("confirm-stop")
 		app.SetFocus(confirm)
 	}))
 	actionBar = centeredActionBar(buttons)
 
-	body := tview.NewFlex()
+	body = tview.NewFlex()
 	body.SetDirection(tview.FlexRow)
 	body.SetBackgroundColor(panelColor)
-	body.AddItem(status, 0, 1, true)
+	body.AddItem(statusDisplay, 0, 1, false)
+	body.AddItem(noticeDisplay, 0, 0, false)
 	body.AddItem(actionBar, 1, 0, true)
-	footerText := "Esc 下播确认"
+	setStatusText()
+	footerText := "Tab 选择　Enter 执行　Esc 下播"
 	if loader != nil {
-		footerText = "房间状态每 30 秒自动刷新　Esc 下播确认"
+		footerText = "房间每 30 秒自动刷新　" + footerText
 	}
 	if healthLoader != nil || statsLoader != nil {
 		go func() {
@@ -206,7 +250,7 @@ func runHomeWithContext(ctx context.Context, startedAt time.Time, roomID string,
 	root := centeredPage(
 		nil,
 		body,
-		pageFooter(footerText+"　Tab 选择　Enter 执行　Esc 下播确认　Ctrl+C 退出"),
+		pageFooter(footerText),
 	)
 
 	pages.AddPage("main", root, true, true)
@@ -228,13 +272,13 @@ func runHomeWithContext(ctx context.Context, startedAt time.Time, roomID string,
 					return
 				}
 				if refreshErr != nil {
-					notice = "房间实时状态暂不可用：" + refreshErr.Error()
+					roomNotice = "房间实时状态暂不可用：" + refreshErr.Error()
 				} else {
 					currentSnapshot = &fresh
 					if onSnapshot != nil {
 						onSnapshot(fresh)
 					}
-					notice = ""
+					roomNotice = ""
 				}
 				setStatusText()
 			})
@@ -271,6 +315,9 @@ func runHomeWithContext(ctx context.Context, startedAt time.Time, roomID string,
 	app.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 		switch event.Key() {
 		case tcell.KeyTab, tcell.KeyBacktab:
+			if editing || confirm.HasFocus() {
+				return event
+			}
 			// 按钮是普通控件而非 Form 项，因此显式循环焦点，让概览中的 Tab 行为稳定；弹窗焦点不处理。
 			for index, button := range buttons {
 				if app.GetFocus() != button {
@@ -288,8 +335,16 @@ func runHomeWithContext(ctx context.Context, startedAt time.Time, roomID string,
 				app.SetFocus(buttons[next])
 				return nil
 			}
-			return event
+			next := 0
+			if event.Key() == tcell.KeyBacktab {
+				next = len(buttons) - 1
+			}
+			app.SetFocus(buttons[next])
+			return nil
 		case tcell.KeyEscape:
+			if editing {
+				return event
+			}
 			// Modal.Focus 会把焦点交给内部表单；只检查弹窗控件本身会漏掉这里并反复打开弹窗。
 			if confirm.HasFocus() {
 				pages.HidePage("confirm-stop")
@@ -300,6 +355,10 @@ func runHomeWithContext(ctx context.Context, startedAt time.Time, roomID string,
 			app.SetFocus(confirm)
 			return nil
 		case tcell.KeyCtrlC:
+			if editing && cancelEdit != nil {
+				cancelEdit()
+				return nil
+			}
 			action = HomeActionStop
 			stopApplication()
 			return nil
@@ -311,6 +370,13 @@ func runHomeWithContext(ctx context.Context, startedAt time.Time, roomID string,
 		return HomeActionDanmaku, fmt.Errorf("启动直播概览失败: %w", err)
 	}
 	return action, nil
+}
+
+func noticeRowHeight(message string) int {
+	if strings.TrimSpace(message) == "" {
+		return 0
+	}
+	return 1
 }
 
 func formatStreamHealth(health streamruntime.Health) string {
@@ -325,6 +391,9 @@ func formatStreamHealth(health streamruntime.Health) string {
 	color := mutedColor.String()
 	if health.Reconnecting {
 		state = "正在重连"
+		if strings.Contains(health.LastError, "正在确认") {
+			state = "正在确认"
+		}
 		color = "#d68a4b"
 	} else if health.Active {
 		state = "推流正常"
@@ -354,10 +423,6 @@ func formatStreamHealth(health streamruntime.Health) string {
 		parts = append(parts, fmt.Sprintf("CPU %.1f%%", health.CPUPercent))
 	}
 	return strings.Join(parts, " · ")
-}
-
-func liveInfoSummary(roomID string, settings api.LiveSettings, areas []api.LiveArea, snapshot *api.RoomSnapshot) string {
-	return liveInfoSummaryWithStats(roomID, settings, areas, snapshot, nil)
 }
 
 func liveInfoSummaryWithStats(roomID string, settings api.LiveSettings, areas []api.LiveArea, snapshot *api.RoomSnapshot, sessionStats *api.LiveSessionStats) string {
@@ -396,12 +461,12 @@ func liveInfoSummaryWithStats(roomID string, settings api.LiveSettings, areas []
 	}
 	if snapshot != nil {
 		if sessionStats != nil && sessionStats.PopularityKnown {
-			lines = append(lines, fmt.Sprintf("[%s]当前人气[-]　%s", labelColor, formatMetric(sessionStats.Popularity, true, "")))
+			lines = append(lines, fmt.Sprintf("[%s]当前人气[-]　%d", labelColor, sessionStats.Popularity))
 		} else if snapshot.OnlineKnown {
-			lines = append(lines, fmt.Sprintf("[%s]当前人气[-]　%s", labelColor, formatMetric(snapshot.Online, true, "")))
+			lines = append(lines, fmt.Sprintf("[%s]当前人气[-]　%d", labelColor, snapshot.Online))
 		}
 		if snapshot.WatchedKnown {
-			lines = append(lines, fmt.Sprintf("[%s]累计观看[-]　%s", labelColor, formatMetric(snapshot.Watched, true, "")))
+			lines = append(lines, fmt.Sprintf("[%s]累计观看[-]　%d", labelColor, snapshot.Watched))
 		}
 	}
 	return strings.Join(lines, "\n")
@@ -420,13 +485,6 @@ func areaNameForID(id string, areas []api.LiveArea) string {
 		return name
 	}
 	return ""
-}
-
-func formatMetric(value int64, known bool, fallback string) string {
-	if !known || value < 0 {
-		return fallback
-	}
-	return strconv.FormatInt(value, 10)
 }
 
 func formatLiveDuration(duration time.Duration) string {
