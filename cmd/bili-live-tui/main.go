@@ -7,8 +7,10 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"os/exec"
 	"os/signal"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -172,6 +174,10 @@ func main() {
 	// OBS/FFmpeg 通过 RTMP 连接维持直播。
 	// B 站移动端心跳接口用于观众观看任务，不属于主播推流会话，不能在这里调用。
 	danmakuSession := tui.NewLiveDanmakuSession(ctx, client, roomID, auth.SESSDATA, auth.BiliJCT)
+	previewer := &livePreviewer{}
+	previewLive := func() error {
+		return previewer.Start(ctx, client, roomID, auth.SESSDATA, auth.BiliJCT)
+	}
 	var outputEndedUnexpectedly atomic.Bool
 	go watchStreamOutput(ctx, liveStream.Done(), func() {
 		outputEndedUnexpectedly.Store(true)
@@ -241,9 +247,9 @@ func main() {
 				}
 				return nil
 			}
-			action, err := tui.RunHomeAtWithLiveStatusStatsAndHealthContextAndEditor(ctx, liveStartedAt, roomID, &settings, areas, roomSnapshot, danmakuSession.Stats(), homeNotice, loadRoomSnapshot, func(fresh api.RoomSnapshot) {
+			action, err := tui.RunHomeAtWithLiveStatusStatsAndHealthContextAndEditorAndPreview(ctx, liveStartedAt, roomID, &settings, areas, roomSnapshot, danmakuSession.Stats(), homeNotice, loadRoomSnapshot, func(fresh api.RoomSnapshot) {
 				roomSnapshot = &fresh
-			}, streamHealth, saveEdit, os.Stdin, os.Stdout, danmakuSession.Stats)
+			}, streamHealth, saveEdit, previewLive, os.Stdin, os.Stdout, danmakuSession.Stats)
 			homeNotice = ""
 			if err != nil {
 				diagnosticLog.Printf("直播概览异常: %v", err)
@@ -288,6 +294,75 @@ func main() {
 	} else {
 		diagnosticLog.Printf("直播已安全结束 room=%s", roomID)
 	}
+}
+
+type livePreviewer struct {
+	mu      sync.Mutex
+	running bool
+}
+
+func (previewer *livePreviewer) Start(ctx context.Context, client *api.Client, roomID, sessdata, biliJCT string) (err error) {
+	previewer.mu.Lock()
+	if previewer.running {
+		previewer.mu.Unlock()
+		return nil
+	}
+	previewer.running = true
+	previewer.mu.Unlock()
+	started := false
+	defer func() {
+		if started {
+			return
+		}
+		previewer.mu.Lock()
+		previewer.running = false
+		previewer.mu.Unlock()
+	}()
+
+	player, err := findMPV()
+	if err != nil {
+		return err
+	}
+	requestCtx, cancelRequest := context.WithTimeout(ctx, 8*time.Second)
+	playbackURL, err := client.GetRoomPlaybackURL(requestCtx, roomID, sessdata, biliJCT)
+	cancelRequest()
+	if err != nil {
+		return err
+	}
+	command := exec.CommandContext(ctx, player, mpvPreviewArgs(roomID, playbackURL)...)
+	if err := command.Start(); err != nil {
+		return fmt.Errorf("启动 mpv 失败: %w", err)
+	}
+	started = true
+	go func() {
+		_ = command.Wait()
+		previewer.mu.Lock()
+		previewer.running = false
+		previewer.mu.Unlock()
+	}()
+	return nil
+}
+
+func mpvPreviewArgs(roomID, playbackURL string) []string {
+	return []string{
+		"--force-window=immediate",
+		"--cache=yes",
+		"--stream-lavf-o=reconnect=1,reconnect_at_eof=1,reconnect_streamed=1,reconnect_delay_max=5",
+		"--mute=yes",
+		"--title=bili-live-tui 直播预览",
+		"--referrer=https://live.bilibili.com/" + strings.TrimSpace(roomID),
+		"--",
+		playbackURL,
+	}
+}
+
+func findMPV() (string, error) {
+	for _, name := range []string{"mpv", "mpv.exe"} {
+		if path, err := exec.LookPath(name); err == nil {
+			return path, nil
+		}
+	}
+	return "", fmt.Errorf("未找到 mpv，请先安装并确保 mpv 在 PATH 中")
 }
 
 func watchStreamOutput(ctx context.Context, done <-chan struct{}, onUnexpectedStop func()) {

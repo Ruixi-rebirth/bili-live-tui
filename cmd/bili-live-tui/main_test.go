@@ -126,6 +126,22 @@ func TestWatchStreamOutputIgnoresSessionShutdown(t *testing.T) {
 	}
 }
 
+func TestMPVPreviewArgsReconnectLiveStream(t *testing.T) {
+	args := mpvPreviewArgs("123", "https://cdn.example.com/live.m3u8?token=value")
+	joined := strings.Join(args, "\n")
+	for _, expected := range []string{
+		"--cache=yes",
+		"reconnect=1",
+		"reconnect_at_eof=1",
+		"reconnect_streamed=1",
+		"--referrer=https://live.bilibili.com/123",
+	} {
+		if !strings.Contains(joined, expected) {
+			t.Fatalf("mpv args missing %q: %#v", expected, args)
+		}
+	}
+}
+
 func TestWaitForContextStopsImmediatelyOnCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()

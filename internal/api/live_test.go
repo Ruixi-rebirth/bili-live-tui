@@ -44,7 +44,7 @@ func TestLiveSettingsValidate(t *testing.T) {
 }
 
 func TestEndpointCatalog(t *testing.T) {
-	for _, name := range []string{"GetMyRoomID", "GetRoomSnapshot", "GetOnlineGoldRank", "GetDanmakuInfo", "GetDanmakuInfoLegacy", "SendDanmaku", "GetLiveAreas", "UploadRoomCover", "AddLiveTag", "DeleteLiveTag", "UpdateRoomNews", "UpdatePreLiveInfo", "UpdateLiveInfo", "StartLive", "StopLive", "GetTVQRCode", "CheckQRStatus"} {
+	for _, name := range []string{"GetMyRoomID", "GetRoomSnapshot", "GetOnlineGoldRank", "GetRoomPlaybackURL", "GetDanmakuInfo", "GetDanmakuInfoLegacy", "SendDanmaku", "GetLiveAreas", "UploadRoomCover", "AddLiveTag", "DeleteLiveTag", "UpdateRoomNews", "UpdatePreLiveInfo", "UpdateLiveInfo", "StartLive", "StopLive", "GetTVQRCode", "CheckQRStatus"} {
 		endpoint, ok := EndpointByName(name)
 		if !ok || endpoint.Path == "" || endpoint.Method == "" {
 			t.Fatalf("endpoint %q missing from catalog", name)
@@ -78,6 +78,29 @@ func TestGetOnlineGoldRank(t *testing.T) {
 	}
 	if snapshot.Online != 23 || len(snapshot.Members) != 1 || snapshot.Members[0].Username != "高能用户" || snapshot.Members[0].Score != 11 || snapshot.Members[0].GuardLevel != 3 {
 		t.Fatalf("online rank snapshot = %#v", snapshot)
+	}
+}
+
+func TestGetRoomPlaybackURL(t *testing.T) {
+	transport := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		query := r.URL.Query()
+		if r.URL.Path != "/xlive/web-room/v2/index/getRoomPlayInfo" || query.Get("room_id") != "1" || query.Get("protocol") != "0,1" || query.Get("format") != "0,1,2" || query.Get("codec") != "0,1" {
+			t.Errorf("playback request = %s", r.URL.String())
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(strings.NewReader(`{"code":0,"data":{"live_status":1,"playurl_info":{"playurl":{"stream":[{"protocol_name":"http_stream","format":[{"format_name":"flv","codec":[{"codec_name":"avc","base_url":"/live/test.flv?","url_info":[{"host":"https://cdn.example.com","extra":"token=flv"}]}]}]},{"protocol_name":"http_hls","format":[{"format_name":"ts","codec":[{"codec_name":"avc","base_url":"/live/test.m3u8?","url_info":[{"host":"https://cdn.example.com","extra":"token=hls"}]}]}]}]}}}}`)),
+			Header:     make(http.Header),
+		}, nil
+	})
+	client := NewClient(&http.Client{Transport: transport})
+	client.BaseURL = "http://test.invalid"
+	playbackURL, err := client.GetRoomPlaybackURL(context.Background(), "1", "sess", "jct")
+	if err != nil {
+		t.Fatalf("GetRoomPlaybackURL() error = %v", err)
+	}
+	if playbackURL != "https://cdn.example.com/live/test.m3u8?token=hls" {
+		t.Fatalf("playback URL = %q", playbackURL)
 	}
 }
 

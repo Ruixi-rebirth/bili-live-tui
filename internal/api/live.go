@@ -354,6 +354,130 @@ func (c *Client) getOnlineGoldRank(ctx context.Context, roomID string, anchorUID
 	return snapshot, nil
 }
 
+// GetRoomPlaybackURL 获取适合本地播放器预览的直播间回拉地址。
+func (c *Client) GetRoomPlaybackURL(ctx context.Context, roomID, sessdata, biliJCT string) (string, error) {
+	roomID = strings.TrimSpace(roomID)
+	if roomID == "" {
+		return "", fmt.Errorf("获取直播预览需要有效的房间号")
+	}
+	path, err := c.endpointByName("GetRoomPlaybackURL")
+	if err != nil {
+		return "", err
+	}
+	parsed, err := url.Parse(path)
+	if err != nil {
+		return "", fmt.Errorf("准备获取直播预览失败: %w", err)
+	}
+	query := parsed.Query()
+	query.Set("room_id", roomID)
+	query.Set("protocol", "0,1")
+	query.Set("format", "0,1,2")
+	query.Set("codec", "0,1")
+	query.Set("qn", "10000")
+	query.Set("platform", "web")
+	query.Set("ptype", "8")
+	parsed.RawQuery = query.Encode()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, parsed.String(), nil)
+	if err != nil {
+		return "", fmt.Errorf("准备获取直播预览失败: %w", err)
+	}
+	setBilibiliBrowserHeaders(req)
+	req.Header.Set("Referer", "https://live.bilibili.com/"+roomID)
+	if cookie := browserCookie(sessdata, biliJCT); cookie != "" {
+		req.Header.Set("Cookie", cookie)
+	}
+	resp, err := c.HTTPClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("获取直播预览失败: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return "", fmt.Errorf("获取直播预览失败：远程服务器返回 HTTP %d", resp.StatusCode)
+	}
+	var raw struct {
+		Code    int    `json:"code"`
+		Message string `json:"message"`
+		Data    *struct {
+			LiveStatus  int `json:"live_status"`
+			PlayURLInfo *struct {
+				PlayURL struct {
+					Streams []struct {
+						ProtocolName string `json:"protocol_name"`
+						Formats      []struct {
+							FormatName string `json:"format_name"`
+							Codecs     []struct {
+								CodecName string `json:"codec_name"`
+								BaseURL   string `json:"base_url"`
+								URLInfo   []struct {
+									Host  string `json:"host"`
+									Extra string `json:"extra"`
+								} `json:"url_info"`
+							} `json:"codec"`
+						} `json:"format"`
+					} `json:"stream"`
+				} `json:"playurl"`
+			} `json:"playurl_info"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxAPIResponseBytes+1)).Decode(&raw); err != nil {
+		return "", fmt.Errorf("解析直播预览失败: %w", err)
+	}
+	if raw.Code != 0 {
+		return "", fmt.Errorf("获取直播预览失败: %s", strings.TrimSpace(raw.Message))
+	}
+	if raw.Data == nil || raw.Data.LiveStatus != 1 {
+		return "", fmt.Errorf("直播间当前未在直播")
+	}
+	if raw.Data.PlayURLInfo == nil {
+		return "", fmt.Errorf("直播预览接口未返回播放地址")
+	}
+	bestURL := ""
+	bestScore := int(^uint(0) >> 1)
+	for _, stream := range raw.Data.PlayURLInfo.PlayURL.Streams {
+		for _, format := range stream.Formats {
+			for _, codec := range format.Codecs {
+				if strings.TrimSpace(codec.BaseURL) == "" {
+					continue
+				}
+				for _, info := range codec.URLInfo {
+					candidate := strings.TrimSpace(info.Host) + codec.BaseURL + info.Extra
+					playbackURL, parseErr := url.Parse(candidate)
+					if parseErr == nil && playbackURL.Host != "" && (playbackURL.Scheme == "https" || playbackURL.Scheme == "http") {
+						score := 0
+						if !strings.EqualFold(codec.CodecName, "avc") {
+							score += 100
+						}
+						switch strings.ToLower(stream.ProtocolName) {
+						case "http_hls":
+						case "http_stream":
+							score += 20
+						default:
+							score += 40
+						}
+						switch strings.ToLower(format.FormatName) {
+						case "ts":
+						case "fmp4":
+							score += 2
+						case "flv":
+							score += 4
+						default:
+							score += 6
+						}
+						if score < bestScore {
+							bestURL = playbackURL.String()
+							bestScore = score
+						}
+					}
+				}
+			}
+		}
+	}
+	if bestURL != "" {
+		return bestURL, nil
+	}
+	return "", fmt.Errorf("直播预览接口未返回可用的播放地址")
+}
+
 // UploadRoomCover 使用 B 站 Web 图片接口上传本地图片，并返回更新封面接口使用的地址。
 // 它与资料更新分开，以便在修改房间资料前先展示上传错误。
 func (c *Client) UploadRoomCover(ctx context.Context, roomID, sessdata, biliJCT, filePath string) (string, error) {
