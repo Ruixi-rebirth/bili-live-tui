@@ -7,6 +7,8 @@ import (
 
 	"bili-live-tui/internal/api"
 	streamruntime "bili-live-tui/internal/stream"
+	"github.com/gdamore/tcell/v2"
+	"github.com/rivo/tview"
 )
 
 func TestLiveInfoSummaryUsesReadableAreaAndKnownMetrics(t *testing.T) {
@@ -35,6 +37,33 @@ func TestFormatLiveDuration(t *testing.T) {
 	if got, want := formatLiveDuration(1*time.Hour+2*time.Minute+3*time.Second), "01:02:03"; got != want {
 		t.Fatalf("formatLiveDuration() = %q, want %q", got, want)
 	}
+}
+
+func TestNoticeRowHeightCollapsesEmptyMessage(t *testing.T) {
+	if got := noticeRowHeight("  "); got != 0 {
+		t.Fatalf("empty notice height = %d, want 0", got)
+	}
+	if got := noticeRowHeight("直播资料已更新"); got != 1 {
+		t.Fatalf("visible notice height = %d, want 1", got)
+	}
+}
+
+func TestDisplayOnlyPrimitiveCannotReceiveFocus(t *testing.T) {
+	primitive := &displayOnlyPrimitive{Primitive: tview.NewTextView()}
+	primitive.Focus(func(tview.Primitive) {})
+	if primitive.HasFocus() || primitive.InputHandler() != nil {
+		t.Fatal("display-only primitive accepts input focus")
+	}
+	handler := primitive.MouseHandler()
+	if handler == nil {
+		t.Fatal("display-only primitive has no safe mouse handler")
+	}
+	if consumed, capture := handler(tview.MouseLeftDown, nil, func(tview.Primitive) {}); consumed || capture != nil {
+		t.Fatal("display-only primitive consumed a mouse event")
+	}
+	flex := tview.NewFlex().AddItem(primitive, 0, 1, false)
+	flex.SetRect(0, 0, 20, 5)
+	flex.MouseHandler()(tview.MouseMove, tcell.NewEventMouse(1, 1, tcell.ButtonNone, tcell.ModNone), func(tview.Primitive) {})
 }
 
 func TestLiveInfoSummaryShowsSessionGiftStats(t *testing.T) {

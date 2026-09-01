@@ -172,6 +172,10 @@ func main() {
 	// OBS/FFmpeg 通过 RTMP 连接维持直播。
 	// B 站移动端心跳接口用于观众观看任务，不属于主播推流会话，不能在这里调用。
 	danmakuSession := tui.NewLiveDanmakuSession(ctx, client, roomID, auth.SESSDATA, auth.BiliJCT)
+	previewer := &livePreviewer{}
+	previewLive := func() error {
+		return previewer.Start(ctx, client, roomID, auth.SESSDATA, auth.BiliJCT)
+	}
 	var outputEndedUnexpectedly atomic.Bool
 	go watchStreamOutput(ctx, liveStream.Done(), func() {
 		outputEndedUnexpectedly.Store(true)
@@ -212,50 +216,28 @@ func main() {
 			break
 		}
 
-		// 直播概览自身是一个小循环。编辑资料关闭后回到这里，只有“返回弹幕”
-		// 会切换到弹幕页；Esc 始终只处理下播确认，不负责页面切换。
-		for {
-			saveEdit := func() error {
-				edited, editErr := tui.RunLiveEditContext(ctx, settings, areas, os.Stdin, os.Stdout)
-				if editErr != nil {
-					if errors.Is(editErr, tui.ErrLiveEditCancelled) {
-						return nil
-					}
-					return editErr
-				}
-				updated, saveErr := saveLiveSettings(ctx, client, roomID, auth, settings, edited)
-				if saveErr != nil {
-					return saveErr
-				}
-				settings = updated
-				if saveErr := config.SaveLiveSettings(settings); saveErr != nil {
-					diagnosticLog.Printf("保存下次开播默认值失败: %v", saveErr)
-				}
-				if roomSnapshot != nil {
-					roomSnapshot.Title = updated.Title
-					roomSnapshot.Description = updated.Description
-					roomSnapshot.Tags = updated.Tags
-					roomSnapshot.AreaName = ""
-					roomSnapshot.ParentAreaName = ""
-					roomSnapshot.Cover = updated.CoverPath
-				}
-				return nil
+		saveEdit := func(edited api.LiveSettings) (api.LiveSettings, error) {
+			updated, saveErr := saveLiveSettings(ctx, client, roomID, auth, settings, edited)
+			if saveErr != nil {
+				return api.LiveSettings{}, saveErr
 			}
-			action, err := tui.RunHomeAtWithLiveStatusStatsAndHealthContextAndEditor(ctx, liveStartedAt, roomID, &settings, areas, roomSnapshot, danmakuSession.Stats(), homeNotice, loadRoomSnapshot, func(fresh api.RoomSnapshot) {
-				roomSnapshot = &fresh
-			}, streamHealth, saveEdit, os.Stdin, os.Stdout, danmakuSession.Stats)
-			homeNotice = ""
-			if err != nil {
-				diagnosticLog.Printf("直播概览异常: %v", err)
-				fmt.Fprintf(os.Stderr, "直播概览异常: %v\n", err)
-				stopRequested = true
-				break
+			if saveErr := config.SaveLiveSettings(updated); saveErr != nil {
+				diagnosticLog.Printf("保存下次开播默认值失败: %v", saveErr)
 			}
-			switch action {
-			case tui.HomeActionStop:
-				stopRequested = true
-			}
+			return updated, nil
+		}
+		action, err := tui.RunHomeAtWithLiveStatusStatsAndHealthContextAndEditorAndPreview(ctx, liveStartedAt, roomID, &settings, areas, roomSnapshot, danmakuSession.Stats(), homeNotice, loadRoomSnapshot, func(fresh api.RoomSnapshot) {
+			roomSnapshot = &fresh
+		}, streamHealth, saveEdit, previewLive, os.Stdin, os.Stdout, danmakuSession.Stats)
+		homeNotice = ""
+		if err != nil {
+			diagnosticLog.Printf("直播概览异常: %v", err)
+			fmt.Fprintf(os.Stderr, "直播概览异常: %v\n", err)
+			stopRequested = true
 			break
+		}
+		if action == tui.HomeActionStop {
+			stopRequested = true
 		}
 		if stopRequested {
 			break

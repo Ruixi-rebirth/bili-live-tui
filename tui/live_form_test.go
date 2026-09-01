@@ -137,6 +137,35 @@ func TestLiveFormPrefillsSettings(t *testing.T) {
 	}
 }
 
+func TestLiveEditPageSavesWithoutStartingAnotherApplication(t *testing.T) {
+	initial := api.LiveSettings{
+		Title:       "已有标题",
+		AreaID:      "12",
+		Orientation: api.OrientationLandscape,
+	}
+	var saved api.LiveSettings
+	page := newLiveEditPage(tview.NewApplication(), initial, []api.LiveArea{{ID: "12", Name: "手游"}}, func(settings api.LiveSettings) {
+		saved = settings
+	}, nil)
+
+	page.form.GetButton(0).InputHandler()(tcell.NewEventKey(tcell.KeyEnter, 0, tcell.ModNone), func(tview.Primitive) {})
+	if saved != initial {
+		t.Fatalf("saved settings = %#v, want %#v", saved, initial)
+	}
+}
+
+func TestLiveEditPageCancelCallback(t *testing.T) {
+	cancelled := false
+	page := newLiveEditPage(tview.NewApplication(), api.LiveSettings{}, nil, nil, func() {
+		cancelled = true
+	})
+
+	page.cancel()
+	if !cancelled {
+		t.Fatal("cancel callback was not called")
+	}
+}
+
 func TestNewLiveFormDefaultsToOBSAndAllowsTestSource(t *testing.T) {
 	form, state := newLiveForm([]api.LiveArea{{ID: "376", Name: "单机游戏"}})
 	settings := state.settings()

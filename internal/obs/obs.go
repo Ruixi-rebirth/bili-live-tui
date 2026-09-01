@@ -11,6 +11,7 @@ import (
 	"time"
 
 	streamruntime "bili-live-tui/internal/stream"
+	"bili-live-tui/internal/utils"
 	"github.com/andreykaipov/goobs"
 	"github.com/andreykaipov/goobs/api/requests/config"
 	"github.com/andreykaipov/goobs/api/requests/general"
@@ -40,15 +41,9 @@ func ensureObsAlive() error {
 		return nil // 已经运行中
 	}
 
-	command := ""
-	for _, candidate := range []string{"obs", "obs-studio"} {
-		if path, err := exec.LookPath(candidate); err == nil {
-			command = path
-			break
-		}
-	}
-	if command == "" {
-		return fmt.Errorf("未找到 OBS Studio，请先安装 OBS，或确认 obs/obs-studio 命令在 PATH 中")
+	command, err := utils.GetExecutablePath("obs", "obs-studio")
+	if err != nil {
+		return err
 	}
 	cmd := exec.Command(command)
 

@@ -13,9 +13,14 @@ import (
 	"time"
 
 	streamruntime "bili-live-tui/internal/stream"
+	"bili-live-tui/internal/utils"
 )
 
 func StartTestStream(rtmpAddr, streamKey string, orientation ...string) (*exec.Cmd, error) {
+	ffmpegPath, err := utils.GetExecutablePath("ffmpeg")
+	if err != nil {
+		return nil, err
+	}
 	// B 站的完整推流地址是 Addr + Code 拼接而成
 	fullURL := rtmpAddr + streamKey
 	direction := ""
@@ -26,10 +31,10 @@ func StartTestStream(rtmpAddr, streamKey string, orientation ...string) (*exec.C
 		"-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
 		"-c:a", "aac", "-b:a", "128k", "-f", "flv", fullURL,
 	)
-	cmd := exec.Command("ffmpeg", args...)
+	cmd := exec.Command(ffmpegPath, args...)
 
 	if err := cmd.Start(); err != nil {
-		return nil, fmt.Errorf("启动 ffmpeg 失败: %v", err)
+		return nil, fmt.Errorf("启动 ffmpeg 失败: %w", err)
 	}
 
 	return cmd, nil
@@ -120,13 +125,17 @@ func (r *TestRuntime) Start(rtmpAddr, streamKey string) error {
 }
 
 func newFFmpegProcess(rtmpAddr, streamKey, orientation string) (*exec.Cmd, io.ReadCloser, error) {
+	ffmpegPath, err := utils.GetExecutablePath("ffmpeg")
+	if err != nil {
+		return nil, nil, err
+	}
 	args := []string{"-hide_banner", "-nostats", "-progress", "pipe:2"}
 	args = append(args, testSourceArgs(orientation)...)
 	args = append(args,
 		"-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
 		"-c:a", "aac", "-b:a", "128k", "-f", "flv", rtmpAddr+streamKey,
 	)
-	cmd := exec.Command("ffmpeg", args...)
+	cmd := exec.Command(ffmpegPath, args...)
 	progress, err := cmd.StderrPipe()
 	if err != nil {
 		return nil, nil, fmt.Errorf("读取 FFmpeg 状态失败: %w", err)

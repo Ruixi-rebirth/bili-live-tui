@@ -126,6 +126,61 @@ func TestWatchStreamOutputIgnoresSessionShutdown(t *testing.T) {
 	}
 }
 
+func TestMPVPreviewArgsPlayBilibiliURLDirectly(t *testing.T) {
+	args := mpvPreviewArgs("123", "https://cdn.example.com/live.m3u8?token=value")
+	joined := strings.Join(args, "\n")
+	for _, expected := range []string{
+		"--force-window=no",
+		"--loop-file=inf",
+		"--cache=yes",
+		"--stream-lavf-o=reconnect=1,reconnect_at_eof=1,reconnect_streamed=1,reconnect_delay_max=5",
+		"--referrer=https://live.bilibili.com/123",
+		"https://cdn.example.com/live.m3u8?token=value",
+	} {
+		if !strings.Contains(joined, expected) {
+			t.Fatalf("mpv args missing %q: %#v", expected, args)
+		}
+	}
+}
+
+func TestMPVProbeArgsDecodeOneFrameWithoutWindow(t *testing.T) {
+	args := mpvProbeArgs("123", "https://cdn.example.com/live.m3u8?token=value")
+	joined := strings.Join(args, "\n")
+	for _, expected := range []string{
+		"--no-config",
+		"--force-window=no",
+		"--vo=null",
+		"--audio=no",
+		"--frames=1",
+		"--term-status-msg=" + mpvFrameReadyMarker,
+		"--referrer=https://live.bilibili.com/123",
+		"https://cdn.example.com/live.m3u8?token=value",
+	} {
+		if !strings.Contains(joined, expected) {
+			t.Fatalf("mpv probe args missing %q: %#v", expected, args)
+		}
+	}
+	if strings.Contains(joined, "--force-window=immediate") || strings.Contains(joined, "--idle=yes") {
+		t.Fatalf("mpv probe opens a window: %#v", args)
+	}
+}
+
+func TestLastMPVErrorLineRedactsPlaybackURL(t *testing.T) {
+	got := lastMPVErrorLine("Failed to open https://cdn.example.com/live.m3u8?token=secret\nExiting... (Errors when loading file)\n")
+	if strings.Contains(got, "secret") || !strings.Contains(got, "[播放地址]") {
+		t.Fatalf("mpv error = %q", got)
+	}
+}
+
+func TestTailBufferKeepsBoundedSuffix(t *testing.T) {
+	buffer := &tailBuffer{limit: 5}
+	_, _ = buffer.Write([]byte("1234"))
+	_, _ = buffer.Write([]byte("567"))
+	if got := buffer.String(); got != "34567" {
+		t.Fatalf("tail buffer = %q", got)
+	}
+}
+
 func TestWaitForContextStopsImmediatelyOnCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()

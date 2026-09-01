@@ -17,6 +17,7 @@ var Endpoints = map[string]Endpoint{
 	"GetRoomSnapshot":       {Name: "GetRoomSnapshot", Method: http.MethodGet, Path: "/xlive/web-room/v1/index/getInfoByRoom", Description: "获取直播间实时状态和人气"},
 	"GetRoomSnapshotLegacy": {Name: "GetRoomSnapshotLegacy", Method: http.MethodGet, Path: "/room/v1/Room/get_info", Description: "获取直播间基础状态（备用接口）"},
 	"GetOnlineGoldRank":     {Name: "GetOnlineGoldRank", Method: http.MethodGet, Path: "/xlive/general-interface/v1/rank/getOnlineGoldRank", Description: "获取在线人数和在线高能榜"},
+	"GetRoomPlaybackURL":    {Name: "GetRoomPlaybackURL", Method: http.MethodGet, Path: "/xlive/web-room/v2/index/getRoomPlayInfo", Description: "获取直播间回拉播放地址"},
 	"GetDanmakuInfo":        {Name: "GetDanmakuInfo", Method: http.MethodGet, Path: "/xlive/web-room/v1/index/getDanmuInfo", Description: "获取直播间弹幕 websocket 连接信息"},
 	"GetDanmakuInfoLegacy":  {Name: "GetDanmakuInfoLegacy", Method: http.MethodGet, Path: "/room/v1/Danmu/getConf", Description: "获取直播间弹幕连接信息（备用接口）"},
 	"GetWebNav":             {Name: "GetWebNav", Method: http.MethodGet, Path: "https://api.bilibili.com/x/web-interface/nav", Description: "获取当前网页登录用户 UID"},

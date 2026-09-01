@@ -12,8 +12,12 @@ import (
 	"github.com/rivo/tview"
 )
 
-// ErrLiveEditCancelled 用于区分用户主动取消表单和终端/渲染错误，避免匹配本地化文本。
-var ErrLiveEditCancelled = errors.New("已取消修改直播资料")
+var (
+	// ErrLiveEditCancelled 表示用户主动退出资料编辑。
+	ErrLiveEditCancelled = errors.New("已取消修改直播资料")
+	// ErrLiveEditUnchanged 表示用户保存了未发生变化的资料。
+	ErrLiveEditUnchanged = errors.New("直播资料没有变化")
+)
 
 // ErrLiveSettingsCancelled 用于区分用户主动放弃开播和设置/网络错误。
 var ErrLiveSettingsCancelled = errors.New("已取消设置开播信息")
@@ -186,13 +190,14 @@ func RunLiveEditContext(ctx context.Context, initial api.LiveSettings, areas []a
 	return runLiveEdit(ctx, initial, areas)
 }
 
-func runLiveEdit(ctx context.Context, initial api.LiveSettings, areas []api.LiveArea) (api.LiveSettings, error) {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	applyTheme()
-	app := tview.NewApplication().EnableMouse(true).EnablePaste(true).SetTitle("bili-live-tui")
+type liveEditPage struct {
+	root      tview.Primitive
+	form      *tview.Form
+	setStatus func(string, bool)
+	cancel    func()
+}
 
+func newLiveEditPage(app *tview.Application, initial api.LiveSettings, areas []api.LiveArea, onSave func(api.LiveSettings), onCancel func()) *liveEditPage {
 	form, state := newLiveFormWithSettings(areas, &initial, "修改直播资料")
 	status := tview.NewTextView()
 	status.SetDynamicColors(true)
@@ -203,25 +208,8 @@ func runLiveEdit(ctx context.Context, initial api.LiveSettings, areas []api.Live
 		if isError {
 			color = errorColor
 		}
-		status.SetText("[" + color.String() + "]" + message + "[-]")
+		status.SetText("[" + color.String() + "]" + tview.Escape(message) + "[-]")
 	}
-
-	pages := tview.NewPages()
-	body := tview.NewFlex()
-	body.SetDirection(tview.FlexRow)
-	body.SetBackgroundColor(tview.Styles.PrimitiveBackgroundColor)
-	// 编辑页面字段较少，同样保留表单的垂直滚动能力。
-	body.AddItem(form, 0, 1, true)
-	body.AddItem(status, 2, 0, false)
-	configureResponsiveLiveForm(app, form, state.description)
-	root := wideFormPage(
-		pageHeader("修改直播资料", "保存后会立即同步到直播间"),
-		body,
-		pageFooter("Tab 切换　Enter 确认　Esc/Ctrl+C 放弃修改　支持鼠标点击"),
-	)
-	pages.AddPage("main", root, true, true)
-	result := initial
-	cancelled := false
 	form.AddButton("保存修改", func() {
 		settings := state.settings()
 		if err := settings.Validate(); err != nil {
@@ -232,25 +220,60 @@ func runLiveEdit(ctx context.Context, initial api.LiveSettings, areas []api.Live
 			setStatus(err.Error(), true)
 			return
 		}
-		result = settings
-		app.Stop()
+		if onSave != nil {
+			onSave(settings)
+		}
 	})
 	form.GetButton(form.GetButtonCount() - 1).SetLabel("  保存修改  ").
 		SetStyle(tcell.StyleDefault.Background(accentColor).Foreground(buttonTextColor).Bold(true)).
 		SetActivatedStyle(tcell.StyleDefault.Background(accentActiveColor).Foreground(buttonActiveTextColor).Bold(true))
 	form.AddButton("取消修改", func() {
-		cancelled = true
-		app.Stop()
+		if onCancel != nil {
+			onCancel()
+		}
 	})
 	equalizeButtonWidths(form)
 	form.SetCancelFunc(func() {
+		if onCancel != nil {
+			onCancel()
+		}
+	})
+
+	body := tview.NewFlex()
+	body.SetDirection(tview.FlexRow)
+	body.SetBackgroundColor(tview.Styles.PrimitiveBackgroundColor)
+	body.AddItem(form, 0, 1, true)
+	body.AddItem(status, 2, 0, false)
+	configureResponsiveLiveForm(app, form, state.description)
+	root := wideFormPage(
+		pageHeader("修改直播资料", "保存后会立即同步到直播间"),
+		body,
+		pageFooter("Tab 切换　Enter 确认　Esc/Ctrl+C 放弃修改　支持鼠标点击"),
+	)
+	return &liveEditPage{root: root, form: form, setStatus: setStatus, cancel: onCancel}
+}
+
+func runLiveEdit(ctx context.Context, initial api.LiveSettings, areas []api.LiveArea) (api.LiveSettings, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	applyTheme()
+	app := tview.NewApplication().EnableMouse(true).EnablePaste(true).SetTitle("bili-live-tui")
+
+	pages := tview.NewPages()
+	result := initial
+	cancelled := false
+	page := newLiveEditPage(app, initial, areas, func(settings api.LiveSettings) {
+		result = settings
+		app.Stop()
+	}, func() {
 		cancelled = true
 		app.Stop()
 	})
+	pages.AddPage("main", page.root, true, true)
 	app.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 		if event.Key() == tcell.KeyCtrlC {
-			cancelled = true
-			app.Stop()
+			page.cancel()
 			return nil
 		}
 		return event
@@ -264,7 +287,7 @@ func runLiveEdit(ctx context.Context, initial api.LiveSettings, areas []api.Live
 		case <-viewDone:
 		}
 	}()
-	if err := app.SetRoot(pages, true).SetFocus(form).Run(); err != nil {
+	if err := app.SetRoot(pages, true).SetFocus(page.form).Run(); err != nil {
 		return initial, fmt.Errorf("启动资料编辑界面失败: %w", err)
 	}
 	if ctx.Err() != nil {
