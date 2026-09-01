@@ -27,11 +27,39 @@ func TestTestRuntimeParsesFFmpegProgress(t *testing.T) {
 	}
 }
 
+func TestReadProgressSignalsConfirmedOutput(t *testing.T) {
+	runtime := NewTestRuntime()
+	ready := make(chan struct{})
+	runtime.readProgressWithReady(strings.NewReader("frame=1\n"), ready)
+	select {
+	case <-ready:
+	default:
+		t.Fatal("FFmpeg output progress was not confirmed")
+	}
+}
+
+func TestFFmpegReconnectDelayStopsGrowing(t *testing.T) {
+	want := []time.Duration{2 * time.Second, 5 * time.Second, 10 * time.Second, 15 * time.Second, 15 * time.Second}
+	for attempt, expected := range want {
+		if got := ffmpegReconnectDelay(attempt); got != expected {
+			t.Fatalf("reconnect delay %d = %v, want %v", attempt, got, expected)
+		}
+	}
+}
+
 func TestTestRuntimeKeepsSanitizedFFmpegFailureDetail(t *testing.T) {
 	runtime := NewTestRuntime()
-	runtime.readProgress(strings.NewReader("[flv @ 0x1] Error opening output rtmp://example/live/?key=secret: Input/output error\n"))
+	runtime.readProgress(strings.NewReader("[flv @ 0x1] Error opening output rtmp://example/live/?key=secret: Input/output error\nConversion failed!\n"))
 	if strings.Contains(runtime.lastLog, "secret") || !strings.Contains(runtime.lastLog, "[REDACTED]") || !strings.Contains(runtime.lastLog, "Input/output error") {
 		t.Fatalf("sanitized FFmpeg detail = %q", runtime.lastLog)
+	}
+}
+
+func TestReadProgressDoesNotTreatProgressMarkerAsError(t *testing.T) {
+	runtime := NewTestRuntime()
+	runtime.readProgress(strings.NewReader("progress=continue\nprogress=end\n"))
+	if runtime.lastLog != "" {
+		t.Fatalf("progress marker became error detail: %q", runtime.lastLog)
 	}
 }
 

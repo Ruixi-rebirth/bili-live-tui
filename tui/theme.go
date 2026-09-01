@@ -106,15 +106,6 @@ func workspacePage(header, body, footer tview.Primitive) tview.Primitive {
 	return root
 }
 
-func stylePanel(box *tview.Box, title string) *tview.Box {
-	return box.
-		SetBackgroundColor(panelColor).
-		SetBorder(true).
-		SetBorderColor(tview.Styles.BorderColor).
-		SetTitle(" ♡ " + title + " ♡ ").
-		SetTitleColor(tview.Styles.TitleColor)
-}
-
 func styleForm(form *tview.Form, title string) *tview.Form {
 	form.SetBackgroundColor(panelColor)
 	form.SetBorder(true)

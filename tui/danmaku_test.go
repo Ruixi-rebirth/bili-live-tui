@@ -60,7 +60,6 @@ func TestDanmakuStreamContinuesAfterAuthentication(t *testing.T) {
 		ctx,
 		connect,
 		queueUI,
-		func(api.DanmakuEvent) {},
 		onEvent,
 		tview.NewTextView(),
 		chat,
@@ -172,8 +171,8 @@ func TestObservePopularityKeepsLatestValue(t *testing.T) {
 	session.ObservePopularity(88, now.Add(time.Second))
 	session.ObservePopularity(0, now.Add(2*time.Second))
 	session.ObservePopularity(7, now.Add(-time.Second))
-	if got, known := session.Popularity(); !known || got != 88 {
-		t.Fatalf("popularity = (%d, %t), want latest value (88, true)", got, known)
+	if got, known := session.Popularity(); !known || got != 0 {
+		t.Fatalf("popularity = (%d, %t), want latest value (0, true)", got, known)
 	}
 }
 
@@ -209,6 +208,17 @@ func TestDanmakuStatusDoesNotDuplicateViewerCount(t *testing.T) {
 		viewerKnown:  true,
 	}
 	if got := formatDanmakuSessionStatus(snapshot); got != "弹幕已连接 · 当前人气 88" {
+		t.Fatalf("danmaku status = %q", got)
+	}
+}
+
+func TestDanmakuStatusPreservesConnectedNode(t *testing.T) {
+	snapshot := liveDanmakuSnapshot{
+		status:      "弹幕已连接 · 节点 broadcast.example:443 · 当前人气 42",
+		online:      88,
+		onlineKnown: true,
+	}
+	if got := formatDanmakuSessionStatus(snapshot); got != "弹幕已连接 · 节点 broadcast.example:443 · 当前人气 88" {
 		t.Fatalf("danmaku status = %q", got)
 	}
 }

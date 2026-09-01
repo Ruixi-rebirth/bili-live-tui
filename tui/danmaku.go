@@ -3,7 +3,7 @@ package tui
 import (
 	"context"
 	"fmt"
-	"io"
+	"net/url"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -15,37 +15,9 @@ import (
 	"github.com/rivo/tview"
 )
 
-// RunDanmaku 保留原有的无凭证入口，供只需要显示弹幕页的调用方使用。
-// 直播主流程应使用 RunDanmakuLive，以连接真实 WebSocket 和发送 API。
-func RunDanmaku(_ io.Reader, _ io.Writer) (Navigation, error) {
-	return runDanmaku(context.Background(), nil, "", "", "", nil, nil, nil)
-}
-
-// RunDanmakuLive 打开指定房间的弹幕页。接收、礼物/系统事件解析和发送由 internal/api
-// 处理，本函数只负责把标准化事件映射到 TUI 并管理页面导航。
-func RunDanmakuLive(ctx context.Context, client *api.Client, roomID, sessdata, biliJCT string, _ io.Reader, _ io.Writer) (Navigation, error) {
-	return runDanmaku(ctx, client, roomID, sessdata, biliJCT, nil, nil, nil)
-}
-
-// RunDanmakuLiveWithStats 与 RunDanmakuLive 相同，并将标准化事件额外通知调用方。
-// 回调运行在 UI 协程之外，可用于统计本场礼物等会话数据。
-func RunDanmakuLiveWithStats(ctx context.Context, client *api.Client, roomID, sessdata, biliJCT string, onEvent func(api.DanmakuEvent), _ io.Reader, _ io.Writer) (Navigation, error) {
-	return runDanmaku(ctx, client, roomID, sessdata, biliJCT, onEvent, nil, nil)
-}
-
-// RunDanmakuLiveWithStatsAndHealth 在弹幕页增加本地 RTMP 推流状态，
-// 同时保留原有弹幕事件回调。
-func RunDanmakuLiveWithStatsAndHealth(ctx context.Context, client *api.Client, roomID, sessdata, biliJCT string, onEvent func(api.DanmakuEvent), healthLoader func() streamruntime.Health, _ io.Reader, _ io.Writer) (Navigation, error) {
-	return runDanmaku(ctx, client, roomID, sessdata, biliJCT, onEvent, healthLoader, nil)
-}
-
-// RunDanmakuSessionView 将终端页面挂载到长期弹幕会话上。
+// RunDanmaku 将终端页面挂载到长期弹幕会话上。
 // 离开页面不会关闭 WebSocket 或丢弃历史记录。
-func RunDanmakuSessionView(ctx context.Context, session *LiveDanmakuSession, client *api.Client, roomID, sessdata, biliJCT string, healthLoader func() streamruntime.Health, _ io.Reader, _ io.Writer) (Navigation, error) {
-	return runDanmaku(ctx, client, roomID, sessdata, biliJCT, nil, healthLoader, session)
-}
-
-func runDanmaku(ctx context.Context, client *api.Client, roomID, sessdata, biliJCT string, onEvent func(api.DanmakuEvent), healthLoader func() streamruntime.Health, session *LiveDanmakuSession) (Navigation, error) {
+func RunDanmaku(ctx context.Context, session *LiveDanmakuSession, client *api.Client, roomID, sessdata, biliJCT string, healthLoader func() streamruntime.Health) (Navigation, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -63,27 +35,14 @@ func runDanmaku(ctx context.Context, client *api.Client, roomID, sessdata, biliJ
 	// 工作区标题已经命名页面；清空弹幕框标题，避免“弹幕互动”重复显示，同时保留边框。
 	chat.SetTitle("")
 	chat.SetTitleColor(tview.Styles.TitleColor)
-	var initialSessionSnapshot liveDanmakuSnapshot
-	if session != nil {
-		initialSessionSnapshot = session.snapshot()
-		renderDanmakuHistory(chat, initialSessionSnapshot.history, initialSessionSnapshot.placeholder)
-	} else if client != nil && strings.TrimSpace(roomID) != "" {
-		chat.SetText("正在连接弹幕服务器……")
-	} else {
-		chat.SetText("等待弹幕连接……")
-	}
+	initialSessionSnapshot := session.snapshot()
+	renderDanmakuHistory(chat, initialSessionSnapshot.history, initialSessionSnapshot.placeholder)
 
 	status := tview.NewTextView()
 	status.SetDynamicColors(true)
 	status.SetTextColor(mutedColor)
 	status.SetBackgroundColor(panelColor)
-	if session != nil {
-		status.SetText(formatDanmakuSessionStatus(initialSessionSnapshot))
-	} else if client != nil && strings.TrimSpace(roomID) != "" {
-		status.SetText("正在连接弹幕服务……")
-	} else {
-		status.SetText("弹幕服务尚未连接；你发送的内容会暂存在本地记录中。")
-	}
+	status.SetText(formatDanmakuSessionStatus(initialSessionSnapshot))
 	onlineRank := tview.NewTextView()
 	onlineRank.SetScrollable(true)
 	onlineRank.SetDynamicColors(true)
@@ -115,10 +74,8 @@ func runDanmaku(ctx context.Context, client *api.Client, roomID, sessdata, biliJ
 			Foreground(tview.Styles.PrimaryTextColor)).
 		SetAcceptanceFunc(tview.InputFieldMaxLength(80))
 	reply.SetBackgroundColor(panelColor).SetBorder(true).SetBorderColor(accentColor)
-	if session != nil {
-		reply.SetText(initialSessionSnapshot.draft)
-		reply.SetChangedFunc(session.SetDraft)
-	}
+	reply.SetText(initialSessionSnapshot.draft)
+	reply.SetChangedFunc(session.SetDraft)
 
 	navigation := NavigationQuit
 	sentCount := 0
@@ -126,7 +83,6 @@ func runDanmaku(ctx context.Context, client *api.Client, roomID, sessdata, biliJ
 	uiOpen.Store(true)
 	streamCtx, cancelStream := context.WithCancel(ctx)
 	uiUpdates := make(chan func(), 256)
-	var streamDone chan struct{}
 	stopApplication := func() {
 		uiOpen.Store(false)
 		cancelStream()
@@ -158,23 +114,9 @@ func runDanmaku(ctx context.Context, client *api.Client, roomID, sessdata, biliJ
 			}
 		}
 	}()
-	chatHasMessages := len(initialSessionSnapshot.history) > 0
-	appendMessage := func(event api.DanmakuEvent) {
-		if !chatHasMessages {
-			chat.SetText("")
-		}
-		appendDanmakuEvent(chat, event, chatHasMessages)
-		chatHasMessages = true
-	}
 	clearChat := func() {
-		if session != nil {
-			session.ClearHistory()
-		} else {
-			chat.SetText("暂无弹幕记录。")
-			chat.ScrollToBeginning()
-		}
+		session.ClearHistory()
 		sentCount = 0
-		chatHasMessages = false
 		sendStatus.SetText("已清空本地弹幕记录。")
 	}
 	sending := false
@@ -186,21 +128,6 @@ func runDanmaku(ctx context.Context, client *api.Client, roomID, sessdata, biliJ
 		message := strings.TrimSpace(reply.GetText())
 		if message == "" {
 			sendStatus.SetText("内容不能为空。")
-			return
-		}
-		if client == nil || strings.TrimSpace(roomID) == "" {
-			reply.SetText("")
-			sentCount++
-			separator := ""
-			if chatHasMessages {
-				separator = "\n"
-			} else {
-				chat.SetText("")
-			}
-			_, _ = chat.Write([]byte(fmt.Sprintf("%s[%s] 我：%s", separator, time.Now().Format("15:04:05"), tview.Escape(message))))
-			chatHasMessages = true
-			chat.ScrollToEnd()
-			sendStatus.SetText(fmt.Sprintf("已记录 %d 条本地消息；弹幕服务尚未连接。", sentCount))
 			return
 		}
 		sending = true
@@ -256,9 +183,7 @@ func runDanmaku(ctx context.Context, client *api.Client, roomID, sessdata, biliJ
 	activity.SetDirection(tview.FlexColumn)
 	activity.SetBackgroundColor(panelColor)
 	activity.AddItem(chat, 0, 1, true)
-	if session != nil {
-		activity.AddItem(onlineRank, 32, 0, false)
-	}
+	activity.AddItem(onlineRank, 32, 0, false)
 	body.AddItem(activity, 0, 1, true)
 	body.AddItem(status, 1, 0, false)
 	body.AddItem(sendStatus, 1, 0, false)
@@ -274,64 +199,54 @@ func runDanmaku(ctx context.Context, client *api.Client, roomID, sessdata, biliJ
 	)
 	pages.AddPage("main", root, true, true)
 	pages.AddPage("confirm-stop", confirm, true, false)
-	if session != nil {
-		wideRankLayout := true
-		rankRows := 7
-		app.SetBeforeDrawFunc(func(screen tcell.Screen) bool {
-			width, height := screen.Size()
-			wide := width >= 92
-			rows := 7
-			if height < 22 {
-				rows = 5
+	wideRankLayout := true
+	rankRows := 7
+	app.SetBeforeDrawFunc(func(screen tcell.Screen) bool {
+		width, height := screen.Size()
+		wide := width >= 92
+		rows := 7
+		if height < 22 {
+			rows = 5
+		}
+		if wide != wideRankLayout || (!wide && rows != rankRows) {
+			if wide {
+				activity.SetDirection(tview.FlexColumn)
+				activity.ResizeItem(onlineRank, 32, 0)
+			} else {
+				activity.SetDirection(tview.FlexRow)
+				activity.ResizeItem(onlineRank, rows, 0)
 			}
-			if wide != wideRankLayout || (!wide && rows != rankRows) {
-				if wide {
-					activity.SetDirection(tview.FlexColumn)
-					activity.ResizeItem(onlineRank, 32, 0)
-				} else {
-					activity.SetDirection(tview.FlexRow)
-					activity.ResizeItem(onlineRank, rows, 0)
-				}
-				wideRankLayout = wide
-				rankRows = rows
-			}
-			return false
-		})
-	}
-	if session == nil && client != nil && strings.TrimSpace(roomID) != "" {
-		streamDone = make(chan struct{})
-		go runDanmakuStream(streamCtx, client, roomID, sessdata, biliJCT, queueUI, appendMessage, onEvent, status, chat, streamDone)
-	}
-	var unsubscribe func()
-	if session != nil {
-		updates, detach := session.subscribe()
-		unsubscribe = detach
-		// 将更新与上方实际绘制的快照比较。subscribe 始终安排一次刷新，
-		// 因此页面挂载期间收到的消息不会被误认为已经显示。
-		renderedHistoryRevision := initialSessionSnapshot.historyRevision
-		go func() {
-			for {
-				select {
-				case <-streamCtx.Done():
+			wideRankLayout = wide
+			rankRows = rows
+		}
+		return false
+	})
+	updates, unsubscribe := session.subscribe()
+	// 将更新与上方实际绘制的快照比较。subscribe 始终安排一次刷新，
+	// 因此页面挂载期间收到的消息不会被误认为已经显示。
+	renderedHistoryRevision := initialSessionSnapshot.historyRevision
+	go func() {
+		for {
+			select {
+			case <-streamCtx.Done():
+				return
+			case _, ok := <-updates:
+				if !ok {
 					return
-				case _, ok := <-updates:
-					if !ok {
-						return
-					}
-					snapshot := session.snapshot()
-					queueUI(func() {
-						status.SetText(formatDanmakuSessionStatus(snapshot))
-						renderOnlineRank(onlineRank, snapshot)
-						if snapshot.historyRevision != renderedHistoryRevision {
-							renderedHistoryRevision = updateDanmakuHistory(chat, snapshot, renderedHistoryRevision)
-						} else if len(snapshot.history) == 0 && chat.GetText(true) != snapshot.placeholder {
-							chat.SetText(snapshot.placeholder)
-						}
-					})
 				}
+				snapshot := session.snapshot()
+				queueUI(func() {
+					status.SetText(formatDanmakuSessionStatus(snapshot))
+					renderOnlineRank(onlineRank, snapshot)
+					if snapshot.historyRevision != renderedHistoryRevision {
+						renderedHistoryRevision = updateDanmakuHistory(chat, snapshot, renderedHistoryRevision)
+					} else if len(snapshot.history) == 0 && chat.GetText(true) != snapshot.placeholder {
+						chat.SetText(snapshot.placeholder)
+					}
+				})
 			}
-		}()
-	}
+		}
+	}()
 	if healthLoader != nil {
 		go func() {
 			ticker := time.NewTicker(2 * time.Second)
@@ -401,18 +316,12 @@ func runDanmaku(ctx context.Context, client *api.Client, roomID, sessdata, biliJ
 	if err := app.SetRoot(pages, true).SetFocus(reply).Run(); err != nil {
 		uiOpen.Store(false)
 		cancelStream()
-		if unsubscribe != nil {
-			unsubscribe()
-		}
-		waitForDanmakuStream(streamDone)
+		unsubscribe()
 		return NavigationQuit, fmt.Errorf("启动弹幕界面失败: %w", err)
 	}
 	uiOpen.Store(false)
 	cancelStream()
-	if unsubscribe != nil {
-		unsubscribe()
-	}
-	waitForDanmakuStream(streamDone)
+	unsubscribe()
 	return navigation, nil
 }
 
@@ -441,7 +350,14 @@ func formatDanmakuSessionStatus(snapshot liveDanmakuSnapshot) string {
 	if !snapshot.onlineKnown || !strings.HasPrefix(snapshot.status, "弹幕已连接") {
 		return snapshot.status
 	}
-	return fmt.Sprintf("弹幕已连接 · 当前人气 %d", snapshot.online)
+	status := strings.TrimSuffix(snapshot.status, "，消息会实时显示。")
+	for _, marker := range []string{" · 当前人气 ", " · 人气 "} {
+		if index := strings.LastIndex(status, marker); index >= 0 {
+			status = status[:index]
+			break
+		}
+	}
+	return fmt.Sprintf("%s · 当前人气 %d", status, snapshot.online)
 }
 
 func appendDanmakuEvent(chat *tview.TextView, event api.DanmakuEvent, prependLineBreak bool) {
@@ -457,8 +373,6 @@ func appendDanmakuEvent(chat *tview.TextView, event api.DanmakuEvent, prependLin
 	switch event.Kind {
 	case api.DanmakuEventGift:
 		prefixColor = tcell.NewHexColor(0xd68a4b)
-	case api.DanmakuEventSuperChat:
-		prefixColor = tcell.NewHexColor(0xd65e78)
 	case api.DanmakuEventSystem:
 		prefixColor = mutedColor
 	}
@@ -581,24 +495,6 @@ func updateDanmakuHistory(chat *tview.TextView, snapshot liveDanmakuSnapshot, re
 	return snapshot.historyRevision
 }
 
-func waitForDanmakuStream(done <-chan struct{}) {
-	if done == nil {
-		return
-	}
-	select {
-	case <-done:
-	case <-time.After(time.Second):
-		// 本地套接字已取消后，即使远端关闭握手无响应，也不能阻塞页面导航或正常退出。
-	}
-}
-
-func runDanmakuStream(ctx context.Context, client *api.Client, roomID, sessdata, biliJCT string, queueUI func(func()), appendMessage func(api.DanmakuEvent), onEvent func(api.DanmakuEvent), status, chat *tview.TextView, done chan<- struct{}) {
-	connect := func(ctx context.Context) (danmakuStreamConnection, error) {
-		return client.ConnectDanmakuWithCookie(ctx, roomID, sessdata, biliJCT)
-	}
-	runDanmakuStreamWithConnector(ctx, connect, queueUI, appendMessage, onEvent, status, chat, done)
-}
-
 // danmakuStreamConnection 和 danmakuStreamConnector 让重连循环独立于 WebSocket 实现。
 // 这样既便于理解生命周期，也能测试认证响应不会意外终止消息消费循环。
 type danmakuStreamConnection interface {
@@ -609,18 +505,22 @@ type danmakuStreamConnection interface {
 
 type danmakuStreamConnector func(context.Context) (danmakuStreamConnection, error)
 
-func runDanmakuStreamWithConnector(ctx context.Context, connect danmakuStreamConnector, queueUI func(func()), appendMessage func(api.DanmakuEvent), onEvent func(api.DanmakuEvent), status, chat *tview.TextView, done chan<- struct{}) {
+func runDanmakuStreamWithConnector(ctx context.Context, connect danmakuStreamConnector, queueUI func(func()), handleEvent func(api.DanmakuEvent), status, chat *tview.TextView, done chan<- struct{}) {
 	defer close(done)
 	// TCP/WebSocket 连接成功不足以说明弹幕已连接，认证可能紧接着失败。
 	// 只有收到服务器首个事件后才把会话标记为已建立。
+	attempt := 0
 	for {
+		attempt++
+		currentAttempt := attempt
+		queueUI(func() { status.SetText(fmt.Sprintf("正在连接弹幕服务（第 %d 次）……", currentAttempt)) })
 		stream, err := connect(ctx)
 		if err != nil {
 			if ctx.Err() != nil {
 				return
 			}
 			queueUI(func() {
-				status.SetText("弹幕连接失败，5 秒后重试：" + tview.Escape(err.Error()))
+				status.SetText(fmt.Sprintf("弹幕连接失败（第 %d 次），5 秒后重试：%s", currentAttempt, tview.Escape(err.Error())))
 				chat.SetText("暂时无法连接弹幕服务器。\n\n" + tview.Escape(err.Error()) + "\n\n正在自动重试……")
 			})
 			if !waitDanmakuRetry(ctx, 5*time.Second) {
@@ -630,6 +530,15 @@ func runDanmakuStreamWithConnector(ctx context.Context, connect danmakuStreamCon
 		}
 
 		queueUI(func() { status.SetText("已建立通道，正在等待服务器确认……") })
+		endpoint := ""
+		if details, ok := stream.(interface{ Endpoint() string }); ok {
+			endpoint = details.Endpoint()
+		}
+		endpointLabel := tview.Escape(formatDanmakuEndpoint(endpoint))
+		connectedStatus := "弹幕已连接，消息会实时显示。"
+		if endpointLabel != "" {
+			connectedStatus = "弹幕已连接 · 节点 " + endpointLabel
+		}
 		confirmedConnection := false
 		streamEnded := false
 		disconnectReason := ""
@@ -654,27 +563,27 @@ func runDanmakuStreamWithConnector(ctx context.Context, connect danmakuStreamCon
 						}
 						// 重连使用与首次连接相同的确认状态文本。
 						// WebSocket 拨号成功但认证尚未完成时，不能宣称“已恢复”。
-						status.SetText("弹幕已连接，消息会实时显示。")
+						status.SetText(connectedStatus)
 					})
 				}
-				if onEvent != nil {
-					onEvent(event)
-				}
+				handleEvent(event)
 				if event.Kind == api.DanmakuEventConnected {
 					// 认证事件已经更新状态，继续消费当前连接；普通弹幕只会在服务器确认后到达。
 					continue
 				}
 				if event.Kind == api.DanmakuEventOnline {
 					queueUI(func() {
-						status.SetText(fmt.Sprintf("弹幕已连接 · 当前人气 %d", event.Online))
+						if endpointLabel == "" {
+							status.SetText(fmt.Sprintf("弹幕已连接 · 当前人气 %d", event.Online))
+						} else {
+							status.SetText(fmt.Sprintf("弹幕已连接 · 节点 %s · 当前人气 %d", endpointLabel, event.Online))
+						}
 					})
-				} else {
-					queueUI(func() { appendMessage(event) })
 				}
 			case streamErr, ok := <-errors:
 				if ok && streamErr != nil {
-					disconnectReason = streamErr.Error()
-					queueUI(func() { status.SetText("弹幕连接异常：" + streamErr.Error()) })
+					disconnectReason = tview.Escape(streamErr.Error())
+					queueUI(func() { status.SetText("弹幕连接异常：" + tview.Escape(streamErr.Error())) })
 				} else if !ok {
 					errors = nil
 					streamEnded = events == nil
@@ -687,7 +596,13 @@ func runDanmakuStreamWithConnector(ctx context.Context, connect danmakuStreamCon
 		}
 		reason := ""
 		if disconnectReason != "" {
-			reason = "（" + disconnectReason + "）"
+			reason = "（" + disconnectReason
+			if endpointLabel != "" {
+				reason += "；节点 " + endpointLabel
+			}
+			reason += "）"
+		} else if endpointLabel != "" {
+			reason = "（节点 " + endpointLabel + "）"
 		}
 		if confirmedConnection {
 			queueUI(func() { status.SetText("弹幕连接中断" + reason + "，5 秒后自动重连……") })
@@ -698,6 +613,14 @@ func runDanmakuStreamWithConnector(ctx context.Context, connect danmakuStreamCon
 			return
 		}
 	}
+}
+
+func formatDanmakuEndpoint(endpoint string) string {
+	parsed, err := url.Parse(strings.TrimSpace(endpoint))
+	if err == nil && parsed.Host != "" {
+		return parsed.Host
+	}
+	return strings.TrimSpace(endpoint)
 }
 
 func waitDanmakuRetry(ctx context.Context, delay time.Duration) bool {

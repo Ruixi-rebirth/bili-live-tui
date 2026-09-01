@@ -13,27 +13,8 @@ import (
 	"time"
 
 	streamruntime "bili-live-tui/internal/stream"
+	"bili-live-tui/internal/utils"
 )
-
-func StartTestStream(rtmpAddr, streamKey string, orientation ...string) (*exec.Cmd, error) {
-	// B 站的完整推流地址是 Addr + Code 拼接而成
-	fullURL := rtmpAddr + streamKey
-	direction := ""
-	if len(orientation) > 0 {
-		direction = orientation[0]
-	}
-	args := append(testSourceArgs(direction),
-		"-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
-		"-c:a", "aac", "-b:a", "128k", "-f", "flv", fullURL,
-	)
-	cmd := exec.Command("ffmpeg", args...)
-
-	if err := cmd.Start(); err != nil {
-		return nil, fmt.Errorf("启动 ffmpeg 失败: %v", err)
-	}
-
-	return cmd, nil
-}
 
 // testSourceArgs 生成带网格、色彩变化和移动方块的无依赖测试画面。
 func testSourceArgs(orientation string) []string {
@@ -48,13 +29,6 @@ func testSourceArgs(orientation string) []string {
 		"-f", "lavfi", "-i", "testsrc2=size=" + size + ":rate=30,hue=h=45*sin(2*PI*t/8)," + filter,
 		"-f", "lavfi", "-i", "sine=frequency=440:sample_rate=44100",
 	}
-}
-
-func StopStream(cmd *exec.Cmd) error {
-	if cmd != nil && cmd.Process != nil {
-		return cmd.Process.Kill()
-	}
-	return nil
 }
 
 // TestRuntime 管理用于完整测试 RTMP 链路的 FFmpeg 合成源，不依赖 OBS。
@@ -77,6 +51,19 @@ type TestRuntime struct {
 var ffmpegStreamURLPattern = regexp.MustCompile(`(?i)rtmps?://\S+`)
 
 const streamruntimeOrientationPortrait = "portrait"
+
+const (
+	ffmpegReconnectWindow      = 60 * time.Second
+	ffmpegOutputConfirmTimeout = 15 * time.Second
+	ffmpegStableRunDuration    = 10 * time.Second
+)
+
+var ffmpegReconnectDelays = []time.Duration{
+	2 * time.Second,
+	5 * time.Second,
+	10 * time.Second,
+	15 * time.Second,
+}
 
 func NewTestRuntime(orientation ...string) *TestRuntime {
 	direction := ""
@@ -111,22 +98,26 @@ func (r *TestRuntime) Start(rtmpAddr, streamKey string) error {
 	r.cmd = cmd
 	r.rtmpAddr = rtmpAddr
 	r.streamKey = streamKey
-	r.health.Active = true
-	r.health.Reconnecting = false
-	r.health.LastError = ""
+	r.health.Active = false
+	r.health.Reconnecting = true
+	r.health.LastError = "FFmpeg 已启动，正在确认有效编码帧"
 	r.mu.Unlock()
 	go r.run(cmd, progress)
 	return nil
 }
 
 func newFFmpegProcess(rtmpAddr, streamKey, orientation string) (*exec.Cmd, io.ReadCloser, error) {
+	ffmpegPath, err := utils.GetExecutablePath("ffmpeg")
+	if err != nil {
+		return nil, nil, err
+	}
 	args := []string{"-hide_banner", "-nostats", "-progress", "pipe:2"}
 	args = append(args, testSourceArgs(orientation)...)
 	args = append(args,
 		"-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
 		"-c:a", "aac", "-b:a", "128k", "-f", "flv", rtmpAddr+streamKey,
 	)
-	cmd := exec.Command("ffmpeg", args...)
+	cmd := exec.Command(ffmpegPath, args...)
 	progress, err := cmd.StderrPipe()
 	if err != nil {
 		return nil, nil, fmt.Errorf("读取 FFmpeg 状态失败: %w", err)
@@ -139,88 +130,219 @@ func newFFmpegProcess(rtmpAddr, streamKey, orientation string) (*exec.Cmd, io.Re
 }
 
 func (r *TestRuntime) run(cmd *exec.Cmd, progress io.ReadCloser) {
-	r.mu.RLock()
-	stopping := r.stopping
-	r.mu.RUnlock()
-	if stopping {
-		r.mu.Lock()
-		r.health.Active = false
-		r.health.Reconnecting = false
-		r.mu.Unlock()
-		stopFFmpegProcess(cmd, progress)
-		r.finish()
-		return
-	}
-	progressDone := make(chan struct{})
-	go func() {
-		r.readProgress(progress)
-		close(progressDone)
-	}()
-	err := cmd.Wait()
-	<-progressDone
-	_ = progress.Close()
-
-	r.mu.Lock()
-	if r.stopping {
-		r.health.Active = false
-		r.health.Reconnecting = false
-		r.mu.Unlock()
-		r.finish()
-		return
-	}
-	detail := r.lastLog
-	if err != nil {
-		detail = "FFmpeg 测试源已退出：" + err.Error() + "；" + detail
-	}
-	r.health.Active = false
-	r.health.Reconnecting = true
-	r.health.LastError = strings.TrimSuffix(detail, "；")
-	r.mu.Unlock()
-
-	deadline := time.Now().Add(60 * time.Second)
-	delays := []time.Duration{2 * time.Second, 5 * time.Second, 10 * time.Second, 15 * time.Second, 15 * time.Second, 13 * time.Second}
-	for _, delay := range delays {
-		if time.Now().After(deadline) {
-			break
-		}
-		timer := time.NewTimer(delay)
-		select {
-		case <-r.stopCh:
-			if !timer.Stop() {
-				<-timer.C
-			}
+	recoveryStarted := time.Time{}
+	attempt := 0
+	for {
+		err, stable := r.waitFFmpegProcess(cmd, progress)
+		if r.isStopping() {
+			r.setStoppedHealth()
 			r.finish()
 			return
-		case <-timer.C:
 		}
-		newCmd, newProgress, startErr := newFFmpegProcess(r.rtmpAddr, r.streamKey, r.orientation)
-		if startErr == nil {
+
+		detail := r.ffmpegExitDetail(err)
+		// 一次产生有效帧且稳定运行过的恢复应开始新的重连窗口；否则短暂
+		// 拉起又退出会持续消耗原窗口，不能无限重置 60 秒倒计时。
+		if recoveryStarted.IsZero() || stable {
+			recoveryStarted = time.Now()
+			attempt = 0
+		}
+		r.setReconnectHealth(detail)
+
+		for {
+			remaining := ffmpegReconnectWindow - time.Since(recoveryStarted)
+			if remaining <= 0 {
+				r.setReconnectTimeout(detail)
+				r.finish()
+				return
+			}
+			attempt++
+			delay := ffmpegReconnectDelay(attempt - 1)
+			if delay > remaining {
+				delay = remaining
+			}
+			r.setReconnectWaiting(detail, attempt, delay)
+			if !r.waitReconnectDelay(delay) {
+				r.setStoppedHealth()
+				r.finish()
+				return
+			}
+
+			newCmd, newProgress, startErr := newFFmpegProcess(r.rtmpAddr, r.streamKey, r.orientation)
+			if startErr != nil {
+				detail = "启动 FFmpeg 重连进程失败：" + startErr.Error()
+				r.setReconnectHealth(detail)
+				continue
+			}
 			r.mu.Lock()
 			if r.stopping {
 				r.mu.Unlock()
 				stopFFmpegProcess(newCmd, newProgress)
+				r.setStoppedHealth()
 				r.finish()
 				return
 			}
 			r.cmd = newCmd
-			r.health.Active = true
-			r.health.Reconnecting = false
-			r.health.LastError = ""
+			r.health.Active = false
+			r.health.Reconnecting = true
+			r.health.LastError = fmt.Sprintf("FFmpeg 已重启，正在确认推流是否恢复（第 %d 次）", attempt)
+			r.health.Duration = 0
+			r.health.FPS = 0
+			r.health.BitrateKbps = 0
+			r.health.SkippedFrames = 0
+			r.health.TotalFrames = 0
 			r.lastLog = ""
 			r.mu.Unlock()
-			r.run(newCmd, newProgress)
-			return
+			cmd, progress = newCmd, newProgress
+			break
 		}
-		r.mu.Lock()
-		r.health.LastError = fmt.Sprintf("等待网络恢复，重连失败：%v", startErr)
-		r.mu.Unlock()
 	}
+}
+
+func (r *TestRuntime) waitFFmpegProcess(cmd *exec.Cmd, progress io.ReadCloser) (error, bool) {
+	progressDone := make(chan struct{})
+	outputReady := make(chan struct{})
+	go func() {
+		r.readProgressWithReady(progress, outputReady)
+		close(progressDone)
+	}()
+	waitDone := make(chan error, 1)
+	go func() { waitDone <- cmd.Wait() }()
+	confirmTimer := time.NewTimer(ffmpegOutputConfirmTimeout)
+	defer confirmTimer.Stop()
+	var stableTimer *time.Timer
+	var stableC <-chan time.Time
+	stable := false
+	defer func() {
+		if stableTimer != nil {
+			stableTimer.Stop()
+		}
+	}()
+	for {
+		select {
+		case err := <-waitDone:
+			<-progressDone
+			_ = progress.Close()
+			return err, stable
+		case <-outputReady:
+			outputReady = nil
+			if !confirmTimer.Stop() {
+				select {
+				case <-confirmTimer.C:
+				default:
+				}
+			}
+			stableTimer = time.NewTimer(ffmpegStableRunDuration)
+			stableC = stableTimer.C
+			r.mu.Lock()
+			if !r.stopping && r.cmd == cmd {
+				r.health.LastError = "FFmpeg 已产生编码帧，正在确认推流稳定"
+			}
+			r.mu.Unlock()
+		case <-confirmTimer.C:
+			if cmd.Process != nil {
+				_ = cmd.Process.Kill()
+			}
+			err := <-waitDone
+			<-progressDone
+			_ = progress.Close()
+			if err != nil {
+				return fmt.Errorf("FFmpeg 在 %s 内未产生有效编码帧：%w", ffmpegOutputConfirmTimeout, err), false
+			}
+			return fmt.Errorf("FFmpeg 在 %s 内未产生有效编码帧", ffmpegOutputConfirmTimeout), false
+		case <-stableC:
+			stable = true
+			stableC = nil
+			r.mu.Lock()
+			if !r.stopping && r.cmd == cmd {
+				r.health.Active = true
+				r.health.Reconnecting = false
+				r.health.LastError = ""
+			}
+			r.mu.Unlock()
+		}
+	}
+}
+
+func (r *TestRuntime) isStopping() bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.stopping
+}
+
+func (r *TestRuntime) setStoppedHealth() {
 	r.mu.Lock()
 	r.health.Active = false
 	r.health.Reconnecting = false
-	r.health.LastError = "等待网络恢复超时：" + strings.TrimPrefix(r.health.LastError, "等待网络恢复，重连失败：")
 	r.mu.Unlock()
-	r.finish()
+}
+
+func (r *TestRuntime) ffmpegExitDetail(err error) string {
+	r.mu.RLock()
+	detail := strings.TrimSpace(r.lastLog)
+	r.mu.RUnlock()
+	if err != nil {
+		if detail != "" {
+			return "FFmpeg 测试源已退出：" + err.Error() + "；" + detail
+		}
+		return "FFmpeg 测试源已退出：" + err.Error()
+	}
+	if detail != "" {
+		return detail
+	}
+	return "FFmpeg 测试源已退出"
+}
+
+func (r *TestRuntime) setReconnectHealth(detail string) {
+	r.mu.Lock()
+	r.health.Active = false
+	r.health.Reconnecting = true
+	r.health.LastError = detail
+	r.mu.Unlock()
+}
+
+func (r *TestRuntime) setReconnectWaiting(detail string, attempt int, delay time.Duration) {
+	r.mu.Lock()
+	r.health.Active = false
+	r.health.Reconnecting = true
+	r.health.LastError = fmt.Sprintf("%s；%s后进行第 %d 次重连", detail, formatReconnectDelay(delay), attempt)
+	r.mu.Unlock()
+}
+
+func (r *TestRuntime) setReconnectTimeout(detail string) {
+	r.mu.Lock()
+	r.health.Active = false
+	r.health.Reconnecting = false
+	r.health.LastError = "FFmpeg 连续重连超时：" + detail
+	r.mu.Unlock()
+}
+
+func (r *TestRuntime) waitReconnectDelay(delay time.Duration) bool {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-r.stopCh:
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
+func ffmpegReconnectDelay(attempt int) time.Duration {
+	if attempt < 0 {
+		attempt = 0
+	}
+	if attempt >= len(ffmpegReconnectDelays) {
+		return ffmpegReconnectDelays[len(ffmpegReconnectDelays)-1]
+	}
+	return ffmpegReconnectDelays[attempt]
+}
+
+func formatReconnectDelay(delay time.Duration) string {
+	if delay%time.Second == 0 {
+		return fmt.Sprintf("%d 秒", int(delay/time.Second))
+	}
+	return delay.Round(100 * time.Millisecond).String()
 }
 
 // stopFFmpegProcess 停止在重连期间创建、但与 Stop 发生竞态的进程。
@@ -253,7 +375,17 @@ func (r *TestRuntime) finish() {
 }
 
 func (r *TestRuntime) readProgress(progress io.Reader) {
+	r.readProgressWithReady(progress, nil)
+}
+
+func (r *TestRuntime) readProgressWithReady(progress io.Reader, outputReady chan struct{}) {
 	scanner := bufio.NewScanner(progress)
+	var readyOnce sync.Once
+	markOutputReady := func() {
+		if outputReady != nil {
+			readyOnce.Do(func() { close(outputReady) })
+		}
+	}
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		key, value, ok := strings.Cut(line, "=")
@@ -263,6 +395,9 @@ func (r *TestRuntime) readProgress(progress io.Reader) {
 			switch key {
 			case "frame":
 				r.health.TotalFrames, _ = strconv.ParseInt(strings.TrimSpace(value), 10, 64)
+				if r.health.TotalFrames > 0 {
+					markOutputReady()
+				}
 			case "fps":
 				r.health.FPS, _ = strconv.ParseFloat(strings.TrimSpace(value), 64)
 			case "drop_frames":
@@ -280,7 +415,12 @@ func (r *TestRuntime) readProgress(progress io.Reader) {
 			}
 		}
 		if !recognized && line != "" {
-			r.lastLog = sanitizeFFmpegLogLine(line)
+			message := sanitizeFFmpegLogLine(line)
+			// FFmpeg 结束时通常最后一行是“Conversion failed!”；保留更早的
+			// Error/Server/Connection 行，才能在 TUI 和诊断日志中看到根因。
+			if r.lastLog == "" || (!isFFmpegDiagnosticLine(r.lastLog) && isFFmpegDiagnosticLine(message)) {
+				r.lastLog = message
+			}
 		}
 		r.mu.Unlock()
 	}
@@ -289,6 +429,16 @@ func (r *TestRuntime) readProgress(progress io.Reader) {
 		r.lastLog = "读取 FFmpeg 输出失败：" + err.Error()
 		r.mu.Unlock()
 	}
+}
+
+func isFFmpegDiagnosticLine(line string) bool {
+	line = strings.ToLower(line)
+	for _, marker := range []string{"error", "failed", "server", "connection", "refused", "denied", "timeout", "timed out"} {
+		if strings.Contains(line, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 func sanitizeFFmpegLogLine(line string) string {
