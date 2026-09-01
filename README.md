@@ -1,42 +1,65 @@
 # bili-live-tui
 
-在终端中管理 B 站直播：扫码登录、设置直播资料、控制 OBS Studio、收发弹幕、查看推流健康并安全下播。
+`bili-live-tui` 是一个面向 B 站主播的终端控制台，将开播资料、OBS 或 FFmpeg 输出、弹幕互动和直播状态集中在一个界面中。
 
-## 环境要求
+![弹幕页面](docs/screenshots/danmaku.png)
 
-- Go 1.26 或更高版本
-- OBS Studio 30+（正式推流）
-- OBS WebSocket 5.x，默认监听 `127.0.0.1:4455`
-- FFmpeg（仅在选择“FFmpeg 测试画面”时需要）
+## 功能
 
-OBS 需要提前配置好场景、画面和声音来源。本程序负责写入 B 站 RTMP 地址并启动/停止推流，不会自动创建摄像头或采集卡来源。
+- 扫码登录并保存本地会话
+- 设置标题、分区、标签、简介、公告、封面和画面方向
+- 连接 OBS Studio，自动写入直播地址并控制开始或停止
+- 使用 FFmpeg 测试画面验证完整直播链路
+- 收发弹幕，查看当前人气、直播状态和输出健康
+- 直播中编辑房间资料，异常中断时自动尝试下播
 
-## 运行
+## 安装
 
-```bash
-go run ./cmd/bili-live-tui
-```
+从 [Releases](https://github.com/Ruixi-rebirth/bili-live-tui/releases) 下载对应平台的压缩包，解压后运行 `bili-live-tui`：
 
-使用 Nix 构建或进入开发环境：
+| 系统 | 架构 | 文件 |
+| --- | --- | --- |
+| Linux | amd64 | `bili-live-tui_linux_amd64.tar.gz` |
+| Linux | arm64 | `bili-live-tui_linux_arm64.tar.gz` |
+| macOS | Intel | `bili-live-tui_macos_amd64.tar.gz` |
+| macOS | Apple 芯片 | `bili-live-tui_macos_arm64.tar.gz` |
+| Windows | amd64 | `bili-live-tui_windows_amd64.zip` |
 
-```bash
-nix run .
-nix build .#bili-live-tui
-nix develop
-```
-
-也可以直接运行 GitHub 上的版本：
+也可以使用 Nix 直接运行：
 
 ```bash
 nix run github:Ruixi-rebirth/bili-live-tui
 ```
 
-## 界面预览
+从源码运行需要 Go 1.26 或更高版本：
 
-![弹幕互动页面](docs/screenshots/danmaku.png)
+```bash
+go run ./cmd/bili-live-tui
+```
+
+## 推流准备
+
+正式直播默认使用 OBS Studio 30+。请在 OBS 中启用 WebSocket 5.x，保持默认地址 `127.0.0.1:4455`，并提前配置好场景、画面和声音来源。程序会写入 B 站直播地址并控制推流，但不会修改场景内容。
+
+“FFmpeg 测试画面”用于验证直播链路，不需要 OBS，但要求系统已安装 `ffmpeg`。
+
+## 使用
+
+启动程序后，使用哔哩哔哩手机客户端扫码确认登录。填写开播资料并选择输出方式，开播成功后即可在弹幕页面和直播概览之间切换。
 
 ![直播概览](docs/screenshots/overview.png)
 
-首次运行会显示二维码，使用哔哩哔哩手机客户端扫码并确认。登录凭证保存在用户配置目录的 `bili-live-tui/auth.json`。成功开播后，标题、简介、公告、标签、分区、封面、推流方式和方向会保存到同目录的 `live-settings.json`，下次自动回填。
+封面支持 JPG、PNG 和 WebP，上传时会自动转换并调整尺寸。房间资料的长度和内容限制以 B 站接口返回结果为准。
 
-封面支持 JPG、PNG 和 WebP，上传前会自动转换并调整尺寸；标题、简介、公告和标签的字数由 B 站接口校验。
+## 本地数据
+
+登录凭证保存在系统用户配置目录下的 `bili-live-tui/auth.json`。最近一次成功开播的设置保存在同目录的 `live-settings.json`，供下次启动时回填。配置文件仅允许当前用户读取，B 站推流码不会写入磁盘。
+
+## 开发
+
+```bash
+go test ./...
+go vet ./...
+```
+
+使用 Nix 时可运行 `nix develop` 进入开发环境，或运行 `nix build .#bili-live-tui` 构建程序。
