@@ -3,6 +3,7 @@ module bili-live-tui
 go 1.26.5
 
 require (
+	github.com/andybalholm/brotli v1.2.3
 	github.com/andreykaipov/goobs v1.10.0
 	github.com/gdamore/tcell/v2 v2.8.1
 	github.com/gorilla/websocket v1.5.3

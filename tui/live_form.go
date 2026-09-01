@@ -128,10 +128,6 @@ func labelColorForFocus(focused bool) tcell.Color {
 	return tview.Styles.SecondaryTextColor
 }
 
-func newLiveForm(areas []api.LiveArea) (*tview.Form, *liveFormState) {
-	return newLiveFormWithOptions(areas, nil, "开播信息", true)
-}
-
 // newLiveFormWithSettings 创建开播前和直播中编辑资料共用的表单。
 // 两个页面共用一套表单定义，确保校验和显示方式一致。
 func newLiveFormWithSettings(areas []api.LiveArea, initial *api.LiveSettings, title string) (*tview.Form, *liveFormState) {

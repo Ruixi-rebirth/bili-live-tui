@@ -11,19 +11,20 @@
 - 连接 OBS Studio，自动写入直播地址并控制开始或停止
 - 使用 FFmpeg 测试画面验证完整直播链路
 - 收发弹幕，查看当前人气、直播状态和输出健康
+- 使用 mpv 回看 B 站实际收到的直播画面
 - 直播中编辑房间资料，异常中断时自动尝试下播
 
 ## 安装
 
 从 [Releases](https://github.com/Ruixi-rebirth/bili-live-tui/releases) 下载对应平台的压缩包，解压后运行 `bili-live-tui`：
 
-| 系统 | 架构 | 文件 |
-| --- | --- | --- |
-| Linux | amd64 | `bili-live-tui_linux_amd64.tar.gz` |
-| Linux | arm64 | `bili-live-tui_linux_arm64.tar.gz` |
-| macOS | Intel | `bili-live-tui_macos_amd64.tar.gz` |
-| macOS | Apple 芯片 | `bili-live-tui_macos_arm64.tar.gz` |
-| Windows | amd64 | `bili-live-tui_windows_amd64.zip` |
+| 系统    | 架构       | 文件                               |
+| ------- | ---------- | ---------------------------------- |
+| Linux   | amd64      | `bili-live-tui_linux_amd64.tar.gz` |
+| Linux   | arm64      | `bili-live-tui_linux_arm64.tar.gz` |
+| macOS   | Intel      | `bili-live-tui_macos_amd64.tar.gz` |
+| macOS   | Apple 芯片 | `bili-live-tui_macos_arm64.tar.gz` |
+| Windows | amd64      | `bili-live-tui_windows_amd64.zip`  |
 
 也可以使用 Nix 直接运行：
 
@@ -42,6 +43,8 @@ go run ./cmd/bili-live-tui
 正式直播默认使用 OBS Studio 30+。请在 OBS 中启用 WebSocket 5.x，保持默认地址 `127.0.0.1:4455`，并提前配置好场景、画面和声音来源。程序会写入 B 站直播地址并控制推流，但不会修改场景内容。
 
 “FFmpeg 测试画面”用于验证直播链路，不需要 OBS，但要求系统已安装 `ffmpeg`。
+
+直播概览中的“预览直播”会用 `mpv` 打开 B 站回拉画面，用来确认观众端实际能看到的内容。该功能默认静音以避免声音回授。
 
 ## 使用
 

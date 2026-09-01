@@ -126,6 +126,43 @@ func TestWatchStreamOutputIgnoresSessionShutdown(t *testing.T) {
 	}
 }
 
+func TestMPVPreviewArgsPlayBilibiliURLDirectly(t *testing.T) {
+	args := mpvPreviewArgs("123", "https://cdn.example.com/live.m3u8?token=value")
+	joined := strings.Join(args, "\n")
+	for _, expected := range []string{
+		"--force-window=immediate",
+		"--terminal=no",
+		"--no-config",
+		"--cache=no",
+		"--demuxer-readahead-secs=0",
+		"--demuxer-lavf-analyzeduration=1",
+		"--demuxer-lavf-probesize=1048576",
+		"--stream-lavf-o=fflags=+nobuffer,reconnect=1,reconnect_at_eof=1,reconnect_streamed=1,reconnect_delay_max=5",
+		"--referrer=https://live.bilibili.com/123",
+		"https://cdn.example.com/live.m3u8?token=value",
+	} {
+		if !strings.Contains(joined, expected) {
+			t.Fatalf("mpv args missing %q: %#v", expected, args)
+		}
+	}
+}
+
+func TestLastMPVErrorLineRedactsPlaybackURL(t *testing.T) {
+	got := lastMPVErrorLine("Failed to open https://cdn.example.com/live.m3u8?token=secret\nExiting... (Errors when loading file)\n")
+	if strings.Contains(got, "secret") || !strings.Contains(got, "[播放地址]") {
+		t.Fatalf("mpv error = %q", got)
+	}
+}
+
+func TestTailBufferKeepsBoundedSuffix(t *testing.T) {
+	buffer := &tailBuffer{limit: 5}
+	_, _ = buffer.Write([]byte("1234"))
+	_, _ = buffer.Write([]byte("567"))
+	if got := buffer.String(); got != "34567" {
+		t.Fatalf("tail buffer = %q", got)
+	}
+}
+
 func TestWaitForContextStopsImmediatelyOnCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()

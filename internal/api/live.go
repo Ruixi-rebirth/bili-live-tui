@@ -354,6 +354,132 @@ func (c *Client) getOnlineGoldRank(ctx context.Context, roomID string, anchorUID
 	return snapshot, nil
 }
 
+// GetRoomPlaybackURL 获取适合本地播放器预览的直播间回拉地址。
+func (c *Client) GetRoomPlaybackURL(ctx context.Context, roomID, sessdata, biliJCT string) (string, error) {
+	roomID = strings.TrimSpace(roomID)
+	if roomID == "" {
+		return "", fmt.Errorf("获取直播预览需要有效的房间号")
+	}
+	path, err := c.endpointByName("GetRoomPlaybackURL")
+	if err != nil {
+		return "", err
+	}
+	parsed, err := url.Parse(path)
+	if err != nil {
+		return "", fmt.Errorf("准备获取直播预览失败: %w", err)
+	}
+	query := parsed.Query()
+	query.Set("room_id", roomID)
+	query.Set("protocol", "0,1")
+	query.Set("format", "0,1,2")
+	query.Set("codec", "0,1")
+	query.Set("qn", "10000")
+	query.Set("platform", "web")
+	query.Set("ptype", "8")
+	parsed.RawQuery = query.Encode()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, parsed.String(), nil)
+	if err != nil {
+		return "", fmt.Errorf("准备获取直播预览失败: %w", err)
+	}
+	setBilibiliBrowserHeaders(req)
+	req.Header.Set("Referer", "https://live.bilibili.com/"+roomID)
+	if cookie := browserCookie(sessdata, biliJCT); cookie != "" {
+		req.Header.Set("Cookie", cookie)
+	}
+	resp, err := c.HTTPClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("获取直播预览失败: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return "", fmt.Errorf("获取直播预览失败：远程服务器返回 HTTP %d", resp.StatusCode)
+	}
+	var raw struct {
+		Code    int    `json:"code"`
+		Message string `json:"message"`
+		Data    *struct {
+			LiveStatus  int `json:"live_status"`
+			PlayURLInfo *struct {
+				PlayURL struct {
+					Streams []struct {
+						ProtocolName string `json:"protocol_name"`
+						Formats      []struct {
+							FormatName string `json:"format_name"`
+							Codecs     []struct {
+								CodecName string `json:"codec_name"`
+								BaseURL   string `json:"base_url"`
+								URLInfo   []struct {
+									Host  string `json:"host"`
+									Extra string `json:"extra"`
+								} `json:"url_info"`
+							} `json:"codec"`
+						} `json:"format"`
+					} `json:"stream"`
+				} `json:"playurl"`
+			} `json:"playurl_info"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxAPIResponseBytes+1)).Decode(&raw); err != nil {
+		return "", fmt.Errorf("解析直播预览失败: %w", err)
+	}
+	if raw.Code != 0 {
+		return "", fmt.Errorf("获取直播预览失败: %s", strings.TrimSpace(raw.Message))
+	}
+	if raw.Data == nil || raw.Data.LiveStatus != 1 {
+		return "", fmt.Errorf("直播间当前未在直播")
+	}
+	if raw.Data.PlayURLInfo == nil {
+		return "", fmt.Errorf("直播预览接口未返回播放地址")
+	}
+	bestURL := ""
+	bestScore := int(^uint(0) >> 1)
+	for _, stream := range raw.Data.PlayURLInfo.PlayURL.Streams {
+		for _, format := range stream.Formats {
+			for _, codec := range format.Codecs {
+				if strings.TrimSpace(codec.BaseURL) == "" {
+					continue
+				}
+				for _, info := range codec.URLInfo {
+					candidate := strings.TrimSpace(info.Host) + codec.BaseURL + info.Extra
+					playbackURL, parseErr := url.Parse(candidate)
+					if parseErr == nil && playbackURL.Host != "" && (playbackURL.Scheme == "https" || playbackURL.Scheme == "http") {
+						score := 0
+						if !strings.EqualFold(codec.CodecName, "avc") {
+							score += 100
+						}
+						switch strings.ToLower(stream.ProtocolName) {
+						case "http_stream":
+							// HTTP-FLV 可以边收边播，预览首帧通常比 HLS 更快。
+						case "http_hls":
+							score += 20
+						default:
+							score += 40
+						}
+						switch strings.ToLower(format.FormatName) {
+						case "flv":
+							// FLV 是 http_stream 的低延迟首选格式。
+						case "fmp4":
+							score += 2
+						case "ts":
+							score += 4
+						default:
+							score += 6
+						}
+						if score < bestScore {
+							bestURL = playbackURL.String()
+							bestScore = score
+						}
+					}
+				}
+			}
+		}
+	}
+	if bestURL != "" {
+		return bestURL, nil
+	}
+	return "", fmt.Errorf("直播预览接口未返回可用的播放地址")
+}
+
 // UploadRoomCover 使用 B 站 Web 图片接口上传本地图片，并返回更新封面接口使用的地址。
 // 它与资料更新分开，以便在修改房间资料前先展示上传错误。
 func (c *Client) UploadRoomCover(ctx context.Context, roomID, sessdata, biliJCT, filePath string) (string, error) {
@@ -677,10 +803,12 @@ type Client struct {
 	BaseURL    string
 	HTTPClient *http.Client
 
-	danmakuIdentityMu  sync.Mutex
-	danmakuIdentity    danmakuIdentity
-	danmakuIdentityFor string
-	danmakuIdentityAt  time.Time
+	danmakuIdentityMu     sync.Mutex
+	danmakuIdentity       danmakuIdentity
+	danmakuIdentityFor    string
+	danmakuIdentityAt     time.Time
+	danmakuEndpointMu     sync.Mutex
+	danmakuEndpointOffset int
 }
 
 func NewClient(httpClient *http.Client) *Client {
@@ -994,11 +1122,6 @@ func (c *Client) UpdatePreLiveCover(ctx context.Context, roomID, sessdata, biliJ
 	return nil
 }
 
-// UpdateLiveInfo 在开播前更新标题、简介和分区。
-func (c *Client) UpdateLiveInfo(ctx context.Context, roomID, accessToken string, settings LiveSettings) error {
-	return c.updateLiveInfo(ctx, roomID, accessToken, "", "", settings, true)
-}
-
 // UpdateLiveInfoWithCookie 使用 Room/update 所需的 Web API 凭证更新房间资料，AccessToken 可选。
 func (c *Client) UpdateLiveInfoWithCookie(ctx context.Context, roomID, accessToken, sessdata, biliJCT string, settings LiveSettings) error {
 	return c.updateLiveInfo(ctx, roomID, accessToken, sessdata, biliJCT, settings, true)
@@ -1124,17 +1247,4 @@ func responseMessage(message, fallback string) string {
 		return fallback
 	}
 	return "B 站未返回具体原因"
-}
-
-// 兼容原有包级 API 的包装函数。
-func StartLive(roomID, accessToken string) (string, string, error) {
-	return NewClient(nil).StartLive(context.Background(), roomID, accessToken, LiveSettings{Title: "直播", AreaID: "376"})
-}
-
-func StopLive(roomID, accessToken string) error {
-	return NewClient(nil).StopLive(context.Background(), roomID, accessToken)
-}
-
-func GetMyRoomID(sessdata string) (string, error) {
-	return NewClient(nil).GetMyRoomID(context.Background(), sessdata)
 }

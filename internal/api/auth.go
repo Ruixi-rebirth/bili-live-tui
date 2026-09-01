@@ -33,11 +33,6 @@ type TVQRPollResponse struct {
 	Message string `json:"message"`
 }
 
-// GetTVQRCode 获取登录二维码链接和 authCode
-func GetTVQRCode() (qrURL string, authCode string, err error) {
-	return GetTVQRCodeContext(context.Background())
-}
-
 // GetTVQRCodeContext 获取登录二维码，并允许主流程在收到退出信号时取消请求。
 func GetTVQRCodeContext(ctx context.Context) (qrURL string, authCode string, err error) {
 	params := url.Values{}
@@ -69,11 +64,6 @@ func GetTVQRCodeContext(ctx context.Context) (qrURL string, authCode string, err
 		return "", "", fmt.Errorf("登录接口未返回有效二维码")
 	}
 	return result.Data.URL, result.Data.AuthCode, nil
-}
-
-// CheckQRStatus 执行单次状态检查
-func CheckQRStatus(authCode string) (QRStatus, *TVQRPollResponse, error) {
-	return CheckQRStatusContext(context.Background(), authCode)
 }
 
 // CheckQRStatusContext 执行一次可取消的扫码状态检查。

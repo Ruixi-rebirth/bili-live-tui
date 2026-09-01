@@ -11,6 +11,7 @@ import (
 	"time"
 
 	streamruntime "bili-live-tui/internal/stream"
+	"bili-live-tui/internal/utils"
 	"github.com/andreykaipov/goobs"
 	"github.com/andreykaipov/goobs/api/requests/config"
 	"github.com/andreykaipov/goobs/api/requests/general"
@@ -19,6 +20,12 @@ import (
 )
 
 const OBSPort = "4455"
+
+const (
+	obsControlReconnectWindow = 60 * time.Second
+	obsStartupReadyAttempts   = 41
+	obsStartupReadyRetryDelay = 500 * time.Millisecond
+)
 
 // 检查端口是否被占用
 func isObsRunning(port string) bool {
@@ -40,15 +47,9 @@ func ensureObsAlive() error {
 		return nil // 已经运行中
 	}
 
-	command := ""
-	for _, candidate := range []string{"obs", "obs-studio"} {
-		if path, err := exec.LookPath(candidate); err == nil {
-			command = path
-			break
-		}
-	}
-	if command == "" {
-		return fmt.Errorf("未找到 OBS Studio，请先安装 OBS，或确认 obs/obs-studio 命令在 PATH 中")
+	command, err := utils.GetExecutablePath("obs", "obs-studio")
+	if err != nil {
+		return err
 	}
 	cmd := exec.Command(command)
 
@@ -71,53 +72,13 @@ func ensureObsAlive() error {
 	return fmt.Errorf("OBS 启动超时或 WebSocket 未开启")
 }
 
-// SyncAndStartStream 自动拉起 OBS、填入密钥并开始推流。
-func SyncAndStartStream(rtmpAddr string, streamKey string, obsPassword string) error {
-	// 确保 OBS 进程已经启动。
-	if err := ensureObsAlive(); err != nil {
-		return err
-	}
-
-	// 连接 OBS WebSocket。
-	client, err := goobs.New("localhost:4455", goobs.WithPassword(obsPassword))
-	if err != nil {
-		return err
-	}
-	defer client.Disconnect()
-
-	// 填入 B 站推流码。
-	serviceType := "rtmp_custom" // Go 语法限制不能直接 &"字符串"，必须先声明变量
-
-	settings := typedefs.StreamServiceSettings{
-		Server:  rtmpAddr,
-		Key:     streamKey,
-		UseAuth: false,
-	}
-
-	_, err = client.Config.SetStreamServiceSettings(&config.SetStreamServiceSettingsParams{
-		StreamServiceType:     &serviceType, // 取指针
-		StreamServiceSettings: &settings,    // 取指针
-	})
-	if err != nil {
-		return fmt.Errorf("设置 OBS 推流地址失败: %v", err)
-	}
-
-	// 开始推流。
-	_, err = client.Stream.StartStream(&obsstream.StartStreamParams{})
-	if err != nil {
-		return err
-	}
-
-	log.Println("OBS 自动推流已启动！")
-	return nil
-}
-
 // Runtime 持有持续的 OBS WebSocket 会话，使 TUI 能在开播后观察推流状态，
 // 而不是配置 RTMP 后立即断开连接。
 type Runtime struct {
 	password string
 
 	mu              sync.RWMutex
+	controlMu       sync.Mutex
 	client          *goobs.Client
 	health          streamruntime.Health
 	done            chan struct{}
@@ -125,6 +86,7 @@ type Runtime struct {
 	monitorStop     chan struct{}
 	monitorStopOnce sync.Once
 	stopping        bool
+	controlFailedAt time.Time
 	lastBytes       float64
 	lastSample      time.Time
 }
@@ -155,20 +117,20 @@ func (r *Runtime) Start(rtmpAddr, streamKey string) error {
 	if err := ensureObsAlive(); err != nil {
 		return err
 	}
-	client, err := goobs.New(
-		"localhost:"+OBSPort,
-		goobs.WithPassword(r.password),
-		goobs.WithLogger(log.New(io.Discard, "", 0)),
-		goobs.WithResponseTimeoutDuration(5*time.Second),
-	)
+	client, err := newRuntimeClient(r.password)
 	if err != nil {
 		return fmt.Errorf("连接 OBS WebSocket 失败: %w；请确认 OBS 已启用 WebSocket 服务且密码正确", err)
 	}
 
-	status, err := client.Stream.GetStreamStatus(&obsstream.GetStreamStatusParams{})
+	var status *obsstream.GetStreamStatusResponse
+	err = retryOBSNotReady(obsStartupReadyAttempts, obsStartupReadyRetryDelay, func() error {
+		var requestErr error
+		status, requestErr = client.Stream.GetStreamStatus(&obsstream.GetStreamStatusParams{})
+		return requestErr
+	})
 	if err != nil {
 		_ = client.Disconnect()
-		return fmt.Errorf("读取 OBS 推流状态失败: %w", err)
+		return fmt.Errorf("等待 OBS 就绪失败: %w", err)
 	}
 	if status.OutputActive {
 		_ = client.Disconnect()
@@ -177,14 +139,22 @@ func (r *Runtime) Start(rtmpAddr, streamKey string) error {
 
 	serviceType := "rtmp_custom"
 	settings := typedefs.StreamServiceSettings{Server: rtmpAddr, Key: streamKey, UseAuth: false}
-	if _, err := client.Config.SetStreamServiceSettings(&config.SetStreamServiceSettingsParams{
-		StreamServiceType:     &serviceType,
-		StreamServiceSettings: &settings,
-	}); err != nil {
+	err = retryOBSNotReady(obsStartupReadyAttempts, obsStartupReadyRetryDelay, func() error {
+		_, requestErr := client.Config.SetStreamServiceSettings(&config.SetStreamServiceSettingsParams{
+			StreamServiceType:     &serviceType,
+			StreamServiceSettings: &settings,
+		})
+		return requestErr
+	})
+	if err != nil {
 		_ = client.Disconnect()
 		return fmt.Errorf("设置 OBS 推流地址失败: %w", err)
 	}
-	if _, err := client.Stream.StartStream(&obsstream.StartStreamParams{}); err != nil {
+	err = retryOBSNotReady(obsStartupReadyAttempts, obsStartupReadyRetryDelay, func() error {
+		_, requestErr := client.Stream.StartStream(&obsstream.StartStreamParams{})
+		return requestErr
+	})
+	if err != nil {
 		_ = client.Disconnect()
 		return fmt.Errorf("启动 OBS 推流失败: %w", err)
 	}
@@ -220,11 +190,32 @@ func (r *Runtime) sampleHealth() {
 	if client == nil || stopping {
 		return
 	}
+	r.controlMu.Lock()
+	defer r.controlMu.Unlock()
+	r.mu.RLock()
+	if r.stopping || r.client != client {
+		r.mu.RUnlock()
+		return
+	}
+	r.mu.RUnlock()
 	status, err := client.Stream.GetStreamStatus(&obsstream.GetStreamStatusParams{})
 	if err != nil {
-		r.mu.Lock()
-		r.health.LastError = "读取 OBS 推流状态失败：" + err.Error()
-		r.mu.Unlock()
+		if isOBSNotReady(err) {
+			r.markControlNotReady(err)
+			return
+		}
+		if r.markControlConnectionError(err) {
+			return
+		}
+		r.mu.RLock()
+		stopping = r.stopping
+		r.mu.RUnlock()
+		if stopping {
+			return
+		}
+		if reconnectErr := r.reconnectControlClient(client); reconnectErr != nil {
+			r.markControlConnectionError(reconnectErr)
+		}
 		return
 	}
 	stats, statsErr := client.General.GetStats(&general.GetStatsParams{})
@@ -245,6 +236,110 @@ func (r *Runtime) sampleHealth() {
 	r.applyHealthSample(sample, time.Now())
 }
 
+func newRuntimeClient(password string) (*goobs.Client, error) {
+	return goobs.New(
+		"localhost:"+OBSPort,
+		goobs.WithPassword(password),
+		goobs.WithLogger(log.New(io.Discard, "", 0)),
+		goobs.WithResponseTimeoutDuration(5*time.Second),
+	)
+}
+
+// retryOBSNotReady 只重试协议明确标记为可稍后重试的 207 状态。
+// 其他错误通常是密码、请求或配置问题，应立即返回给用户。
+func retryOBSNotReady(attempts int, delay time.Duration, operation func() error) error {
+	if attempts < 1 {
+		attempts = 1
+	}
+	var lastErr error
+	for attempt := 1; attempt <= attempts; attempt++ {
+		lastErr = operation()
+		if lastErr == nil || !isOBSNotReady(lastErr) {
+			return lastErr
+		}
+		if attempt < attempts && delay > 0 {
+			time.Sleep(delay)
+		}
+	}
+	return fmt.Errorf("OBS 在约 %d 秒内仍未准备完成: %w", int(time.Duration(attempts-1)*delay/time.Second), lastErr)
+}
+
+func isOBSNotReady(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "NotReady (207)")
+}
+
+func (r *Runtime) markControlNotReady(err error) bool {
+	if err == nil {
+		return false
+	}
+	timedOut := r.markControlConnectionError(err)
+	if timedOut {
+		return true
+	}
+	r.mu.Lock()
+	if !r.stopping {
+		r.health.LastError = "OBS 暂未就绪，正在等待恢复：" + err.Error()
+	}
+	r.mu.Unlock()
+	return false
+}
+
+func (r *Runtime) markControlConnectionError(err error) bool {
+	return r.markControlConnectionErrorAt(err, time.Now())
+}
+
+// markControlConnectionErrorAt 返回控制通道是否已经超过恢复窗口。
+// 时间参数让边界状态无需真实等待一分钟即可测试。
+func (r *Runtime) markControlConnectionErrorAt(err error, now time.Time) bool {
+	if err == nil {
+		return false
+	}
+	r.mu.Lock()
+	if r.stopping {
+		r.mu.Unlock()
+		return false
+	}
+	if r.controlFailedAt.IsZero() {
+		r.controlFailedAt = now
+	}
+	if now.Sub(r.controlFailedAt) >= obsControlReconnectWindow {
+		r.health.Active = false
+		r.health.Reconnecting = false
+		r.health.LastError = fmt.Sprintf("OBS 控制连接在 %d 秒内未恢复：%v", int(obsControlReconnectWindow/time.Second), err)
+		r.mu.Unlock()
+		r.monitorStopOnce.Do(func() { close(r.monitorStop) })
+		r.doneOnce.Do(func() { close(r.done) })
+		return true
+	}
+	r.health.Reconnecting = true
+	r.health.LastError = "OBS 控制连接断开，正在重连：" + err.Error()
+	r.mu.Unlock()
+	return false
+}
+
+// reconnectControlClient 只恢复 OBS WebSocket 控制通道，不重启 OBS 或重新开始推流。
+// 调用方必须持有 controlMu，避免与状态读取和 Stop 并发使用 goobs 客户端。
+func (r *Runtime) reconnectControlClient(previous *goobs.Client) error {
+	client, err := newRuntimeClient(r.password)
+	if err != nil {
+		return fmt.Errorf("OBS 控制连接重连失败: %w", err)
+	}
+	r.mu.Lock()
+	if r.stopping || r.client != previous {
+		r.mu.Unlock()
+		_ = client.Disconnect()
+		return fmt.Errorf("OBS 控制连接已停止")
+	}
+	r.client = client
+	r.health.Reconnecting = true
+	r.health.LastError = "OBS 控制连接已恢复，正在确认推流状态"
+	r.mu.Unlock()
+	if previous != nil {
+		_ = previous.Disconnect()
+	}
+	return nil
+}
+
 func (r *Runtime) applyHealthSample(sample healthSample, now time.Time) {
 	r.mu.Lock()
 	if elapsed := now.Sub(r.lastSample).Seconds(); elapsed > 0 && !r.lastSample.IsZero() && sample.bytes >= r.lastBytes {
@@ -252,6 +347,7 @@ func (r *Runtime) applyHealthSample(sample healthSample, now time.Time) {
 	}
 	r.lastBytes = sample.bytes
 	r.lastSample = now
+	r.controlFailedAt = time.Time{}
 	r.health.Active = sample.active
 	r.health.Reconnecting = sample.reconnecting
 	r.health.Duration = sample.duration
@@ -282,38 +378,66 @@ func (r *Runtime) Health() streamruntime.Health {
 
 func (r *Runtime) Done() <-chan struct{} { return r.done }
 
-func (r *Runtime) Stop() error {
+func (r *Runtime) Stop() (stopErr error) {
 	r.mu.Lock()
-	if r.client == nil {
+	if r.client == nil || r.stopping {
 		r.mu.Unlock()
 		return nil
 	}
 	r.stopping = true
-	client := r.client
 	r.mu.Unlock()
 	r.monitorStopOnce.Do(func() { close(r.monitorStop) })
+	r.controlMu.Lock()
+	defer r.controlMu.Unlock()
 
-	var stopErr error
+	// 监控协程可能正在更换控制连接，因此要在获得 controlMu 后再取客户端。
+	r.mu.RLock()
+	client := r.client
+	r.mu.RUnlock()
+	defer func() {
+		if client != nil {
+			if err := client.Disconnect(); err != nil && stopErr == nil && !isOBSClientDisconnected(err) {
+				stopErr = fmt.Errorf("断开 OBS WebSocket 失败: %w", err)
+			}
+		}
+		r.mu.Lock()
+		r.health.Active = false
+		r.client = nil
+		r.mu.Unlock()
+		r.doneOnce.Do(func() { close(r.done) })
+	}()
+
 	status, err := client.Stream.GetStreamStatus(&obsstream.GetStreamStatusParams{})
-	if err != nil {
-		stopErr = fmt.Errorf("停止前读取 OBS 状态失败: %w", err)
-		// 读取状态可能暂时失败，但 StopStream 仍可能成功到达 OBS。
-		// 这里尽力停止，避免离开 TUI 后编码器仍在无提示地运行。
-		if _, stopRequestErr := client.Stream.StopStream(&obsstream.StopStreamParams{}); stopRequestErr != nil {
-			stopErr = fmt.Errorf("%v；停止 OBS 推流也失败: %w", stopErr, stopRequestErr)
+	if isOBSClientDisconnected(err) {
+		freshClient, reconnectErr := newRuntimeClient(r.password)
+		if reconnectErr != nil {
+			return fmt.Errorf("停止 OBS 推流失败：控制连接已断开，重新连接失败: %w", reconnectErr)
 		}
-	} else if status.OutputActive {
-		if _, err := client.Stream.StopStream(&obsstream.StopStreamParams{}); err != nil && !strings.Contains(strings.ToLower(err.Error()), "not active") {
-			stopErr = fmt.Errorf("停止 OBS 推流失败: %w", err)
+		_ = client.Disconnect()
+		client = freshClient
+		status, err = client.Stream.GetStreamStatus(&obsstream.GetStreamStatusParams{})
+	}
+	if err == nil && !status.OutputActive {
+		return nil
+	}
+	// 即使状态读取暂时失败，停止请求仍可能成功到达 OBS。
+	if _, requestErr := client.Stream.StopStream(&obsstream.StopStreamParams{}); requestErr != nil && !isOBSOutputNotRunning(requestErr) {
+		if isOBSClientDisconnected(requestErr) {
+			return fmt.Errorf("停止 OBS 推流失败：OBS 控制连接已断开")
 		}
+		return fmt.Errorf("停止 OBS 推流失败: %w", requestErr)
 	}
-	if err := client.Disconnect(); err != nil && stopErr == nil {
-		stopErr = fmt.Errorf("断开 OBS WebSocket 失败: %w", err)
+	return nil
+}
+
+func isOBSClientDisconnected(err error) bool {
+	return err != nil && strings.Contains(strings.ToLower(err.Error()), "client already disconnected")
+}
+
+func isOBSOutputNotRunning(err error) bool {
+	if err == nil {
+		return false
 	}
-	r.mu.Lock()
-	r.health.Active = false
-	r.client = nil
-	r.mu.Unlock()
-	r.doneOnce.Do(func() { close(r.done) })
-	return stopErr
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "outputnotrunning (501)") || strings.Contains(message, "not active")
 }

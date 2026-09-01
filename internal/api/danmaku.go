@@ -16,21 +16,26 @@ import (
 	"sync"
 	"time"
 
+	"github.com/andybalholm/brotli"
 	"github.com/gorilla/websocket"
 )
 
 const (
-	danmakuHeaderLength       = 16
-	danmakuProtocolPlain      = 0
-	danmakuProtocolHeartbeat  = 1
-	danmakuProtocolAuth       = 1
-	danmakuProtocolZlib       = 2
-	danmakuOperationHeartbeat = 2
-	danmakuOperationOnline    = 3
-	danmakuOperationCommand   = 5
-	danmakuOperationAuth      = 7
-	danmakuOperationAuthReply = 8
-	danmakuHeartbeatInterval  = 30 * time.Second
+	danmakuHeaderLength        = 16
+	danmakuProtocolPlain       = 0
+	danmakuProtocolHeartbeat   = 1
+	danmakuProtocolAuth        = 1
+	danmakuProtocolZlib        = 2
+	danmakuProtocolBrotli      = 3
+	danmakuOperationHeartbeat  = 2
+	danmakuOperationOnline     = 3
+	danmakuOperationCommand    = 5
+	danmakuOperationAuth       = 7
+	danmakuOperationAuthReply  = 8
+	danmakuHeartbeatInterval   = 30 * time.Second
+	danmakuWebSocketReadLimit  = 8 << 20
+	danmakuDecodedPayloadLimit = 16 << 20
+	danmakuPacketNestingLimit  = 4
 )
 
 // DanmakuHost 是 B 站公布的一个 WebSocket 服务器地址。
@@ -87,13 +92,6 @@ type danmakuHostWire struct {
 	Port    flexibleInt64 `json:"port"`
 	WSPort  flexibleInt64 `json:"ws_port"`
 	WSSPort flexibleInt64 `json:"wss_port"`
-}
-
-// GetDanmakuInfo 获取弹幕 WebSocket 所需的令牌和服务器列表。
-// 它保留无凭证调用的原有 API；直播会话应使用带 Cookie 的版本，
-// 因为 B 站可能对匿名请求执行风控。
-func (c *Client) GetDanmakuInfo(ctx context.Context, roomID string) (DanmakuInfo, error) {
-	return c.getDanmakuInfo(ctx, roomID, "", "", danmakuIdentity{})
 }
 
 // GetDanmakuInfoWithCookie 携带当前网页登录 Cookie 获取弹幕连接信息。
@@ -212,11 +210,10 @@ func (c *Client) getDanmakuInfoAt(ctx context.Context, path, roomID, sessdata, b
 type DanmakuEventKind string
 
 const (
-	DanmakuEventMessage   DanmakuEventKind = "message"
-	DanmakuEventGift      DanmakuEventKind = "gift"
-	DanmakuEventSuperChat DanmakuEventKind = "super_chat"
-	DanmakuEventSystem    DanmakuEventKind = "system"
-	DanmakuEventOnline    DanmakuEventKind = "online"
+	DanmakuEventMessage DanmakuEventKind = "message"
+	DanmakuEventGift    DanmakuEventKind = "gift"
+	DanmakuEventSystem  DanmakuEventKind = "system"
+	DanmakuEventOnline  DanmakuEventKind = "online"
 	// DanmakuEventConnected 在服务器接受操作码 7 的认证后产生。
 	// TCP/WebSocket 连接成功本身不能证明直播间订阅已经可用。
 	DanmakuEventConnected DanmakuEventKind = "connected"
@@ -253,21 +250,25 @@ type LiveSessionStats struct {
 }
 
 func (stats *LiveSessionStats) Observe(event DanmakuEvent) {
-	if stats == nil || event.Kind != DanmakuEventGift {
+	if stats == nil {
 		return
 	}
-	stats.GiftEvents++
-	count := event.Message.GiftCount
-	if count <= 0 {
-		count = 1
+	switch event.Kind {
+	case DanmakuEventGift:
+		stats.GiftEvents++
+		count := event.Message.GiftCount
+		if count <= 0 {
+			count = 1
+		}
+		stats.GiftCount += int64(count)
 	}
-	stats.GiftCount += int64(count)
 }
 
 // DanmakuStream 管理一个已认证的直播弹幕 WebSocket。
 // 流结束时会关闭 Events 和 Errors；离开弹幕页时调用方应调用 Close。
 type DanmakuStream struct {
 	conn       *websocket.Conn
+	endpoint   string
 	events     chan DanmakuEvent
 	errors     chan error
 	done       chan struct{}
@@ -278,6 +279,14 @@ type DanmakuStream struct {
 func (s *DanmakuStream) Events() <-chan DanmakuEvent { return s.events }
 
 func (s *DanmakuStream) Errors() <-chan error { return s.errors }
+
+// Endpoint 返回当前弹幕连接使用的服务器地址，不包含认证信息。
+func (s *DanmakuStream) Endpoint() string {
+	if s == nil {
+		return ""
+	}
+	return s.endpoint
+}
 
 // Close 中断读取和心跳循环，可重复调用，也可在 WebSocket 正在读取时调用。
 func (s *DanmakuStream) Close() {
@@ -290,11 +299,6 @@ func (s *DanmakuStream) Close() {
 			_ = s.conn.Close()
 		}
 	})
-}
-
-// ConnectDanmaku 获取房间连接信息并打开认证 WebSocket，返回后立即开始消费数据包。
-func (c *Client) ConnectDanmaku(ctx context.Context, roomID string) (*DanmakuStream, error) {
-	return c.connectDanmaku(ctx, roomID, "", "")
 }
 
 // ConnectDanmakuWithCookie 是带 Cookie 的直播会话版本。
@@ -317,7 +321,8 @@ func (c *Client) connectDanmaku(ctx context.Context, roomID, sessdata, biliJCT s
 	if len(endpoints) == 0 {
 		return nil, fmt.Errorf("弹幕连接信息没有可用的 websocket 地址")
 	}
-	dialer := websocket.Dialer{HandshakeTimeout: 10 * time.Second}
+	endpoints = c.rotateDanmakuEndpoints(endpoints)
+	dialer := websocket.Dialer{HandshakeTimeout: 10 * time.Second, Proxy: http.ProxyFromEnvironment}
 	headers := danmakuWebSocketHeaders(roomID, sessdata, biliJCT, identity)
 	var lastErr error
 	for _, endpoint := range endpoints {
@@ -329,11 +334,13 @@ func (c *Client) connectDanmaku(ctx context.Context, roomID, sessdata, biliJCT s
 			lastErr = dialErr
 			continue
 		}
+		conn.SetReadLimit(danmakuWebSocketReadLimit)
 		stream := &DanmakuStream{
-			conn:   conn,
-			events: make(chan DanmakuEvent, 128),
-			errors: make(chan error, 1),
-			done:   make(chan struct{}),
+			conn:     conn,
+			endpoint: endpoint,
+			events:   make(chan DanmakuEvent, 128),
+			errors:   make(chan error, 1),
+			done:     make(chan struct{}),
 		}
 		go stream.run(ctx, info.Token, roomID, identity)
 		return stream, nil
@@ -342,6 +349,24 @@ func (c *Client) connectDanmaku(ctx context.Context, roomID, sessdata, biliJCT s
 		lastErr = fmt.Errorf("没有可用的弹幕 websocket 服务器")
 	}
 	return nil, fmt.Errorf("连接弹幕服务器失败: %w", lastErr)
+}
+
+// rotateDanmakuEndpoints 让连续的重连从不同节点开始。
+// B 站的首个 host 偶尔会在 WebSocket 已建立后直接关闭连接，固定顺序会让
+// 自动重连反复失败，直到用户手动重启程序。
+func (c *Client) rotateDanmakuEndpoints(endpoints []string) []string {
+	if len(endpoints) < 2 {
+		return endpoints
+	}
+	c.danmakuEndpointMu.Lock()
+	offset := c.danmakuEndpointOffset % len(endpoints)
+	c.danmakuEndpointOffset = (offset + 1) % len(endpoints)
+	c.danmakuEndpointMu.Unlock()
+
+	ordered := make([]string, 0, len(endpoints))
+	ordered = append(ordered, endpoints[offset:]...)
+	ordered = append(ordered, endpoints[:offset]...)
+	return ordered
 }
 
 func danmakuWebSocketHeaders(roomID, sessdata, biliJCT string, identity danmakuIdentity) http.Header {
@@ -413,7 +438,7 @@ func danmakuAuthPayload(token, roomID string, identity danmakuIdentity) []byte {
 		Key      string `json:"key"`
 		Version  int    `json:"version"`
 	}{
-		UID: identity.UID, RoomID: room, Protover: 2, Buvid: identity.Buvid, Platform: "web", Type: 2, Key: token, Version: 1,
+		UID: identity.UID, RoomID: room, Protover: 3, Buvid: identity.Buvid, Platform: "web", Type: 2, Key: token, Version: 1,
 	}
 	body, _ := json.Marshal(payload)
 	return body
@@ -632,6 +657,16 @@ func isDanmakuCloseError(err error) bool {
 }
 
 func parseDanmakuPackets(data []byte) ([]DanmakuEvent, error) {
+	return parseDanmakuPacketsDepth(data, 0)
+}
+
+func parseDanmakuPacketsDepth(data []byte, depth int) ([]DanmakuEvent, error) {
+	if len(data) > danmakuDecodedPayloadLimit {
+		return nil, fmt.Errorf("弹幕解压数据超过大小限制: %d", len(data))
+	}
+	if depth > danmakuPacketNestingLimit {
+		return nil, fmt.Errorf("弹幕压缩包嵌套层数超过限制: %d", danmakuPacketNestingLimit)
+	}
 	if len(data) < danmakuHeaderLength {
 		return nil, fmt.Errorf("弹幕数据包长度不足: %d", len(data))
 	}
@@ -653,21 +688,28 @@ func parseDanmakuPackets(data []byte) ([]DanmakuEvent, error) {
 			if err != nil {
 				return events, fmt.Errorf("解压弹幕数据失败: %w", err)
 			}
-			decoded, readErr := io.ReadAll(reader)
+			decoded, readErr := readDanmakuDecoded(reader)
 			_ = reader.Close()
 			if readErr != nil {
 				return events, fmt.Errorf("读取解压弹幕数据失败: %w", readErr)
 			}
-			nested, nestedErr := parseDanmakuPackets(decoded)
+			nested, nestedErr := parseDanmakuPacketsDepth(decoded, depth+1)
 			if nestedErr != nil {
 				return events, nestedErr
 			}
 			events = append(events, nested...)
-		} else if version == 3 {
-			// 客户端请求协议 2（zlib），当前直播服务器都支持。
-			// 协议 3 是 brotli；如果服务器忽略请求，这里明确报告错误，
-			// 不静默丢弃弹幕。
-			return events, fmt.Errorf("弹幕服务器返回暂不支持的 brotli 数据包")
+		} else if version == danmakuProtocolBrotli {
+			// 协议 3 使用 Brotli 压缩，解压后仍是一个或多个标准弹幕包。
+			reader := brotli.NewReader(bytes.NewReader(body))
+			decoded, readErr := readDanmakuDecoded(reader)
+			if readErr != nil {
+				return events, fmt.Errorf("读取 brotli 弹幕数据失败: %w", readErr)
+			}
+			nested, nestedErr := parseDanmakuPacketsDepth(decoded, depth+1)
+			if nestedErr != nil {
+				return events, nestedErr
+			}
+			events = append(events, nested...)
 		} else {
 			event, ok, err := parseDanmakuPayload(operation, body)
 			if err != nil {
@@ -680,6 +722,21 @@ func parseDanmakuPackets(data []byte) ([]DanmakuEvent, error) {
 		data = data[packetLength:]
 	}
 	return events, nil
+}
+
+func readDanmakuDecoded(reader io.Reader) ([]byte, error) {
+	return readDanmakuDecodedLimit(reader, danmakuDecodedPayloadLimit)
+}
+
+func readDanmakuDecodedLimit(reader io.Reader, limit int64) ([]byte, error) {
+	decoded, err := io.ReadAll(io.LimitReader(reader, limit+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(decoded)) > limit {
+		return nil, fmt.Errorf("解压数据超过大小限制: %d", len(decoded))
+	}
+	return decoded, nil
 }
 
 func parseDanmakuPayload(operation uint32, body []byte) (DanmakuEvent, bool, error) {
@@ -728,12 +785,12 @@ func parseDanmakuCommand(body []byte) (DanmakuEvent, bool, error) {
 	switch command {
 	case "DANMU_MSG":
 		return parseDanmuMessage(envelope.Info, command)
-	case "SUPER_CHAT_MESSAGE":
-		return parseSuperChat(envelope.Data, command)
 	case "SEND_GIFT":
 		return parseGift(envelope.Data, command)
 	case "WELCOME", "WELCOME_GUARD", "INTERACT_WORD":
 		return parseSystemInteraction(envelope.Data, command)
+	case "LIKE_INFO_V3_CLICK":
+		return parseLikeInteraction(envelope.Data, command)
 	default:
 		return DanmakuEvent{}, false, nil
 	}
@@ -766,39 +823,12 @@ func parseDanmuMessage(raw json.RawMessage, command string) (DanmakuEvent, bool,
 	return DanmakuEvent{Kind: DanmakuEventMessage, Message: message, Command: command}, true, nil
 }
 
-func parseSuperChat(raw json.RawMessage, command string) (DanmakuEvent, bool, error) {
-	var data struct {
-		UserInfo struct {
-			UID   flexibleID `json:"uid"`
-			Uname string     `json:"uname"`
-		} `json:"user_info"`
-		Message string `json:"message"`
-		Price   int    `json:"price"`
-	}
-	if err := json.Unmarshal(raw, &data); err != nil {
-		return DanmakuEvent{}, false, fmt.Errorf("解析醒目留言失败: %w", err)
-	}
-	if strings.TrimSpace(data.Message) == "" {
-		return DanmakuEvent{}, false, nil
-	}
-	text := data.Message
-	if data.Price > 0 {
-		text = fmt.Sprintf("[醒目留言 ¥%d] %s", data.Price, text)
-	}
-	return DanmakuEvent{Kind: DanmakuEventSuperChat, Command: command, Message: DanmakuMessage{
-		Username:  data.UserInfo.Uname,
-		UserID:    string(data.UserInfo.UID),
-		Text:      text,
-		Timestamp: time.Now(),
-	}}, true, nil
-}
-
 func parseGift(raw json.RawMessage, command string) (DanmakuEvent, bool, error) {
 	var data struct {
-		UID      flexibleID `json:"uid"`
-		Uname    string     `json:"uname"`
-		GiftName string     `json:"giftName"`
-		Num      int        `json:"num"`
+		UID      flexibleID    `json:"uid"`
+		Uname    string        `json:"uname"`
+		GiftName string        `json:"giftName"`
+		Num      flexibleInt64 `json:"num"`
 	}
 	if err := json.Unmarshal(raw, &data); err != nil {
 		return DanmakuEvent{}, false, fmt.Errorf("解析礼物消息失败: %w", err)
@@ -806,7 +836,7 @@ func parseGift(raw json.RawMessage, command string) (DanmakuEvent, bool, error) 
 	if data.GiftName == "" {
 		return DanmakuEvent{}, false, nil
 	}
-	count := data.Num
+	count := int(data.Num)
 	if count <= 0 {
 		count = 1
 	}
@@ -821,11 +851,35 @@ func parseGift(raw json.RawMessage, command string) (DanmakuEvent, bool, error) 
 	}}, true, nil
 }
 
+func parseLikeInteraction(raw json.RawMessage, command string) (DanmakuEvent, bool, error) {
+	var data struct {
+		UID        flexibleID    `json:"uid"`
+		Uname      string        `json:"uname"`
+		ClickCount flexibleInt64 `json:"click_count"`
+	}
+	if err := json.Unmarshal(raw, &data); err != nil {
+		return DanmakuEvent{}, false, fmt.Errorf("解析点赞消息失败: %w", err)
+	}
+	if strings.TrimSpace(data.Uname) == "" {
+		return DanmakuEvent{}, false, nil
+	}
+	text := "点赞了直播间"
+	if data.ClickCount > 1 {
+		text = fmt.Sprintf("点赞了直播间 ×%d", data.ClickCount)
+	}
+	return DanmakuEvent{Kind: DanmakuEventSystem, Command: command, Message: DanmakuMessage{
+		Username:  data.Uname,
+		UserID:    string(data.UID),
+		Text:      text,
+		Timestamp: time.Now(),
+	}}, true, nil
+}
+
 func parseSystemInteraction(raw json.RawMessage, command string) (DanmakuEvent, bool, error) {
 	var data struct {
-		UID     flexibleID `json:"uid"`
-		Uname   string     `json:"uname"`
-		MsgType int        `json:"msg_type"`
+		UID     flexibleID    `json:"uid"`
+		Uname   string        `json:"uname"`
+		MsgType flexibleInt64 `json:"msg_type"`
 	}
 	if err := json.Unmarshal(raw, &data); err != nil {
 		return DanmakuEvent{}, false, fmt.Errorf("解析互动消息失败: %w", err)

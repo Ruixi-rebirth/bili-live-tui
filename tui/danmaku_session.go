@@ -84,24 +84,7 @@ func newLiveDanmakuSessionWithConnector(ctx context.Context, connect danmakuStre
 		update()
 		session.updateConnectionState(statusView.GetText(true), chatView.GetText(true))
 	}
-	onEvent := func(event api.DanmakuEvent) {
-		if event.Kind == api.DanmakuEventOnline {
-			session.ObservePopularity(event.Online, time.Now())
-			return
-		}
-		session.mu.Lock()
-		changed := false
-		switch event.Kind {
-		case api.DanmakuEventGift:
-			session.stats.Observe(event)
-			changed = true
-		}
-		if changed {
-			session.notifyLocked()
-		}
-		session.mu.Unlock()
-	}
-	go runDanmakuStreamWithConnector(sessionCtx, connect, queueState, session.appendEvent, onEvent, statusView, chatView, session.done)
+	go runDanmakuStreamWithConnector(sessionCtx, connect, queueState, session.handleEvent, statusView, chatView, session.done)
 	return session
 }
 
@@ -116,11 +99,18 @@ func (s *LiveDanmakuSession) updateConnectionState(status, placeholder string) {
 	s.mu.Unlock()
 }
 
-func (s *LiveDanmakuSession) appendEvent(event api.DanmakuEvent) {
-	if event.Kind == api.DanmakuEventOnline || event.Kind == api.DanmakuEventConnected {
+func (s *LiveDanmakuSession) handleEvent(event api.DanmakuEvent) {
+	if event.Kind == api.DanmakuEventOnline {
+		s.ObservePopularity(event.Online, time.Now())
+		return
+	}
+	if event.Kind == api.DanmakuEventConnected {
 		return
 	}
 	s.mu.Lock()
+	if event.Kind == api.DanmakuEventGift {
+		s.stats.Observe(event)
+	}
 	s.history = append(s.history, event)
 	if overflow := len(s.history) - danmakuHistoryLimit; overflow > 0 {
 		copy(s.history, s.history[overflow:])
@@ -260,7 +250,7 @@ func (s *LiveDanmakuSession) ObservePopularity(value int64, observedAt time.Time
 	if s == nil {
 		return
 	}
-	if value <= 0 {
+	if value < 0 {
 		return
 	}
 	if observedAt.IsZero() {
