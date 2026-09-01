@@ -65,24 +65,29 @@ func RunHomeAtWithLiveStatusStatsAndHealth(startedAt time.Time, roomID string, s
 // RunHomeAtWithLiveStatusStatsAndHealthContext 是主流程使用的信号感知概览。
 // 取消 ctx 会停止 TUI，使调用方即使收到 SIGTERM 也能执行 OBS 和 B 站清理。
 func RunHomeAtWithLiveStatusStatsAndHealthContext(ctx context.Context, startedAt time.Time, roomID string, settings api.LiveSettings, areas []api.LiveArea, snapshot *api.RoomSnapshot, sessionStats api.LiveSessionStats, notice string, loader func() (api.RoomSnapshot, error), onSnapshot func(api.RoomSnapshot), healthLoader func() streamruntime.Health, _ io.Reader, _ io.Writer) (HomeAction, error) {
-	return runHomeWithContext(ctx, startedAt, roomID, &settings, areas, snapshot, true, notice, loader, onSnapshot, &sessionStats, nil, healthLoader, nil)
+	return runHomeWithContext(ctx, startedAt, roomID, &settings, areas, snapshot, true, notice, loader, onSnapshot, &sessionStats, nil, healthLoader, nil, nil)
 }
 
 // RunHomeAtWithLiveStatusStatsAndHealthContextAndEditor 在概览内执行资料编辑，避免网络操作期间退出终端界面。
 // 可选的 statsLoader 会定时读取长期弹幕连接的最新会话统计。
-func RunHomeAtWithLiveStatusStatsAndHealthContextAndEditor(ctx context.Context, startedAt time.Time, roomID string, settings *api.LiveSettings, areas []api.LiveArea, snapshot *api.RoomSnapshot, sessionStats api.LiveSessionStats, notice string, loader func() (api.RoomSnapshot, error), onSnapshot func(api.RoomSnapshot), healthLoader func() streamruntime.Health, edit func() error, _ io.Reader, _ io.Writer, statsLoaders ...func() api.LiveSessionStats) (HomeAction, error) {
+func RunHomeAtWithLiveStatusStatsAndHealthContextAndEditor(ctx context.Context, startedAt time.Time, roomID string, settings *api.LiveSettings, areas []api.LiveArea, snapshot *api.RoomSnapshot, sessionStats api.LiveSessionStats, notice string, loader func() (api.RoomSnapshot, error), onSnapshot func(api.RoomSnapshot), healthLoader func() streamruntime.Health, edit func() error, input io.Reader, output io.Writer, statsLoaders ...func() api.LiveSessionStats) (HomeAction, error) {
+	return RunHomeAtWithLiveStatusStatsAndHealthContextAndEditorAndPreview(ctx, startedAt, roomID, settings, areas, snapshot, sessionStats, notice, loader, onSnapshot, healthLoader, edit, nil, input, output, statsLoaders...)
+}
+
+// RunHomeAtWithLiveStatusStatsAndHealthContextAndEditorAndPreview 还提供可选的外部播放器预览入口。
+func RunHomeAtWithLiveStatusStatsAndHealthContextAndEditorAndPreview(ctx context.Context, startedAt time.Time, roomID string, settings *api.LiveSettings, areas []api.LiveArea, snapshot *api.RoomSnapshot, sessionStats api.LiveSessionStats, notice string, loader func() (api.RoomSnapshot, error), onSnapshot func(api.RoomSnapshot), healthLoader func() streamruntime.Health, edit, preview func() error, _ io.Reader, _ io.Writer, statsLoaders ...func() api.LiveSessionStats) (HomeAction, error) {
 	var statsLoader func() api.LiveSessionStats
 	if len(statsLoaders) > 0 {
 		statsLoader = statsLoaders[0]
 	}
-	return runHomeWithContext(ctx, startedAt, roomID, settings, areas, snapshot, true, notice, loader, onSnapshot, &sessionStats, statsLoader, healthLoader, edit)
+	return runHomeWithContext(ctx, startedAt, roomID, settings, areas, snapshot, true, notice, loader, onSnapshot, &sessionStats, statsLoader, healthLoader, edit, preview)
 }
 
 func runHome(startedAt time.Time, roomID string, settings *api.LiveSettings, areas []api.LiveArea, snapshot *api.RoomSnapshot, showEdit bool, notice string, loader roomSnapshotLoader, onSnapshot func(api.RoomSnapshot), sessionStats *api.LiveSessionStats, healthLoader func() streamruntime.Health) (HomeAction, error) {
-	return runHomeWithContext(context.Background(), startedAt, roomID, settings, areas, snapshot, showEdit, notice, loader, onSnapshot, sessionStats, nil, healthLoader, nil)
+	return runHomeWithContext(context.Background(), startedAt, roomID, settings, areas, snapshot, showEdit, notice, loader, onSnapshot, sessionStats, nil, healthLoader, nil, nil)
 }
 
-func runHomeWithContext(ctx context.Context, startedAt time.Time, roomID string, settings *api.LiveSettings, areas []api.LiveArea, snapshot *api.RoomSnapshot, showEdit bool, notice string, loader roomSnapshotLoader, onSnapshot func(api.RoomSnapshot), sessionStats *api.LiveSessionStats, statsLoader func() api.LiveSessionStats, healthLoader func() streamruntime.Health, edit func() error) (HomeAction, error) {
+func runHomeWithContext(ctx context.Context, startedAt time.Time, roomID string, settings *api.LiveSettings, areas []api.LiveArea, snapshot *api.RoomSnapshot, showEdit bool, notice string, loader roomSnapshotLoader, onSnapshot func(api.RoomSnapshot), sessionStats *api.LiveSessionStats, statsLoader func() api.LiveSessionStats, healthLoader func() streamruntime.Health, edit, preview func() error) (HomeAction, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -110,6 +115,12 @@ func runHomeWithContext(ctx context.Context, startedAt time.Time, roomID string,
 	status.SetBorderColor(tview.Styles.BorderColor)
 	status.SetTitle(" ♡ 直播概览 ♡ ")
 	status.SetTitleColor(tview.Styles.TitleColor)
+	noticeView := tview.NewTextView()
+	noticeView.SetDynamicColors(true)
+	noticeView.SetTextAlign(tview.AlignCenter)
+	noticeView.SetWrap(false)
+	noticeView.SetBackgroundColor(panelColor)
+	roomNotice := ""
 	currentSnapshot := snapshot
 	setStatusText := func() {
 		if statsLoader != nil {
@@ -123,10 +134,16 @@ func runHomeWithContext(ctx context.Context, startedAt time.Time, roomID string,
 		if healthLoader != nil {
 			statusText += "\n\n" + formatStreamHealth(healthLoader())
 		}
-		if message := strings.TrimSpace(notice); message != "" {
-			statusText += "\n\n[" + mutedColor.String() + "]" + tview.Escape(message) + "[-]"
-		}
 		status.SetText(statusText)
+		message := strings.TrimSpace(notice)
+		if message == "" {
+			message = strings.TrimSpace(roomNotice)
+		}
+		if message == "" {
+			noticeView.SetText("")
+		} else {
+			noticeView.SetText("[" + mutedColor.String() + "]" + tview.Escape(message) + "[-]")
+		}
 	}
 	setStatusText()
 
@@ -146,10 +163,35 @@ func runHomeWithContext(ctx context.Context, startedAt time.Time, roomID string,
 		app.SetFocus(actionBar)
 	})
 
-	buttons := make([]*tview.Button, 0, 3)
+	buttons := make([]*tview.Button, 0, 4)
 	buttons = append(buttons, newHomeActionButton("返回弹幕", stopApplication))
+	if preview != nil {
+		var previewBusy atomic.Bool
+		buttons = append(buttons, newHomeActionButton("预览直播", func() {
+			if !previewBusy.CompareAndSwap(false, true) {
+				return
+			}
+			notice = "正在打开直播预览……"
+			setStatusText()
+			go func() {
+				err := preview()
+				if !applicationRunning.Load() {
+					return
+				}
+				app.QueueUpdateDraw(func() {
+					previewBusy.Store(false)
+					if err != nil {
+						notice = err.Error()
+					} else {
+						notice = "直播预览已打开；默认静音，可在 mpv 中按 m 开启声音。"
+					}
+					setStatusText()
+				})
+			}()
+		}))
+	}
 	if showEdit {
-		buttons = append(buttons, newHomeActionButton("修改直播资料", func() {
+		buttons = append(buttons, newHomeActionButton("修改资料", func() {
 			if edit != nil {
 				app.Suspend(func() {
 					if err := edit(); err != nil {
@@ -165,7 +207,7 @@ func runHomeWithContext(ctx context.Context, startedAt time.Time, roomID string,
 			stopApplication()
 		}))
 	}
-	buttons = append(buttons, newHomeActionButton("下播并退出", func() {
+	buttons = append(buttons, newHomeActionButton("下播退出", func() {
 		pages.ShowPage("confirm-stop")
 		app.SetFocus(confirm)
 	}))
@@ -175,6 +217,7 @@ func runHomeWithContext(ctx context.Context, startedAt time.Time, roomID string,
 	body.SetDirection(tview.FlexRow)
 	body.SetBackgroundColor(panelColor)
 	body.AddItem(status, 0, 1, true)
+	body.AddItem(noticeView, 1, 0, false)
 	body.AddItem(actionBar, 1, 0, true)
 	footerText := "Esc 下播确认"
 	if loader != nil {
@@ -228,13 +271,13 @@ func runHomeWithContext(ctx context.Context, startedAt time.Time, roomID string,
 					return
 				}
 				if refreshErr != nil {
-					notice = "房间实时状态暂不可用：" + refreshErr.Error()
+					roomNotice = "房间实时状态暂不可用：" + refreshErr.Error()
 				} else {
 					currentSnapshot = &fresh
 					if onSnapshot != nil {
 						onSnapshot(fresh)
 					}
-					notice = ""
+					roomNotice = ""
 				}
 				setStatusText()
 			})

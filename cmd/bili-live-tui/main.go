@@ -172,6 +172,10 @@ func main() {
 	// OBS/FFmpeg 通过 RTMP 连接维持直播。
 	// B 站移动端心跳接口用于观众观看任务，不属于主播推流会话，不能在这里调用。
 	danmakuSession := tui.NewLiveDanmakuSession(ctx, client, roomID, auth.SESSDATA, auth.BiliJCT)
+	previewer := &livePreviewer{}
+	previewLive := func() error {
+		return previewer.Start(ctx, client, roomID, auth.SESSDATA, auth.BiliJCT)
+	}
 	var outputEndedUnexpectedly atomic.Bool
 	go watchStreamOutput(ctx, liveStream.Done(), func() {
 		outputEndedUnexpectedly.Store(true)
@@ -241,9 +245,9 @@ func main() {
 				}
 				return nil
 			}
-			action, err := tui.RunHomeAtWithLiveStatusStatsAndHealthContextAndEditor(ctx, liveStartedAt, roomID, &settings, areas, roomSnapshot, danmakuSession.Stats(), homeNotice, loadRoomSnapshot, func(fresh api.RoomSnapshot) {
+			action, err := tui.RunHomeAtWithLiveStatusStatsAndHealthContextAndEditorAndPreview(ctx, liveStartedAt, roomID, &settings, areas, roomSnapshot, danmakuSession.Stats(), homeNotice, loadRoomSnapshot, func(fresh api.RoomSnapshot) {
 				roomSnapshot = &fresh
-			}, streamHealth, saveEdit, os.Stdin, os.Stdout, danmakuSession.Stats)
+			}, streamHealth, saveEdit, previewLive, os.Stdin, os.Stdout, danmakuSession.Stats)
 			homeNotice = ""
 			if err != nil {
 				diagnosticLog.Printf("直播概览异常: %v", err)

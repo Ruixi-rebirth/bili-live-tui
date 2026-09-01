@@ -9,6 +9,7 @@ import (
 	"image/png"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -123,6 +124,70 @@ func TestWatchStreamOutputIgnoresSessionShutdown(t *testing.T) {
 	case <-called:
 		t.Fatal("normal session shutdown was reported as unexpected")
 	default:
+	}
+}
+
+func TestMPVPreviewArgsReconnectLiveStream(t *testing.T) {
+	args := mpvPreviewArgs("123", "https://cdn.example.com/live.m3u8?token=value")
+	joined := strings.Join(args, "\n")
+	for _, expected := range []string{
+		"--idle=yes",
+		"--loop-file=inf",
+		"--cache=yes",
+		"reconnect=1",
+		"reconnect_at_eof=1",
+		"reconnect_streamed=1",
+		"--referrer=https://live.bilibili.com/123",
+	} {
+		if !strings.Contains(joined, expected) {
+			t.Fatalf("mpv args missing %q: %#v", expected, args)
+		}
+	}
+}
+
+func TestLivePlaybackURLSourceRefreshesExpiredAddress(t *testing.T) {
+	loads := 0
+	source := &livePlaybackURLSource{
+		current:      "https://cdn.example.com/old.m3u8",
+		checkedAt:    time.Now().Add(-time.Minute),
+		refreshAfter: 30 * time.Second,
+		load: func(context.Context) (string, error) {
+			loads++
+			return "https://cdn.example.com/fresh.m3u8", nil
+		},
+	}
+
+	got, err := source.URL(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "https://cdn.example.com/fresh.m3u8" || loads != 1 {
+		t.Fatalf("refreshed URL = %q, loads = %d", got, loads)
+	}
+	got, err = source.URL(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "https://cdn.example.com/fresh.m3u8" || loads != 1 {
+		t.Fatalf("cached URL = %q, loads = %d", got, loads)
+	}
+}
+
+func TestLivePreviewRedirectHandler(t *testing.T) {
+	source := &livePlaybackURLSource{
+		current:      "https://cdn.example.com/live.m3u8?token=value",
+		checkedAt:    time.Now(),
+		refreshAfter: time.Minute,
+	}
+	request := httptest.NewRequest(http.MethodGet, "http://127.0.0.1/secret", nil)
+	recorder := httptest.NewRecorder()
+	livePreviewRedirectHandler("/secret", source).ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusTemporaryRedirect {
+		t.Fatalf("redirect status = %d", recorder.Code)
+	}
+	if location := recorder.Header().Get("Location"); location != source.current {
+		t.Fatalf("redirect location = %q", location)
 	}
 }
 
