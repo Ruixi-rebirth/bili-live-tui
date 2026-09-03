@@ -76,6 +76,14 @@ func main() {
 		diagnosticLog.Printf("读取上次开播信息失败，将使用默认值: %v", settingsLoadErr)
 		savedSettings = nil
 	}
+	if savedSettings == nil || strings.TrimSpace(savedSettings.CoverPath) == "" {
+		if snapshot, snapshotErr := client.GetRoomSnapshot(ctx, roomID); snapshotErr == nil && strings.TrimSpace(snapshot.Cover) != "" {
+			if savedSettings == nil {
+				savedSettings = &api.LiveSettings{}
+			}
+			savedSettings.CoverPath = snapshot.Cover
+		}
+	}
 	var liveStream streamruntime.Runtime
 	var liveStartedAt time.Time
 	var platformLiveStarted atomic.Bool
@@ -91,7 +99,14 @@ func main() {
 		return rollbackErr
 	}
 	settings, err := tui.RunLiveSettings(ctx, areas, savedSettings, func(liveSettings *api.LiveSettings) error {
-		if cover := strings.TrimSpace(liveSettings.CoverPath); cover != "" {
+		existingCover := ""
+		if savedSettings != nil {
+			existingCover = strings.TrimSpace(savedSettings.CoverPath)
+		}
+		cover := strings.TrimSpace(liveSettings.CoverPath)
+		if cover == "" {
+			liveSettings.CoverPath = existingCover
+		} else if cover != existingCover || !isRemoteCoverURL(cover) {
 			coverURL, uploadErr := uploadCover(ctx, client, roomID, auth.SESSDATA, auth.BiliJCT, cover)
 			if uploadErr != nil {
 				return uploadErr
@@ -316,8 +331,7 @@ func newStreamRuntime(settings api.LiveSettings) (streamruntime.Runtime, error) 
 }
 
 func uploadCover(ctx context.Context, client *api.Client, roomID, sessdata, biliJCT, cover string) (string, error) {
-	parsed, err := url.ParseRequestURI(strings.TrimSpace(cover))
-	if err == nil && (strings.EqualFold(parsed.Scheme, "http") || strings.EqualFold(parsed.Scheme, "https")) && parsed.Host != "" {
+	if isRemoteCoverURL(cover) {
 		uploaded, uploadErr := client.UploadRoomCoverURL(ctx, roomID, sessdata, biliJCT, cover)
 		if uploadErr == nil {
 			return uploaded, nil
@@ -327,9 +341,17 @@ func uploadCover(ctx context.Context, client *api.Client, roomID, sessdata, bili
 	return client.UploadRoomCover(ctx, roomID, sessdata, biliJCT, cover)
 }
 
+func isRemoteCoverURL(cover string) bool {
+	parsed, err := url.ParseRequestURI(strings.TrimSpace(cover))
+	return err == nil && (strings.EqualFold(parsed.Scheme, "http") || strings.EqualFold(parsed.Scheme, "https")) && parsed.Host != ""
+}
+
 func saveLiveSettings(ctx context.Context, client *api.Client, roomID string, auth *config.AuthData, current, edited api.LiveSettings) (api.LiveSettings, error) {
 	// 用户只修改文字资料时，已经上传过的封面地址保持不变。
 	// 新的本地文件和第三方链接沿用首次设置时的上传流程。
+	if strings.TrimSpace(edited.CoverPath) == "" && strings.TrimSpace(current.CoverPath) != "" {
+		edited.CoverPath = current.CoverPath
+	}
 	if strings.TrimSpace(edited.CoverPath) != strings.TrimSpace(current.CoverPath) {
 		if cover := strings.TrimSpace(edited.CoverPath); cover != "" {
 			coverURL, err := uploadCover(ctx, client, roomID, auth.SESSDATA, auth.BiliJCT, cover)
