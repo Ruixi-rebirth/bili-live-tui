@@ -1,6 +1,8 @@
 package tui
 
 import (
+	"image"
+	"image/png"
 	"os"
 	"path/filepath"
 	"strings"
@@ -62,21 +64,34 @@ func TestFormClippedTextAreaDoesNotDrawPastInnerBorder(t *testing.T) {
 
 func TestValidateCoverInput(t *testing.T) {
 	t.Run("empty is allowed", func(t *testing.T) {
-		if err := validateCoverInput(""); err != nil {
+		if err := validateCoverInput("", true); err != nil {
 			t.Fatalf("empty cover = %v", err)
 		}
 	})
+	t.Run("empty is rejected without an existing cover", func(t *testing.T) {
+		if err := validateCoverInput("", false); err == nil {
+			t.Fatal("empty first cover accepted")
+		}
+	})
 	for _, value := range []string{"https://example.com/cover.jpg", "http://cdn.example/cover.webp"} {
-		if err := validateCoverInput(value); err != nil {
+		if err := validateCoverInput(value, false); err != nil {
 			t.Fatalf("URL %q rejected: %v", value, err)
 		}
 	}
 	t.Run("local image", func(t *testing.T) {
 		path := filepath.Join(t.TempDir(), "cover.PNG")
-		if err := os.WriteFile(path, []byte("image"), 0o600); err != nil {
+		file, err := os.Create(path)
+		if err != nil {
 			t.Fatal(err)
 		}
-		if err := validateCoverInput(path); err != nil {
+		if err := png.Encode(file, image.NewRGBA(image.Rect(0, 0, 640, 360))); err != nil {
+			file.Close()
+			t.Fatal(err)
+		}
+		if err := file.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if err := validateCoverInput(path, false); err != nil {
 			t.Fatalf("local image rejected: %v", err)
 		}
 	})
@@ -85,7 +100,7 @@ func TestValidateCoverInput(t *testing.T) {
 		if err := os.WriteFile(path, []byte("image"), 0o600); err != nil {
 			t.Fatal(err)
 		}
-		if err := validateCoverInput(path); err == nil {
+		if err := validateCoverInput(path, false); err == nil {
 			t.Fatal("unsupported extension accepted")
 		}
 	})
@@ -141,6 +156,7 @@ func TestLiveEditPageSavesWithoutStartingAnotherApplication(t *testing.T) {
 	initial := api.LiveSettings{
 		Title:       "已有标题",
 		AreaID:      "12",
+		CoverPath:   "https://i.example/cover.jpg",
 		Orientation: api.OrientationLandscape,
 	}
 	var saved api.LiveSettings

@@ -10,11 +10,12 @@ import (
 
 	"bili-live-tui/internal/api"
 	streamruntime "bili-live-tui/internal/stream"
+	"github.com/gabriel-vasile/mimetype"
 	"github.com/gdamore/tcell/v2"
 	"github.com/rivo/tview"
 )
 
-const maxCoverBytes int64 = 5 * 1024 * 1024
+const maxCoverSourceBytes int64 = 64 * 1024 * 1024
 
 type liveFormState struct {
 	title                *tview.InputField
@@ -27,6 +28,7 @@ type liveFormState struct {
 	orientation          *autoOpenDropDown
 	obsPassword          *tview.InputField
 	tagIDsJSON           string
+	hasExistingCover     bool
 	streamOptionsVisible bool
 	initialStreamMode    string
 }
@@ -135,7 +137,13 @@ func newLiveFormWithSettings(areas []api.LiveArea, initial *api.LiveSettings, ti
 }
 
 func newLiveFormWithOptions(areas []api.LiveArea, initial *api.LiveSettings, title string, showStreamOptions bool) (*tview.Form, *liveFormState) {
+	hasExistingCover := initial != nil && strings.TrimSpace(initial.CoverPath) != ""
+	coverPlaceholder := "填写本地图片路径 / URL"
+	if hasExistingCover {
+		coverPlaceholder = "留空沿用，或填写本地图片路径 / URL"
+	}
 	state := &liveFormState{
+		hasExistingCover:     hasExistingCover,
 		streamOptionsVisible: showStreamOptions,
 		title: tview.NewInputField().
 			SetLabel("直播标题").
@@ -155,7 +163,7 @@ func newLiveFormWithOptions(areas []api.LiveArea, initial *api.LiveSettings, tit
 		area: newAreaField(areas),
 		cover: tview.NewInputField().
 			SetLabel("直播封面").
-			SetPlaceholder("可选：图片路径或 URL（JPG/PNG/WebP，≤5 MB）").
+			SetPlaceholder(coverPlaceholder).
 			SetAcceptanceFunc(tview.InputFieldMaxLength(500)),
 		streamMode:  newStreamModeDropDown(),
 		orientation: newOrientationDropDown(),
@@ -167,7 +175,9 @@ func newLiveFormWithOptions(areas []api.LiveArea, initial *api.LiveSettings, tit
 	}
 	if initial != nil {
 		state.initialStreamMode = initial.StreamMode
-		state.title.SetText(initial.Title)
+		if strings.TrimSpace(initial.Title) != "" {
+			state.title.SetText(initial.Title)
+		}
 		state.description.SetText(initial.Description, false)
 		state.announcement.SetText(initial.Announcement, false)
 		state.tags.SetText(initial.Tags)
@@ -284,12 +294,15 @@ func (d *autoOpenDropDown) Focus(delegate func(tview.Primitive)) {
 }
 
 // validateCoverInput 在关闭设置页面前执行本地可完成的检查。
-// 远程地址交给 B 站处理，本地文件使用上传接口相同的格式和大小限制。
+// 远程地址在提交阶段下载，本地文件在表单内提前校验。
 // 这样可以尽早给出明确错误，避免房间资料已修改后才失败。
-func validateCoverInput(value string) error {
+func validateCoverInput(value string, hasExistingCover bool) error {
 	value = strings.TrimSpace(value)
 	if value == "" {
-		return nil
+		if hasExistingCover {
+			return nil
+		}
+		return fmt.Errorf("首次开播请设置直播封面")
 	}
 	if parsed, err := url.ParseRequestURI(value); err == nil &&
 		(strings.EqualFold(parsed.Scheme, "http") || strings.EqualFold(parsed.Scheme, "https")) {
@@ -307,15 +320,17 @@ func validateCoverInput(value string) error {
 	if !info.Mode().IsRegular() {
 		return fmt.Errorf("直播封面必须是图片文件")
 	}
-	if info.Size() > maxCoverBytes {
-		return fmt.Errorf("直播封面不能超过 5 MB")
+	if info.Size() > maxCoverSourceBytes {
+		return fmt.Errorf("直播封面源文件不能超过 64 MB")
 	}
-	switch strings.ToLower(filepath.Ext(path)) {
-	case ".jpg", ".jpeg", ".png", ".webp":
+	detectedMIME, err := mimetype.DetectFile(path)
+	if err != nil {
+		return fmt.Errorf("识别直播封面失败: %w", err)
+	}
+	if detectedMIME.Is("image/jpeg") || detectedMIME.Is("image/png") || detectedMIME.Is("image/webp") {
 		return nil
-	default:
-		return fmt.Errorf("直播封面仅支持 JPG、JPEG、PNG 或 WebP 图片")
 	}
+	return fmt.Errorf("直播封面实际格式不受支持：%s", detectedMIME.String())
 }
 
 func normalizeCoverPath(value string) string {
