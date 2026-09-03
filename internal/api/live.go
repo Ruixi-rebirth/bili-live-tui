@@ -4,10 +4,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"image"
 	"image/color"
-	"image/jpeg"
 	_ "image/png"
 	"io"
 	"mime/multipart"
@@ -15,12 +15,14 @@ import (
 	"net/textproto"
 	"net/url"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/gabriel-vasile/mimetype"
+	"github.com/go-resty/resty/v2"
+	"github.com/shamspias/fennec"
 	xdraw "golang.org/x/image/draw"
 	_ "golang.org/x/image/webp"
 )
@@ -30,6 +32,8 @@ const DefaultBaseURL = "https://api.live.bilibili.com"
 const biliBrowserUserAgent = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0 Safari/537.36"
 
 const maxRoomCoverBytes int64 = 5 * 1024 * 1024
+
+const maxRoomCoverSourceBytes int64 = 64 * 1024 * 1024
 
 // 上传前会把图片等比调整到 B 站图片服务接受的像素范围。
 const maxRoomCoverDimension = 4096
@@ -41,6 +45,8 @@ const maxRoomCoverSourceDimension = 16384
 const maxRoomCoverSourcePixels int64 = 64 * 1024 * 1024
 
 const minRoomCoverWidth = 640
+
+const minRoomCoverProcessingWidth = 656
 
 const maxAPIResponseBytes int64 = 4 * 1024 * 1024
 
@@ -502,15 +508,17 @@ func (c *Client) UploadRoomCover(ctx context.Context, roomID, sessdata, biliJCT,
 	if info.IsDir() {
 		return "", fmt.Errorf("直播封面必须是图片文件")
 	}
-	if info.Size() > maxRoomCoverBytes {
-		return "", fmt.Errorf("直播封面不能超过 5 MB")
+	if info.Size() > maxRoomCoverSourceBytes {
+		return "", fmt.Errorf("直播封面源文件不能超过 64 MB")
 	}
-	ext := strings.ToLower(filepath.Ext(path))
-	contentType := map[string]string{".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".webp": "image/webp"}[ext]
-	if contentType == "" {
-		return "", fmt.Errorf("直播封面仅支持 JPG、JPEG、PNG 或 WebP 图片")
+	detectedMIME, err := mimetype.DetectFile(path)
+	if err != nil {
+		return "", fmt.Errorf("识别直播封面失败: %w", err)
 	}
-	uploadData, uploadType, width, height, err := normalizeCoverForUpload(file)
+	if !isSupportedCoverMIME(detectedMIME) {
+		return "", fmt.Errorf("直播封面实际格式不受支持：%s", detectedMIME.String())
+	}
+	uploadData, uploadType, width, height, err := normalizeCoverForUpload(ctx, file)
 	if err != nil {
 		return "", fmt.Errorf("处理直播封面失败: %w", err)
 	}
@@ -610,7 +618,7 @@ func (c *Client) UploadRoomCover(ctx context.Context, roomID, sessdata, biliJCT,
 	return coverURL, nil
 }
 
-func normalizeCoverForUpload(file *os.File) ([]byte, string, int, int, error) {
+func normalizeCoverForUpload(ctx context.Context, file *os.File) ([]byte, string, int, int, error) {
 	if _, err := file.Seek(0, io.SeekStart); err != nil {
 		return nil, "", 0, 0, err
 	}
@@ -627,7 +635,7 @@ func normalizeCoverForUpload(file *os.File) ([]byte, string, int, int, error) {
 	if _, err := file.Seek(0, io.SeekStart); err != nil {
 		return nil, "", 0, 0, err
 	}
-	src, _, err := image.Decode(file)
+	src, err := fennec.OpenAndOrient(file.Name())
 	if err != nil {
 		return nil, "", 0, 0, fmt.Errorf("请提供有效的 JPG、PNG 或 WebP 图片")
 	}
@@ -641,8 +649,8 @@ func normalizeCoverForUpload(file *os.File) ([]byte, string, int, int, error) {
 		maxSide = height
 	}
 	scale := 1.0
-	if width < minRoomCoverWidth {
-		scale = float64(minRoomCoverWidth) / float64(width)
+	if width < minRoomCoverProcessingWidth {
+		scale = float64(minRoomCoverProcessingWidth) / float64(width)
 	}
 	if float64(maxSide)*scale > maxRoomCoverDimension {
 		scale = float64(maxRoomCoverDimension) / float64(maxSide)
@@ -660,17 +668,29 @@ func normalizeCoverForUpload(file *os.File) ([]byte, string, int, int, error) {
 	dst := image.NewRGBA(image.Rect(0, 0, dw, dh))
 	xdraw.Draw(dst, dst.Bounds(), image.NewUniform(color.White), image.Point{}, xdraw.Src)
 	xdraw.CatmullRom.Scale(dst, dst.Bounds(), src, src.Bounds(), xdraw.Over, nil)
-	width, height = dw, dh
-	for _, quality := range []int{90, 82, 74, 66} {
-		var out bytes.Buffer
-		if err := jpeg.Encode(&out, dst, &jpeg.Options{Quality: quality}); err != nil {
-			return nil, "", 0, 0, err
-		}
-		if int64(out.Len()) <= maxRoomCoverBytes {
-			return out.Bytes(), "image/jpeg", width, height, nil
-		}
+	return compressCoverWithinLimit(ctx, dst, maxRoomCoverBytes)
+}
+
+func compressCoverWithinLimit(ctx context.Context, src image.Image, limit int64) ([]byte, string, int, int, error) {
+	opts := fennec.DefaultOptions()
+	opts.Format = fennec.JPEG
+	opts.TargetSize = int(limit)
+	opts.MaxWidth = maxRoomCoverDimension
+	opts.MaxHeight = maxRoomCoverDimension
+	opts.AutoOrient = false
+	result, err := fennec.CompressImage(ctx, src, opts)
+	if err != nil {
+		return nil, "", 0, 0, err
 	}
-	return nil, "", 0, 0, fmt.Errorf("处理后的图片仍超过 5 MB")
+	data := result.Bytes()
+	if int64(len(data)) > limit {
+		return nil, "", 0, 0, fmt.Errorf("图片处理结果仍超过 %d MB", limit/(1024*1024))
+	}
+	width, height := result.FinalDimensions.X, result.FinalDimensions.Y
+	if width < minRoomCoverWidth || height < 1 {
+		return nil, "", 0, 0, fmt.Errorf("图片压缩后的尺寸无效（当前 %d×%d）", width, height)
+	}
+	return data, "image/jpeg", width, height, nil
 }
 
 // UploadRoomCoverURL 下载远程图片，再通过与本地文件相同的 B 站接口上传。
@@ -680,30 +700,37 @@ func (c *Client) UploadRoomCoverURL(ctx context.Context, roomID, sessdata, biliJ
 	if err != nil || (!strings.EqualFold(parsed.Scheme, "http") && !strings.EqualFold(parsed.Scheme, "https")) || parsed.Host == "" {
 		return "", fmt.Errorf("直播封面 URL 无效")
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, parsed.String(), nil)
-	if err != nil {
-		return "", fmt.Errorf("准备下载直播封面失败: %w", err)
+	downloadHTTPClient := &http.Client{
+		Transport:     c.HTTPClient.Transport,
+		CheckRedirect: c.HTTPClient.CheckRedirect,
+		Jar:           c.HTTPClient.Jar,
+		Timeout:       30 * time.Second,
 	}
-	req.Header.Set("Accept", "image/jpeg,image/png,image/webp;q=0.9,*/*;q=0.1")
-	req.Header.Set("User-Agent", "bili-live-tui/1.0")
-	resp, err := c.HTTPClient.Do(req)
+	downloadClient := resty.NewWithClient(downloadHTTPClient).
+		SetRetryCount(2).
+		SetRetryWaitTime(200 * time.Millisecond).
+		SetRetryMaxWaitTime(time.Second).
+		SetResponseBodyLimit(int(maxRoomCoverSourceBytes))
+	resp, err := downloadClient.R().
+		SetContext(ctx).
+		SetHeaders(map[string]string{
+			"Accept":     "image/jpeg,image/png,image/webp;q=0.9,*/*;q=0.1",
+			"User-Agent": biliBrowserUserAgent,
+		}).
+		Get(parsed.String())
 	if err != nil {
+		if errors.Is(err, resty.ErrResponseBodyTooLarge) {
+			return "", fmt.Errorf("直播封面源文件不能超过 64 MB")
+		}
 		return "", fmt.Errorf("下载直播封面失败: %w", err)
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return "", fmt.Errorf("下载直播封面失败：远程服务器返回 HTTP %d", resp.StatusCode)
+	if !resp.IsSuccess() {
+		return "", fmt.Errorf("下载直播封面失败：远程服务器返回 HTTP %d", resp.StatusCode())
 	}
-	data, err := io.ReadAll(io.LimitReader(resp.Body, maxRoomCoverBytes+1))
+	data := resp.Body()
+	ext, err := remoteCoverExtension(data, resp.Header().Get("Content-Type"))
 	if err != nil {
-		return "", fmt.Errorf("读取远程直播封面失败: %w", err)
-	}
-	if int64(len(data)) > maxRoomCoverBytes {
-		return "", fmt.Errorf("直播封面不能超过 5 MB")
-	}
-	ext := coverExtension(parsed.Path, resp.Header.Get("Content-Type"), data)
-	if ext == "" {
-		return "", fmt.Errorf("远程直播封面不是支持的 JPG、PNG 或 WebP 图片")
+		return "", err
 	}
 	temp, err := os.CreateTemp("", "bili-live-cover-*"+ext)
 	if err != nil {
@@ -721,32 +748,41 @@ func (c *Client) UploadRoomCoverURL(ctx context.Context, roomID, sessdata, biliJ
 	return c.UploadRoomCover(ctx, roomID, sessdata, biliJCT, path)
 }
 
-func coverExtension(path, contentType string, data []byte) string {
-	switch strings.ToLower(filepath.Ext(path)) {
-	case ".jpg", ".jpeg", ".png", ".webp":
-		return strings.ToLower(filepath.Ext(path))
+func remoteCoverExtension(data []byte, declaredContentType string) (string, error) {
+	detectedMIME := mimetype.Detect(data)
+	detectedContentType := strings.ToLower(strings.TrimSpace(strings.Split(detectedMIME.String(), ";")[0]))
+	if !isSupportedCoverMIME(detectedMIME) {
+		return "", remoteCoverTypeError(declaredContentType, detectedContentType, false)
 	}
-	contentType = strings.ToLower(strings.TrimSpace(strings.Split(contentType, ";")[0]))
-	switch contentType {
-	case "image/jpeg", "image/jpg":
-		return ".jpg"
-	case "image/png":
-		return ".png"
-	case "image/webp":
-		return ".webp"
+	_, format, err := image.DecodeConfig(bytes.NewReader(data))
+	if err != nil {
+		return "", remoteCoverTypeError(declaredContentType, detectedContentType, true)
 	}
-	if len(data) > 0 {
-		detected := strings.ToLower(http.DetectContentType(data))
-		switch detected {
-		case "image/jpeg":
-			return ".jpg"
-		case "image/png":
-			return ".png"
-		case "image/webp":
-			return ".webp"
-		}
+	switch format {
+	case "jpeg":
+		return ".jpg", nil
+	case "png":
+		return ".png", nil
+	case "webp":
+		return ".webp", nil
+	default:
+		return "", fmt.Errorf("远程直播封面格式不受支持：%s", format)
 	}
-	return ""
+}
+
+func isSupportedCoverMIME(detectedMIME *mimetype.MIME) bool {
+	return detectedMIME.Is("image/jpeg") || detectedMIME.Is("image/png") || detectedMIME.Is("image/webp")
+}
+
+func remoteCoverTypeError(declaredContentType, detectedContentType string, damaged bool) error {
+	declaredContentType = strings.TrimSpace(strings.Split(declaredContentType, ";")[0])
+	if declaredContentType == "" {
+		declaredContentType = "未提供"
+	}
+	if damaged {
+		return fmt.Errorf("远程图片数据不完整或已损坏（响应类型：%s，检测类型：%s）", declaredContentType, detectedContentType)
+	}
+	return fmt.Errorf("远程服务器返回的不是 JPG、PNG 或 WebP 图片（响应类型：%s，检测类型：%s）", declaredContentType, detectedContentType)
 }
 
 type flexibleID string
