@@ -23,7 +23,7 @@
             src = ./.;
             subPackages = [ "cmd/bili-live-tui" ];
             go = pkgs.go_1_26;
-            vendorHash = "sha256-WQMlhZrtt9st+BEe39EzivpBLAG0OM3bzX/FKXhL2Qo=";
+            vendorHash = "sha256-p+cSwHPMCrIFV75+imbh2LBEwXzUnNPfkEDVkd9jngE=";
             ldflags = [
               "-s"
               "-w"

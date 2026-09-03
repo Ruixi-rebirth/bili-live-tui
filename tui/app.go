@@ -79,7 +79,7 @@ func RunLiveSettings(ctx context.Context, areas []api.LiveArea, initial *api.Liv
 			setStatus(err.Error(), true)
 			return
 		}
-		if err := validateCoverInput(settings.CoverPath); err != nil {
+		if err := validateCoverInput(settings.CoverPath, state.hasExistingCover); err != nil {
 			setStatus(err.Error(), true)
 			return
 		}
@@ -175,7 +175,7 @@ func newLiveEditPage(app *tview.Application, initial api.LiveSettings, areas []a
 			setStatus(err.Error(), true)
 			return
 		}
-		if err := validateCoverInput(settings.CoverPath); err != nil {
+		if err := validateCoverInput(settings.CoverPath, state.hasExistingCover); err != nil {
 			setStatus(err.Error(), true)
 			return
 		}

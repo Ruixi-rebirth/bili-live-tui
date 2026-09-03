@@ -158,6 +158,9 @@ func TestUploadRoomCover(t *testing.T) {
 	if err := png.Encode(temp, coverImage); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := temp.Write(make([]byte, maxRoomCoverBytes)); err != nil {
+		t.Fatal(err)
+	}
 	if err := temp.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -215,12 +218,15 @@ func TestUploadRoomCoverURL(t *testing.T) {
 		switch r.Method {
 		case http.MethodGet:
 			downloaded.Store(true)
+			if r.Header.Get("User-Agent") != biliBrowserUserAgent {
+				t.Errorf("cover download User-Agent = %q", r.Header.Get("User-Agent"))
+			}
 			var data bytes.Buffer
 			coverImage := image.NewRGBA(image.Rect(0, 0, 640, 360))
 			if err := jpeg.Encode(&data, coverImage, nil); err != nil {
 				return nil, err
 			}
-			return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(bytes.NewReader(data.Bytes())), Header: http.Header{"Content-Type": []string{"image/jpeg"}}}, nil
+			return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(bytes.NewReader(data.Bytes())), Header: http.Header{"Content-Type": []string{"text/plain"}}}, nil
 		case http.MethodPost:
 			body, _ := io.ReadAll(r.Body)
 			if len(body) == 0 {
@@ -233,12 +239,41 @@ func TestUploadRoomCoverURL(t *testing.T) {
 	})
 	client := NewClient(&http.Client{Transport: transport})
 	client.BaseURL = "http://test.invalid"
-	got, err := client.UploadRoomCoverURL(context.Background(), "1", "sess", "jct", "https://apis.example/cover.jpg")
+	got, err := client.UploadRoomCoverURL(context.Background(), "1", "sess", "jct", "https://apis.example/download")
 	if err != nil {
 		t.Fatalf("UploadRoomCoverURL() error = %v", err)
 	}
 	if !downloaded.Load() || got != "https://i.example/cover.jpg" {
 		t.Fatalf("UploadRoomCoverURL() downloaded=%v url=%q", downloaded.Load(), got)
+	}
+}
+
+func TestUploadRoomCoverURLRejectsHTMLBehindImageURL(t *testing.T) {
+	var uploaded atomic.Bool
+	transport := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.Method == http.MethodPost {
+			uploaded.Store(true)
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(strings.NewReader("<!doctype html><title>Access denied</title>")),
+			Header:     http.Header{"Content-Type": []string{"text/html; charset=utf-8"}},
+		}, nil
+	})
+	client := NewClient(&http.Client{Transport: transport})
+	_, err := client.UploadRoomCoverURL(context.Background(), "1", "sess", "jct", "https://apis.example/cover.jpg")
+	if err == nil || !strings.Contains(err.Error(), "检测类型：text/html") {
+		t.Fatalf("UploadRoomCoverURL() error = %v", err)
+	}
+	if uploaded.Load() {
+		t.Fatal("invalid remote content must not be uploaded")
+	}
+}
+
+func TestRemoteCoverExtensionRejectsTruncatedJPEG(t *testing.T) {
+	_, err := remoteCoverExtension([]byte{0xff, 0xd8, 0xff, 0xe0}, "image/jpeg")
+	if err == nil || !strings.Contains(err.Error(), "数据不完整或已损坏") {
+		t.Fatalf("remoteCoverExtension() error = %v", err)
 	}
 }
 
@@ -253,16 +288,44 @@ func TestNormalizeCoverForUploadUpscalesAndEncodesJPEG(t *testing.T) {
 	if _, err := temp.Seek(0, io.SeekStart); err != nil {
 		t.Fatal(err)
 	}
-	data, contentType, width, height, err := normalizeCoverForUpload(temp)
+	data, contentType, width, height, err := normalizeCoverForUpload(context.Background(), temp)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if contentType != "image/jpeg" || width != 640 || height != 547 {
+	if contentType != "image/jpeg" || width != 656 || height != 561 {
 		t.Fatalf("normalized cover = %s %dx%d", contentType, width, height)
 	}
 	config, format, err := image.DecodeConfig(bytes.NewReader(data))
 	if err != nil || format != "jpeg" || config.Width != width || config.Height != height {
 		t.Fatalf("encoded cover = %s %dx%d, err=%v", format, config.Width, config.Height, err)
+	}
+}
+
+func TestCompressCoverWithinLimitFitsTarget(t *testing.T) {
+	src := image.NewNRGBA(image.Rect(0, 0, 1200, 675))
+	state := uint32(1)
+	for i := range src.Pix {
+		state ^= state << 13
+		state ^= state >> 17
+		state ^= state << 5
+		src.Pix[i] = byte(state)
+	}
+	const limit = 200 * 1024
+	data, contentType, width, height, err := compressCoverWithinLimit(context.Background(), src, limit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if int64(len(data)) > limit {
+		t.Fatalf("encoded cover size = %d, limit = %d", len(data), limit)
+	}
+	if contentType != "image/jpeg" {
+		t.Fatalf("encoded cover content type = %q", contentType)
+	}
+	if width < minRoomCoverWidth || width > 1200 || height < 1 {
+		t.Fatalf("encoded cover dimensions = %dx%d", width, height)
+	}
+	if _, format, err := image.DecodeConfig(bytes.NewReader(data)); err != nil || format != "jpeg" {
+		t.Fatalf("encoded cover format = %q, err = %v", format, err)
 	}
 }
 
@@ -278,7 +341,7 @@ func TestNormalizeCoverForUploadRejectsUnknownFormat(t *testing.T) {
 	if _, err := temp.Seek(0, io.SeekStart); err != nil {
 		t.Fatal(err)
 	}
-	_, _, _, _, err = normalizeCoverForUpload(temp)
+	_, _, _, _, err = normalizeCoverForUpload(context.Background(), temp)
 	if err == nil || !strings.Contains(err.Error(), "请提供有效的 JPG、PNG 或 WebP 图片") {
 		t.Fatalf("invalid cover error = %v", err)
 	}
