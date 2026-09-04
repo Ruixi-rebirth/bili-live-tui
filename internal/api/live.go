@@ -12,6 +12,7 @@ import (
 	_ "image/png"
 	"io"
 	"mime/multipart"
+	"net"
 	"net/http"
 	"net/textproto"
 	"net/url"
@@ -88,8 +89,10 @@ type LiveSettings struct {
 	AreaID       string
 	// CoverPath 可以是本地图片路径或远程图片地址；提交房间资料前都会上传到 B 站。
 	CoverPath string
-	// StreamMode 和 OBSPassword 是本地启动选项，API 不会把它们写入 B 站房间资料。
+	// StreamMode、OBSHost、OBSPort 和 OBSPassword 是本地启动选项，API 不会把它们写入 B 站房间资料。
 	StreamMode  string
+	OBSHost     string
+	OBSPort     string
 	OBSPassword string
 	Orientation string
 	// TagIDsJSON 保存标签名称到 B 站编号的映射，用于后续删除。
@@ -102,6 +105,18 @@ func (s LiveSettings) Validate() error {
 	}
 	if orientation := strings.TrimSpace(s.Orientation); orientation != "" && orientation != OrientationLandscape && orientation != OrientationPortrait {
 		return fmt.Errorf("直播方向无效")
+	}
+	if value := strings.TrimSpace(s.OBSHost); value != "" {
+		host := strings.Trim(value, "[]")
+		if strings.Contains(value, "://") || strings.ContainsAny(value, "/\\ 	\r\n") || (strings.Contains(host, ":") && net.ParseIP(host) == nil) {
+			return fmt.Errorf("OBS WebSocket 地址应填写主机名或 IP，不要包含协议、路径或端口")
+		}
+	}
+	if value := strings.TrimSpace(s.OBSPort); value != "" {
+		port, err := strconv.Atoi(value)
+		if err != nil || port < 1 || port > 65535 {
+			return fmt.Errorf("OBS WebSocket 端口必须是 1 到 65535 之间的数字")
+		}
 	}
 	if strings.TrimSpace(s.AreaID) == "" {
 		return fmt.Errorf("分区不能为空")

@@ -1,6 +1,7 @@
 package obs
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"log"
@@ -22,7 +23,9 @@ import (
 	"github.com/andreykaipov/goobs/api/typedefs"
 )
 
-const OBSPort = "4455"
+const DefaultPort = "4455"
+
+const DefaultHost = "127.0.0.1"
 
 const (
 	obsControlReconnectWindow = 60 * time.Second
@@ -48,19 +51,32 @@ func ExecutablePath() (string, error) {
 	}, candidates...)
 }
 
-// Preflight 仅在 OBS WebSocket 尚未运行时要求本地存在 OBS 可执行文件。
-func Preflight() error {
-	if isObsRunning(OBSPort) {
+// Preflight 先验证指定的 OBS WebSocket。只有本机地址未就绪时，才检查 OBS 可执行文件。
+func Preflight(host, port, password string) error {
+	host = normalizedHost(host)
+	port = normalizedPort(port)
+	if isObsRunning(host, port) {
+		client, err := newRuntimeClient(host, port, password)
+		if err != nil {
+			return fmt.Errorf("连接 OBS WebSocket 失败: %w。请确认地址、端口和密码正确", err)
+		}
+		_ = client.Disconnect()
 		return nil
+	}
+	if !isLocalOBSHost(host) {
+		return remoteOBSUnavailableError(host, port)
+	}
+	if isOBSProcessRunning() {
+		return obsWebSocketUnavailableError(port)
 	}
 	_, err := ExecutablePath()
 	return err
 }
 
 // 检查端口是否被占用
-func isObsRunning(port string) bool {
+func isObsRunning(host, port string) bool {
 	timeout := time.Second
-	conn, err := net.DialTimeout("tcp", net.JoinHostPort("localhost", port), timeout)
+	conn, err := net.DialTimeout("tcp", net.JoinHostPort(normalizedHost(host), normalizedPort(port)), timeout)
 	if err != nil {
 		return false
 	}
@@ -72,9 +88,17 @@ func isObsRunning(port string) bool {
 }
 
 // 确保 OBS 已启动
-func ensureObsAlive() error {
-	if isObsRunning(OBSPort) {
+func ensureObsAlive(host, port string) error {
+	host = normalizedHost(host)
+	port = normalizedPort(port)
+	if isObsRunning(host, port) {
 		return nil // 已经运行中
+	}
+	if !isLocalOBSHost(host) {
+		return remoteOBSUnavailableError(host, port)
+	}
+	if isOBSProcessRunning() {
+		return obsWebSocketUnavailableError(port)
 	}
 
 	command, err := ExecutablePath()
@@ -97,7 +121,7 @@ func ensureObsAlive() error {
 	// 轮询等待 OBS WebSocket 端口就绪 (最多等 10 秒)
 	for range 10 {
 		time.Sleep(1 * time.Second)
-		if isObsRunning("4455") {
+		if isObsRunning(host, port) {
 			return nil
 		}
 	}
@@ -105,9 +129,72 @@ func ensureObsAlive() error {
 	return fmt.Errorf("OBS 启动超时或 WebSocket 未开启")
 }
 
+func isOBSProcessRunning() bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	var command *exec.Cmd
+	if runtime.GOOS == "windows" {
+		command = exec.CommandContext(ctx, "tasklist.exe", "/FO", "CSV", "/NH")
+	} else {
+		command = exec.CommandContext(ctx, "ps", "-A", "-o", "comm=")
+	}
+	output, err := command.Output()
+	return err == nil && outputHasOBSProcess(string(output))
+}
+
+func outputHasOBSProcess(output string) bool {
+	for _, line := range strings.Split(output, "\n") {
+		name := line
+		if first, _, found := strings.Cut(name, ","); found {
+			name = first
+		}
+		name = strings.Trim(strings.TrimSpace(name), `"`)
+		name = strings.ToLower(filepath.Base(name))
+		switch name {
+		case "obs", "obs-studio", "obs64.exe", "obs32.exe":
+			return true
+		}
+	}
+	return false
+}
+
+func normalizedPort(port string) string {
+	if port = strings.TrimSpace(port); port != "" {
+		return port
+	}
+	return DefaultPort
+}
+
+func normalizedHost(host string) string {
+	host = strings.Trim(strings.TrimSpace(host), "[]")
+	if host == "" || strings.EqualFold(host, "localhost") {
+		return DefaultHost
+	}
+	return host
+}
+
+func isLocalOBSHost(host string) bool {
+	host = normalizedHost(host)
+	if host == DefaultHost {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+func obsWebSocketUnavailableError(port string) error {
+	return fmt.Errorf("检测到 OBS 已在运行，但无法连接 WebSocket。请启用 OBS WebSocket 服务并确认端口为 %s", normalizedPort(port))
+}
+
+func remoteOBSUnavailableError(host, port string) error {
+	return fmt.Errorf("无法连接远程 OBS WebSocket %s。请确认远端 OBS 已启动、WebSocket 已启用且网络可达", net.JoinHostPort(normalizedHost(host), normalizedPort(port)))
+}
+
 // Runtime 持有持续的 OBS WebSocket 会话，使 TUI 能在开播后观察推流状态，
 // 而不是配置 RTMP 后立即断开连接。
 type Runtime struct {
+	host     string
+	port     string
 	password string
 
 	mu              sync.RWMutex
@@ -137,8 +224,10 @@ type healthSample struct {
 	memoryMB       float64
 }
 
-func NewRuntime(password string) *Runtime {
+func NewRuntime(host, port, password string) *Runtime {
 	return &Runtime{
+		host:        normalizedHost(host),
+		port:        normalizedPort(port),
 		password:    password,
 		health:      streamruntime.Health{Mode: streamruntime.ModeOBS},
 		done:        make(chan struct{}),
@@ -147,12 +236,12 @@ func NewRuntime(password string) *Runtime {
 }
 
 func (r *Runtime) Start(rtmpAddr, streamKey string) error {
-	if err := ensureObsAlive(); err != nil {
+	if err := ensureObsAlive(r.host, r.port); err != nil {
 		return err
 	}
-	client, err := newRuntimeClient(r.password)
+	client, err := newRuntimeClient(r.host, r.port, r.password)
 	if err != nil {
-		return fmt.Errorf("连接 OBS WebSocket 失败: %w；请确认 OBS 已启用 WebSocket 服务且密码正确", err)
+		return fmt.Errorf("连接 OBS WebSocket 失败: %w。请确认 OBS 已启用 WebSocket 服务、端口和密码正确", err)
 	}
 
 	var status *obsstream.GetStreamStatusResponse
@@ -269,9 +358,9 @@ func (r *Runtime) sampleHealth() {
 	r.applyHealthSample(sample, time.Now())
 }
 
-func newRuntimeClient(password string) (*goobs.Client, error) {
+func newRuntimeClient(host, port, password string) (*goobs.Client, error) {
 	return goobs.New(
-		"localhost:"+OBSPort,
+		net.JoinHostPort(normalizedHost(host), normalizedPort(port)),
 		goobs.WithPassword(password),
 		goobs.WithLogger(log.New(io.Discard, "", 0)),
 		goobs.WithResponseTimeoutDuration(5*time.Second),
@@ -353,7 +442,7 @@ func (r *Runtime) markControlConnectionErrorAt(err error, now time.Time) bool {
 // reconnectControlClient 只恢复 OBS WebSocket 控制通道，不重启 OBS 或重新开始推流。
 // 调用方必须持有 controlMu，避免与状态读取和 Stop 并发使用 goobs 客户端。
 func (r *Runtime) reconnectControlClient(previous *goobs.Client) error {
-	client, err := newRuntimeClient(r.password)
+	client, err := newRuntimeClient(r.host, r.port, r.password)
 	if err != nil {
 		return fmt.Errorf("OBS 控制连接重连失败: %w", err)
 	}
@@ -442,7 +531,7 @@ func (r *Runtime) Stop() (stopErr error) {
 
 	status, err := client.Stream.GetStreamStatus(&obsstream.GetStreamStatusParams{})
 	if isOBSClientDisconnected(err) {
-		freshClient, reconnectErr := newRuntimeClient(r.password)
+		freshClient, reconnectErr := newRuntimeClient(r.host, r.port, r.password)
 		if reconnectErr != nil {
 			return fmt.Errorf("停止 OBS 推流失败：控制连接已断开，重新连接失败: %w", reconnectErr)
 		}

@@ -33,6 +33,13 @@ func TestLiveSettingsValidate(t *testing.T) {
 		{"negative area", LiveSettings{Title: "测试直播", AreaID: "-1"}, true},
 		{"long text is delegated to Bilibili", LiveSettings{Title: strings.Repeat("标", 500), Description: strings.Repeat("简", 1000), Announcement: strings.Repeat("公", 1000), Tags: strings.Repeat("标", 1000), AreaID: "376"}, false},
 		{"invalid orientation", LiveSettings{Title: "测试直播", AreaID: "376", Orientation: "diagonal"}, true},
+		{"valid remote OBS host", LiveSettings{Title: "测试直播", AreaID: "376", OBSHost: "obs.example.test"}, false},
+		{"valid IPv6 OBS host", LiveSettings{Title: "测试直播", AreaID: "376", OBSHost: "[2001:db8::1]"}, false},
+		{"OBS host with scheme", LiveSettings{Title: "测试直播", AreaID: "376", OBSHost: "ws://127.0.0.1"}, true},
+		{"OBS host with port", LiveSettings{Title: "测试直播", AreaID: "376", OBSHost: "127.0.0.1:4455"}, true},
+		{"valid custom OBS port", LiveSettings{Title: "测试直播", AreaID: "376", OBSPort: "4456"}, false},
+		{"non numeric OBS port", LiveSettings{Title: "测试直播", AreaID: "376", OBSPort: "port"}, true},
+		{"out of range OBS port", LiveSettings{Title: "测试直播", AreaID: "376", OBSPort: "65536"}, true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

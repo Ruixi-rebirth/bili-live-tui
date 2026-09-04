@@ -85,6 +85,8 @@ func TestSaveAndLoadLiveSettings(t *testing.T) {
 		AreaID:      "376",
 		CoverPath:   "https://example.com/cover.webp",
 		StreamMode:  "obs",
+		OBSHost:     "192.0.2.10",
+		OBSPort:     "4456",
 		OBSPassword: "private-password",
 	}
 	if err := SaveLiveSettings(want); err != nil {

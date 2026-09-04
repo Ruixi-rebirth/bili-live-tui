@@ -128,7 +128,7 @@ func RunHome(ctx context.Context, startedAt time.Time, roomID string, settings *
 	})
 
 	buttons := make([]*tview.Button, 0, 4)
-	buttons = append(buttons, newHomeActionButton("返回弹幕", stopApplication))
+	buttons = append(buttons, newActionButton("返回弹幕", stopApplication))
 	if preview != nil {
 		startPreview = func() {
 			if !previewBusy.CompareAndSwap(false, true) {
@@ -163,9 +163,9 @@ func RunHome(ctx context.Context, startedAt time.Time, roomID string, settings *
 				})
 			}()
 		}
-		buttons = append(buttons, newHomeActionButton("预览直播", startPreview))
+		buttons = append(buttons, newActionButton("预览直播", startPreview))
 	}
-	buttons = append(buttons, newHomeActionButton("修改资料", func() {
+	buttons = append(buttons, newActionButton("修改资料", func() {
 		var saving atomic.Bool
 		var editPage *liveEditPage
 		closeEdit := func() {
@@ -220,7 +220,7 @@ func RunHome(ctx context.Context, startedAt time.Time, roomID string, settings *
 		pages.AddAndSwitchToPage("edit", editPage.root, true)
 		app.SetFocus(editPage.form)
 	}))
-	buttons = append(buttons, newHomeActionButton("下播退出", func() {
+	buttons = append(buttons, newActionButton("下播退出", func() {
 		pages.ShowPage("confirm-stop")
 		app.SetFocus(confirm)
 	}))
@@ -522,7 +522,7 @@ func summaryValue(value, fallback string) string {
 	return tview.Escape(value)
 }
 
-func newHomeActionButton(label string, selected func()) *tview.Button {
+func newActionButton(label string, selected func()) *tview.Button {
 	return tview.NewButton(label).
 		SetSelectedFunc(selected).
 		SetStyle(tcell.StyleDefault.

@@ -118,6 +118,11 @@ func wideFormPage(header, body, footer tview.Primitive) tview.Primitive {
 	return centeredPageWithGrid(header, body, footer, -1, -8, -1)
 }
 
+// tallWideFormPage 给开播前的配置页更多垂直空间，减少字段和 OBS 分组的滚动。
+func tallWideFormPage(header, body, footer tview.Primitive) tview.Primitive {
+	return centeredPageWithGrid(header, body, footer, -1, -16, -1)
+}
+
 func centeredPageWithGrid(header, body, footer tview.Primitive, top, middle, bottom int) tview.Primitive {
 	center := tview.NewGrid()
 	center.SetRows(top, middle, bottom)
