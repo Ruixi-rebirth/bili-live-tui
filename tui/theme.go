@@ -52,6 +52,37 @@ func (overlay *floatingOverlay) Draw(screen tcell.Screen) {
 }
 
 func applyTheme() {
+	if noColor {
+		defaultColor := tcell.ColorDefault
+		tview.Styles = tview.Theme{
+			PrimitiveBackgroundColor:    defaultColor,
+			ContrastBackgroundColor:     defaultColor,
+			MoreContrastBackgroundColor: defaultColor,
+			BorderColor:                 defaultColor,
+			TitleColor:                  defaultColor,
+			GraphicsColor:               defaultColor,
+			PrimaryTextColor:            defaultColor,
+			SecondaryTextColor:          defaultColor,
+			TertiaryTextColor:           defaultColor,
+			InverseTextColor:            defaultColor,
+			ContrastSecondaryTextColor:  defaultColor,
+		}
+		accentColor = defaultColor
+		accentActiveColor = defaultColor
+		buttonTextColor = defaultColor
+		buttonActiveTextColor = defaultColor
+		mutedColor = defaultColor
+		errorColor = defaultColor
+		panelColor = defaultColor
+		formFieldColor = defaultColor
+		formFieldFocusColor = defaultColor
+		formSelectColor = defaultColor
+		autocompleteColor = defaultColor
+		autocompleteSelectedColor = defaultColor
+		autocompleteTextColor = defaultColor
+		autocompleteSelectedTextColor = defaultColor
+		return
+	}
 	tview.Styles = tview.Theme{
 		PrimitiveBackgroundColor:    tcell.NewHexColor(0xfff1f5),
 		ContrastBackgroundColor:     tcell.NewHexColor(0xfff9fb),
@@ -66,6 +97,12 @@ func applyTheme() {
 		ContrastSecondaryTextColor:  tcell.NewHexColor(0x987585),
 	}
 }
+
+var noColor bool
+var danmakuNoColor bool
+
+// SetNoColor 设置弹幕页面是否关闭主题颜色。
+func SetNoColor(disabled bool) { danmakuNoColor = disabled }
 
 var (
 	accentColor                   = tcell.NewHexColor(0xe98eaa)

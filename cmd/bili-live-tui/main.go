@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"net/url"
 	"os"
@@ -25,6 +26,9 @@ import (
 )
 
 func main() {
+	noColor := flag.Bool("no-danmaku-color", false, "禁用弹幕页面颜色")
+	flag.Parse()
+	tui.SetNoColor(*noColor || os.Getenv("NO_COLOR") != "")
 	diagnosticLog, _ := diagnostics.Open()
 	if diagnosticLog != nil {
 		defer diagnosticLog.Close()

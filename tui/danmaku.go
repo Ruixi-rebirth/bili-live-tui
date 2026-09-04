@@ -21,6 +21,9 @@ func RunDanmaku(ctx context.Context, session *LiveDanmakuSession, client *api.Cl
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	previousNoColor := noColor
+	noColor = danmakuNoColor
+	defer func() { noColor = previousNoColor }()
 	applyTheme()
 	app := tview.NewApplication().EnableMouse(true).EnablePaste(true).SetTitle("bili-live-tui")
 
