@@ -96,9 +96,13 @@ func RunLiveSettings(ctx context.Context, areas []api.LiveArea, initial *api.Liv
 	app := tview.NewApplication().EnableMouse(true).EnablePaste(true).SetTitle("bili-live-tui")
 
 	form, state := newLiveFormWithOptions(areas, initial, "开播信息", true)
+	form.SetBorderPadding(0, 0, 1, 1)
 	status := tview.NewTextView()
 	status.SetDynamicColors(true)
 	status.SetTextColor(mutedColor)
+	status.SetTextAlign(tview.AlignCenter)
+	status.SetWrap(true)
+	status.SetWordWrap(false)
 	status.SetBackgroundColor(tview.Styles.PrimitiveBackgroundColor)
 
 	var result api.LiveSettings
@@ -113,20 +117,6 @@ func RunLiveSettings(ctx context.Context, areas []api.LiveArea, initial *api.Liv
 	}
 
 	pages := tview.NewPages()
-	// 先创建选择器再组装中心页面，使弹窗关闭后能把焦点准确返回到打开它的表单控件。
-	body := tview.NewFlex()
-	body.SetDirection(tview.FlexRow)
-	body.SetBackgroundColor(tview.Styles.PrimitiveBackgroundColor)
-	// 表单占据剩余空间，焦点切换到下方项目时自动垂直滚动。
-	body.AddItem(form, 0, 1, true)
-	body.AddItem(status, 2, 0, false)
-	configureResponsiveLiveForm(app, form, state.description)
-	root := wideFormPage(
-		pageHeader("设置开播信息", "填写房间资料，确认后立即开始直播"),
-		body,
-		pageFooter("Tab 切换　Enter 确认　Esc/Ctrl+C 取消开播　支持鼠标点击"),
-	)
-	pages.AddPage("main", root, true, true)
 	cancelLive := func() {
 		if busy.Load() {
 			cancelled = true
@@ -174,7 +164,7 @@ func RunLiveSettings(ctx context.Context, areas []api.LiveArea, initial *api.Liv
 			})
 		}()
 	}
-	form.AddButton("开始直播", func() {
+	startLive := func() {
 		settings := state.settings()
 		if err := settings.Validate(); err != nil {
 			setStatus(err.Error(), true)
@@ -185,20 +175,66 @@ func RunLiveSettings(ctx context.Context, areas []api.LiveArea, initial *api.Liv
 			return
 		}
 		startSubmit(settings)
-	})
-	form.GetButton(form.GetButtonCount() - 1).SetLabel("  ▶ 开始直播  ").
-		SetStyle(tcell.StyleDefault.Background(accentColor).Foreground(buttonTextColor).Bold(true)).
-		SetActivatedStyle(tcell.StyleDefault.Background(accentActiveColor).Foreground(buttonActiveTextColor).Bold(true))
-	form.AddButton("✕ 取消开播", cancelLive)
-	form.GetButton(form.GetButtonCount() - 1).SetLabel("  ✕ 取消开播  ")
-	equalizeButtonWidths(form)
+	}
+	startButton := newActionButton("▶ 开始直播", startLive).
+		SetStyle(tcell.StyleDefault.Background(accentColor).Foreground(buttonTextColor).Bold(true))
+	cancelButton := newActionButton("✕ 取消开播", cancelLive)
+	buttons := centeredActionBar([]*tview.Button{startButton, cancelButton})
+	buttons.SetBackgroundColor(tview.Styles.PrimitiveBackgroundColor)
+
+	// 配置、操作和状态各自独立：长错误只在底部状态区换行，不会撑开表单或推动按钮。
+	body := tview.NewFlex()
+	body.SetDirection(tview.FlexRow)
+	body.SetBackgroundColor(tview.Styles.PrimitiveBackgroundColor)
+	body.AddItem(form, 1, 0, true)
+	body.AddItem(nil, 1, 0, false)
+	body.AddItem(buttons, 1, 0, true)
+	body.AddItem(status, 3, 0, false)
+	configureStartLiveForm(app, body, form, state.description)
+	root := tallWideFormPage(
+		pageHeader("设置开播信息", "填写房间资料，确认后立即开始直播"),
+		body,
+		pageFooter("Tab 切换　Enter 确认　Esc/Ctrl+C 取消开播　支持鼠标点击"),
+	)
+	pages.AddPage("main", root, true, true)
 
 	form.SetCancelFunc(cancelLive)
+	startButton.SetExitFunc(func(key tcell.Key) {
+		switch key {
+		case tcell.KeyTab:
+			app.SetFocus(cancelButton)
+		case tcell.KeyBacktab:
+			focusLastLiveFormItem(app, form, state)
+		case tcell.KeyEscape:
+			cancelLive()
+		}
+	})
+	cancelButton.SetExitFunc(func(key tcell.Key) {
+		switch key {
+		case tcell.KeyTab:
+			form.SetFocus(0)
+			app.SetFocus(form)
+		case tcell.KeyBacktab:
+			app.SetFocus(startButton)
+		case tcell.KeyEscape:
+			cancelLive()
+		}
+	})
 
 	app.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 		if event.Key() == tcell.KeyCtrlC {
 			cancelLive()
 			return nil
+		}
+		if event.Key() == tcell.KeyBacktab && state.title.HasFocus() {
+			app.SetFocus(cancelButton)
+			return nil
+		}
+		if event.Key() == tcell.KeyTab || event.Key() == tcell.KeyEnter {
+			if state.obsPassword.HasFocus() || (formItemIndex(form, state.obsGroup) < 0 && state.streamMode.HasFocus() && event.Key() == tcell.KeyTab) {
+				app.SetFocus(startButton)
+				return nil
+			}
 		}
 		return event
 	})
@@ -226,6 +262,14 @@ func RunLiveSettings(ctx context.Context, areas []api.LiveArea, initial *api.Liv
 		return api.LiveSettings{}, ErrLiveSettingsCancelled
 	}
 	return result, nil
+}
+
+func focusLastLiveFormItem(app *tview.Application, form *tview.Form, state *liveFormState) {
+	if formItemIndex(form, state.obsGroup) >= 0 {
+		app.SetFocus(state.obsPassword)
+		return
+	}
+	app.SetFocus(state.streamMode)
 }
 
 type liveEditPage struct {
@@ -293,6 +337,31 @@ func newLiveEditPage(app *tview.Application, initial api.LiveSettings, areas []a
 
 // configureResponsiveLiveForm 在较矮终端中压缩简介和字段间距。
 // 多行字段的边框裁剪由 formClippedTextArea 统一处理。
+func configureStartLiveForm(app *tview.Application, body *tview.Flex, form *tview.Form, description *tview.TextArea) {
+	app.SetBeforeDrawFunc(func(screen tcell.Screen) bool {
+		_, height := screen.Size()
+		padding, rows := responsiveLiveFormDensity(height)
+		form.SetItemPadding(padding)
+		description.SetSize(rows, 0)
+
+		// 开播页中央区域占垂直权重的 16/18；再留出框外间隔、按钮和状态区。
+		available := max((height-4)*16/18-5, 1)
+		body.ResizeItem(form, min(preferredLiveFormHeight(form, padding), available), 0)
+		return false
+	})
+}
+
+func preferredLiveFormHeight(form *tview.Form, padding int) int {
+	height := 2 // 开播表单仅保留上下边框，不再额外留垂直内边距。
+	for index := 0; index < form.GetFormItemCount(); index++ {
+		height += form.GetFormItem(index).GetFieldHeight()
+	}
+	if count := form.GetFormItemCount(); count > 1 {
+		height += (count - 1) * padding
+	}
+	return height
+}
+
 func configureResponsiveLiveForm(app *tview.Application, form *tview.Form, description *tview.TextArea) {
 	app.SetBeforeDrawFunc(func(screen tcell.Screen) bool {
 		_, height := screen.Size()

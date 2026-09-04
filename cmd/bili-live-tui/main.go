@@ -325,7 +325,7 @@ func rollbackLiveStart(client *api.Client, roomID, accessToken string, cause err
 func newStreamRuntime(settings api.LiveSettings) (streamruntime.Runtime, error) {
 	switch strings.TrimSpace(settings.StreamMode) {
 	case "", streamruntime.ModeOBS:
-		return obs.NewRuntime(settings.OBSPassword), nil
+		return obs.NewRuntime(settings.OBSHost, settings.OBSPort, settings.OBSPassword), nil
 	case streamruntime.ModeFFmpegTest:
 		return ffmpeg.NewTestRuntime(settings.Orientation), nil
 	default:
@@ -336,7 +336,7 @@ func newStreamRuntime(settings api.LiveSettings) (streamruntime.Runtime, error) 
 func preflightStreamExecutable(settings api.LiveSettings) error {
 	switch strings.TrimSpace(settings.StreamMode) {
 	case "", streamruntime.ModeOBS:
-		return obs.Preflight()
+		return obs.Preflight(settings.OBSHost, settings.OBSPort, settings.OBSPassword)
 	case streamruntime.ModeFFmpegTest:
 		_, err := ffmpeg.ExecutablePath()
 		return err

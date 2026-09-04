@@ -26,16 +26,169 @@ type liveFormState struct {
 	cover                *tview.InputField
 	streamMode           *autoOpenDropDown
 	orientation          *autoOpenDropDown
+	obsHost              *tview.InputField
+	obsPort              *tview.InputField
 	obsPassword          *tview.InputField
+	obsGroup             *obsWebSocketGroup
 	tagIDsJSON           string
 	hasExistingCover     bool
 	streamOptionsVisible bool
 	initialStreamMode    string
+	initialOBSHost       string
+	initialOBSPort       string
 }
 
 // focusedLabelItem 让表单只突出显示当前获得焦点的字段标签。
 type focusedLabelItem struct {
 	tview.FormItem
+}
+
+// obsWebSocketGroup 把连接地址、端口和密码收在一个紧凑的表单分组中。
+// 对外它是一个 FormItem，内部仍保留三个可分别 Tab 和鼠标点击的输入框。
+type obsWebSocketGroup struct {
+	*tview.Form
+	parent      *tview.Form
+	items       []tview.FormItem
+	focusedItem int
+	finished    func(key tcell.Key)
+	delegate    func(tview.Primitive)
+	disabled    bool
+}
+
+func (group *obsWebSocketGroup) Draw(screen tcell.Screen) {
+	if group.parent == nil {
+		group.Form.Draw(screen)
+		return
+	}
+	x, y, width, height := group.GetRect()
+	clipX, clipY, clipWidth, clipHeight := group.parent.GetInnerRect()
+	left := max(x, clipX)
+	top := max(y, clipY)
+	right := min(x+width, clipX+clipWidth)
+	bottom := min(y+height, clipY+clipHeight)
+	if left >= right || top >= bottom {
+		return
+	}
+	group.Form.SetRect(left, top, right-left, bottom-top)
+	group.Form.Draw(screen)
+	group.Form.SetRect(x, y, width, height)
+}
+
+func newOBSWebSocketGroup(host, port, password *tview.InputField) *obsWebSocketGroup {
+	// 连接值在屏幕上统一掩码，表单提交时仍使用完整原值。
+	host.SetMaskCharacter('*')
+	port.SetMaskCharacter('*')
+	password.SetMaskCharacter('*')
+	group := &obsWebSocketGroup{
+		Form: styleForm(tview.NewForm(), "OBS WebSocket"),
+		items: []tview.FormItem{
+			focusedLabelInput(host),
+			focusedLabelInput(port),
+			focusedLabelInput(password),
+		},
+	}
+	group.SetBorderPadding(0, 0, 1, 1)
+	group.SetItemPadding(0)
+	for index, item := range group.items {
+		index := index
+		item.SetFinishedFunc(func(key tcell.Key) {
+			group.finishItem(index, key)
+		})
+		group.AddFormItem(item)
+	}
+	return group
+}
+
+func (group *obsWebSocketGroup) GetLabel() string { return "" }
+
+func (group *obsWebSocketGroup) GetFieldWidth() int { return 0 }
+
+func (group *obsWebSocketGroup) GetFieldHeight() int { return len(group.items) + 2 }
+
+func (group *obsWebSocketGroup) SetFormAttributes(_ int, labelColor, bgColor, fieldTextColor, fieldBgColor tcell.Color) tview.FormItem {
+	group.SetBackgroundColor(bgColor)
+	group.SetLabelColor(labelColor)
+	group.SetFieldTextColor(fieldTextColor)
+	group.SetFieldBackgroundColor(fieldBgColor)
+	return group
+}
+
+func (group *obsWebSocketGroup) SetFinishedFunc(handler func(key tcell.Key)) tview.FormItem {
+	group.finished = handler
+	return group
+}
+
+func (group *obsWebSocketGroup) SetDisabled(disabled bool) tview.FormItem {
+	group.disabled = disabled
+	return group
+}
+
+func (group *obsWebSocketGroup) Focus(delegate func(tview.Primitive)) {
+	if group.disabled {
+		if group.finished != nil {
+			group.finished(-1)
+		}
+		return
+	}
+	group.delegate = delegate
+	if group.focusedItem < 0 || group.focusedItem >= len(group.items) {
+		group.focusedItem = 0
+	}
+	delegate(group.items[group.focusedItem])
+}
+
+func (group *obsWebSocketGroup) finishItem(index int, key tcell.Key) {
+	if group.delegate == nil {
+		if group.finished != nil {
+			group.finished(key)
+		}
+		return
+	}
+	switch key {
+	case tcell.KeyTab, tcell.KeyEnter:
+		if index < len(group.items)-1 {
+			group.focusedItem = index + 1
+			group.delegate(group.items[group.focusedItem])
+			return
+		}
+	case tcell.KeyBacktab:
+		if index > 0 {
+			group.focusedItem = index - 1
+			group.delegate(group.items[group.focusedItem])
+			return
+		}
+	}
+	if group.finished != nil {
+		group.finished(key)
+	}
+}
+
+func (group *obsWebSocketGroup) MouseHandler() func(tview.MouseAction, *tcell.EventMouse, func(tview.Primitive)) (bool, tview.Primitive) {
+	return func(action tview.MouseAction, event *tcell.EventMouse, setFocus func(tview.Primitive)) (bool, tview.Primitive) {
+		if group.disabled {
+			return false, nil
+		}
+		group.delegate = setFocus
+		for index, item := range group.items {
+			if handler := item.MouseHandler(); handler != nil {
+				consumed, capture := handler(action, event, setFocus)
+				if consumed {
+					group.focusedItem = index
+					return true, capture
+				}
+			}
+		}
+		return false, nil
+	}
+}
+
+func formItemIndex(form *tview.Form, target tview.FormItem) int {
+	for index := 0; index < form.GetFormItemCount(); index++ {
+		if form.GetFormItem(index) == target {
+			return index
+		}
+	}
+	return -1
 }
 
 // formClippedTextArea 把多行字段限制在表单内边框中。
@@ -167,14 +320,23 @@ func newLiveFormWithOptions(areas []api.LiveArea, initial *api.LiveSettings, tit
 			SetAcceptanceFunc(tview.InputFieldMaxLength(500)),
 		streamMode:  newStreamModeDropDown(),
 		orientation: newOrientationDropDown(),
+		obsHost: tview.NewInputField().
+			SetLabel("地址").
+			SetPlaceholder("留空默认 127.0.0.1").
+			SetAcceptanceFunc(tview.InputFieldMaxLength(253)),
+		obsPort: tview.NewInputField().
+			SetLabel("端口").
+			SetPlaceholder("留空默认 4455").
+			SetAcceptanceFunc(validPortInput),
 		obsPassword: tview.NewInputField().
-			SetLabel("OBS WebSocket 密码").
+			SetLabel("密码").
 			SetPlaceholder("OBS 未启用密码时留空").
-			SetMaskCharacter('*').
 			SetAcceptanceFunc(tview.InputFieldMaxLength(200)),
 	}
 	if initial != nil {
 		state.initialStreamMode = initial.StreamMode
+		state.initialOBSHost = initial.OBSHost
+		state.initialOBSPort = initial.OBSPort
 		if strings.TrimSpace(initial.Title) != "" {
 			state.title.SetText(initial.Title)
 		}
@@ -183,6 +345,12 @@ func newLiveFormWithOptions(areas []api.LiveArea, initial *api.LiveSettings, tit
 		state.tags.SetText(initial.Tags)
 		state.cover.SetText(initial.CoverPath)
 		state.area.setID(initial.AreaID)
+		if host := strings.TrimSpace(initial.OBSHost); host != "" && (!showStreamOptions || host != "127.0.0.1") {
+			state.obsHost.SetText(initial.OBSHost)
+		}
+		if port := strings.TrimSpace(initial.OBSPort); port != "" && (!showStreamOptions || port != "4455") {
+			state.obsPort.SetText(initial.OBSPort)
+		}
 		state.obsPassword.SetText(initial.OBSPassword)
 		state.tagIDsJSON = initial.TagIDsJSON
 		if initial.StreamMode == streamruntime.ModeFFmpegTest {
@@ -194,6 +362,8 @@ func newLiveFormWithOptions(areas []api.LiveArea, initial *api.LiveSettings, tit
 	}
 
 	form := styleForm(tview.NewForm(), title)
+	state.obsGroup = newOBSWebSocketGroup(state.obsHost, state.obsPort, state.obsPassword)
+	state.obsGroup.parent = form
 	form.AddFormItem(focusedLabelInput(state.title)).
 		AddFormItem(clipTextAreaToForm(form, state.description)).
 		AddFormItem(clipTextAreaToForm(form, state.announcement)).
@@ -204,15 +374,15 @@ func newLiveFormWithOptions(areas []api.LiveArea, initial *api.LiveSettings, tit
 	if showStreamOptions {
 		form.AddFormItem(focusedLabelDropDown(state.streamMode))
 		syncOBSOptions := func(index int) {
-			passwordIndex := form.GetFormItemIndex(state.obsPassword.GetLabel())
+			groupIndex := formItemIndex(form, state.obsGroup)
 			if index == 1 {
-				if passwordIndex >= 0 {
-					form.RemoveFormItem(passwordIndex)
+				if groupIndex >= 0 {
+					form.RemoveFormItem(groupIndex)
 				}
 				return
 			}
-			if passwordIndex < 0 {
-				form.AddFormItem(focusedLabelInput(state.obsPassword))
+			if groupIndex < 0 {
+				form.AddFormItem(state.obsGroup)
 			}
 		}
 		state.streamMode.SetSelectedFunc(func(_ string, index int) {
@@ -233,7 +403,15 @@ func (s *liveFormState) settings() api.LiveSettings {
 		streamMode = streamruntime.ModeFFmpegTest
 	}
 	obsPassword := s.obsPassword.GetText()
+	obsHost := s.initialOBSHost
+	obsPort := s.initialOBSPort
+	if s.streamOptionsVisible {
+		obsHost = strings.TrimSpace(s.obsHost.GetText())
+		obsPort = strings.TrimSpace(s.obsPort.GetText())
+	}
 	if s.streamOptionsVisible && streamMode != streamruntime.ModeOBS {
+		obsHost = ""
+		obsPort = ""
 		obsPassword = ""
 	}
 	orientation := api.OrientationLandscape
@@ -248,10 +426,20 @@ func (s *liveFormState) settings() api.LiveSettings {
 		AreaID:       areaID,
 		CoverPath:    normalizeCoverPath(s.cover.GetText()),
 		StreamMode:   streamMode,
+		OBSHost:      obsHost,
+		OBSPort:      obsPort,
 		OBSPassword:  obsPassword,
 		Orientation:  orientation,
 		TagIDsJSON:   s.tagIDsJSON,
 	}
+}
+
+func validPortInput(text string, _ rune) bool {
+	if text == "" {
+		return true
+	}
+	port, err := strconv.Atoi(text)
+	return err == nil && port >= 1 && port <= 65535
 }
 
 // autoOpenDropDown 是常规的终端选择器：Tab 聚焦后立即打开选项，

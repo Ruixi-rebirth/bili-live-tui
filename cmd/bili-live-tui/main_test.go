@@ -58,7 +58,7 @@ func TestUploadCoverReportsUnavailableUploadEndpoint(t *testing.T) {
 }
 
 func TestNewStreamRuntimeSelection(t *testing.T) {
-	obsRuntime, err := newStreamRuntime(api.LiveSettings{})
+	obsRuntime, err := newStreamRuntime(api.LiveSettings{OBSHost: "192.0.2.10", OBSPort: "4456"})
 	if err != nil {
 		t.Fatal(err)
 	}

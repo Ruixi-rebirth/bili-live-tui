@@ -1,13 +1,59 @@
 package obs
 
 import (
+	"net"
 	"strings"
 	"testing"
 	"time"
 )
 
+func TestOutputHasOBSProcess(t *testing.T) {
+	tests := []struct {
+		name   string
+		output string
+		want   bool
+	}{
+		{name: "Windows 64-bit", output: `"obs64.exe","1234","Console","1","100,000 K"`, want: true},
+		{name: "Windows 32-bit", output: `"obs32.exe","1234","Console","1","100,000 K"`, want: true},
+		{name: "Linux", output: "/usr/bin/obs\n", want: true},
+		{name: "unrelated", output: `"notepad.exe","1234","Console","1","1,000 K"`, want: false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := outputHasOBSProcess(test.output); got != test.want {
+				t.Fatalf("outputHasOBSProcess() = %v, want %v", got, test.want)
+			}
+		})
+	}
+}
+
+func TestRuntimeOBSWebSocketPort(t *testing.T) {
+	if runtime := NewRuntime("", "", "password"); runtime.host != DefaultHost || runtime.port != DefaultPort {
+		t.Fatalf("default endpoint = %s, want %s", net.JoinHostPort(runtime.host, runtime.port), net.JoinHostPort(DefaultHost, DefaultPort))
+	}
+	if got := NewRuntime("192.0.2.10", "4456", "password").port; got != "4456" {
+		t.Fatalf("custom port = %q, want 4456", got)
+	}
+	if got := NewRuntime("192.0.2.10", "4456", "password").host; got != "192.0.2.10" {
+		t.Fatalf("custom host = %q, want 192.0.2.10", got)
+	}
+}
+
+func TestOBSHostNormalizationAndLocalDetection(t *testing.T) {
+	for _, host := range []string{"", "localhost", "127.0.0.1", "::1", "[::1]"} {
+		if !isLocalOBSHost(host) {
+			t.Errorf("isLocalOBSHost(%q) = false, want true", host)
+		}
+	}
+	for _, host := range []string{"192.0.2.10", "obs.example.test"} {
+		if isLocalOBSHost(host) {
+			t.Errorf("isLocalOBSHost(%q) = true, want false", host)
+		}
+	}
+}
+
 func TestApplyHealthSampleTracksOutputAndUnexpectedStop(t *testing.T) {
-	runtime := NewRuntime("")
+	runtime := NewRuntime("", "", "")
 	now := time.Unix(100, 0)
 	runtime.lastBytes = 1000
 	runtime.lastSample = now.Add(-2 * time.Second)
@@ -56,7 +102,7 @@ func TestApplyHealthSampleTracksOutputAndUnexpectedStop(t *testing.T) {
 }
 
 func TestMarkControlConnectionErrorShowsReconnectState(t *testing.T) {
-	runtime := NewRuntime("")
+	runtime := NewRuntime("", "", "")
 	runtime.health.Active = true
 	if runtime.markControlConnectionErrorAt(assertError("socket closed"), time.Unix(100, 0)) {
 		t.Fatal("first control error exhausted reconnect window")
@@ -68,7 +114,7 @@ func TestMarkControlConnectionErrorShowsReconnectState(t *testing.T) {
 }
 
 func TestControlConnectionErrorStopsAfterReconnectWindow(t *testing.T) {
-	runtime := NewRuntime("")
+	runtime := NewRuntime("", "", "")
 	runtime.health.Active = true
 	started := time.Unix(100, 0)
 	if runtime.markControlConnectionErrorAt(assertError("socket closed"), started) {
@@ -92,7 +138,7 @@ func TestControlConnectionErrorStopsAfterReconnectWindow(t *testing.T) {
 }
 
 func TestSuccessfulHealthSampleResetsControlReconnectWindow(t *testing.T) {
-	runtime := NewRuntime("")
+	runtime := NewRuntime("", "", "")
 	started := time.Unix(100, 0)
 	runtime.health.Active = true
 	runtime.markControlConnectionErrorAt(assertError("socket closed"), started)

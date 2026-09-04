@@ -35,6 +35,16 @@ func TestResponsiveLiveFormDensity(t *testing.T) {
 	}
 }
 
+func TestPreferredLiveFormHeightCollapsesOBSGroup(t *testing.T) {
+	form, state := newLiveFormWithOptions(nil, nil, "开播信息", true)
+	withOBS := preferredLiveFormHeight(form, 1)
+	state.streamMode.SetCurrentOption(1)
+	withoutOBS := preferredLiveFormHeight(form, 1)
+	if got, want := withOBS-withoutOBS, state.obsGroup.GetFieldHeight()+1; got != want {
+		t.Fatalf("OBS group reserved %d rows after removal, want %d", got, want)
+	}
+}
+
 func TestFormClippedTextAreaDoesNotDrawPastInnerBorder(t *testing.T) {
 	screen := tcell.NewSimulationScreen("")
 	if err := screen.Init(); err != nil {
@@ -184,6 +194,9 @@ func TestLiveEditPageCancelCallback(t *testing.T) {
 
 func TestNewLiveFormDefaultsToOBSAndAllowsTestSource(t *testing.T) {
 	form, state := newLiveFormWithOptions([]api.LiveArea{{ID: "376", Name: "单机游戏"}}, nil, "开播信息", true)
+	if form.GetButtonCount() != 0 {
+		t.Fatal("live settings action buttons must be outside the form border")
+	}
 	settings := state.settings()
 	if settings.StreamMode != streamruntime.ModeOBS {
 		t.Fatalf("default stream mode = %q, want OBS", settings.StreamMode)
@@ -191,8 +204,19 @@ func TestNewLiveFormDefaultsToOBSAndAllowsTestSource(t *testing.T) {
 	if settings.Orientation != api.OrientationLandscape {
 		t.Fatalf("default orientation = %q, want landscape", settings.Orientation)
 	}
-	if form.GetFormItemByLabel("OBS WebSocket 密码") == nil {
-		t.Fatal("OBS password field is missing in OBS mode")
+	if formItemIndex(form, state.obsGroup) < 0 {
+		t.Fatal("OBS WebSocket group is missing in OBS mode")
+	}
+	for _, label := range []string{"地址", "端口", "密码"} {
+		if state.obsGroup.GetFormItemByLabel(label) == nil {
+			t.Fatalf("OBS WebSocket field %q is missing", label)
+		}
+	}
+	if settings.OBSHost != "" {
+		t.Fatalf("default OBS host setting = %q, want blank for runtime default", settings.OBSHost)
+	}
+	if settings.OBSPort != "" {
+		t.Fatalf("default OBS port setting = %q, want blank for runtime default", settings.OBSPort)
 	}
 	state.streamMode.SetCurrentOption(1)
 	selected := state.settings()
@@ -202,12 +226,147 @@ func TestNewLiveFormDefaultsToOBSAndAllowsTestSource(t *testing.T) {
 	if selected.OBSPassword != "" {
 		t.Fatalf("FFmpeg settings retained OBS password %q", selected.OBSPassword)
 	}
-	if form.GetFormItemByLabel("OBS WebSocket 密码") != nil {
-		t.Fatal("OBS password field is visible in FFmpeg mode")
+	if selected.OBSPort != "" {
+		t.Fatalf("FFmpeg settings retained OBS port %q", selected.OBSPort)
+	}
+	if selected.OBSHost != "" {
+		t.Fatalf("FFmpeg settings retained OBS host %q", selected.OBSHost)
+	}
+	if formItemIndex(form, state.obsGroup) >= 0 {
+		t.Fatal("OBS WebSocket group is visible in FFmpeg mode")
 	}
 	state.streamMode.SetCurrentOption(0)
-	if form.GetFormItemByLabel("OBS WebSocket 密码") == nil {
-		t.Fatal("OBS password field was not restored after switching back to OBS")
+	if formItemIndex(form, state.obsGroup) < 0 {
+		t.Fatal("OBS WebSocket group was not restored after switching back to OBS")
+	}
+}
+
+func TestFocusLastLiveFormItem(t *testing.T) {
+	app := tview.NewApplication()
+	form, state := newLiveFormWithOptions(nil, nil, "开播信息", true)
+	focusLastLiveFormItem(app, form, state)
+	if app.GetFocus() != state.obsPassword {
+		t.Fatal("last OBS form item is not the password field")
+	}
+
+	state.streamMode.SetCurrentOption(1)
+	focusLastLiveFormItem(app, form, state)
+	if !state.streamMode.HasFocus() {
+		t.Fatal("last FFmpeg form item is not the stream mode selector")
+	}
+}
+
+func TestLiveFormRestoresCustomOBSEndpointAndCollapsesSavedDefaults(t *testing.T) {
+	_, custom := newLiveFormWithOptions(nil, &api.LiveSettings{
+		OBSHost: "192.0.2.10",
+		OBSPort: "4456",
+	}, "开播信息", true)
+	if custom.obsHost.GetText() != "192.0.2.10" || custom.obsPort.GetText() != "4456" {
+		t.Fatalf("custom OBS endpoint was not restored: %q:%q", custom.obsHost.GetText(), custom.obsPort.GetText())
+	}
+
+	_, defaults := newLiveFormWithOptions(nil, &api.LiveSettings{
+		OBSHost: "127.0.0.1",
+		OBSPort: "4455",
+	}, "开播信息", true)
+	if defaults.obsHost.GetText() != "" || defaults.obsPort.GetText() != "" {
+		t.Fatalf("saved OBS defaults were not collapsed to blanks: %q:%q", defaults.obsHost.GetText(), defaults.obsPort.GetText())
+	}
+}
+
+func TestOBSWebSocketGroupKeyboardNavigation(t *testing.T) {
+	host := tview.NewInputField().SetLabel("地址")
+	port := tview.NewInputField().SetLabel("端口")
+	password := tview.NewInputField().SetLabel("密码").SetMaskCharacter('*')
+	group := newOBSWebSocketGroup(host, port, password)
+	var focused tview.Primitive
+	group.Focus(func(primitive tview.Primitive) { focused = primitive })
+	if focused != group.items[0] {
+		t.Fatal("OBS group did not initially focus the host field")
+	}
+	group.finishItem(0, tcell.KeyTab)
+	if focused != group.items[1] {
+		t.Fatal("Tab did not move from host to port")
+	}
+	group.finishItem(1, tcell.KeyTab)
+	if focused != group.items[2] {
+		t.Fatal("Tab did not move from port to password")
+	}
+	exited := false
+	group.SetFinishedFunc(func(key tcell.Key) { exited = key == tcell.KeyTab })
+	group.finishItem(2, tcell.KeyTab)
+	if !exited {
+		t.Fatal("Tab on password did not leave the OBS group")
+	}
+}
+
+func TestOBSWebSocketGroupDrawsBorderAndMasksPassword(t *testing.T) {
+	screen := tcell.NewSimulationScreen("")
+	if err := screen.Init(); err != nil {
+		t.Fatal(err)
+	}
+	defer screen.Fini()
+	screen.SetSize(60, 7)
+
+	group := newOBSWebSocketGroup(
+		tview.NewInputField().SetLabel("地址").SetText("127.0.0.1"),
+		tview.NewInputField().SetLabel("端口").SetText("4455"),
+		tview.NewInputField().SetLabel("密码").SetText("secret").SetMaskCharacter('*'),
+	)
+	group.SetRect(0, 0, 60, group.GetFieldHeight())
+	group.Draw(screen)
+
+	var rendered strings.Builder
+	for y := 0; y < 7; y++ {
+		for x := 0; x < 60; x++ {
+			mainc, _, _, _ := screen.GetContent(x, y)
+			rendered.WriteRune(mainc)
+		}
+		rendered.WriteByte('\n')
+	}
+	text := rendered.String()
+	if !strings.Contains(text, "OBS WebSocket") {
+		t.Fatalf("group title was not drawn:\n%s", text)
+	}
+	for _, plaintext := range []string{"127.0.0.1", "4455", "secret"} {
+		if strings.Contains(text, plaintext) {
+			t.Fatalf("OBS connection value %q was drawn in plaintext:\n%s", plaintext, text)
+		}
+	}
+	if !strings.Contains(text, "******") {
+		t.Fatalf("OBS connection values were not masked:\n%s", text)
+	}
+}
+
+func TestOBSWebSocketGroupShowsDefaultPlaceholders(t *testing.T) {
+	screen := tcell.NewSimulationScreen("")
+	if err := screen.Init(); err != nil {
+		t.Fatal(err)
+	}
+	defer screen.Fini()
+	screen.SetSize(60, 7)
+
+	group := newOBSWebSocketGroup(
+		tview.NewInputField().SetLabel("地址").SetPlaceholder("留空默认 127.0.0.1"),
+		tview.NewInputField().SetLabel("端口").SetPlaceholder("留空默认 4455"),
+		tview.NewInputField().SetLabel("密码"),
+	)
+	group.SetRect(0, 0, 60, group.GetFieldHeight())
+	group.Draw(screen)
+
+	var rendered strings.Builder
+	for y := 0; y < 7; y++ {
+		for x := 0; x < 60; x++ {
+			mainc, _, _, _ := screen.GetContent(x, y)
+			rendered.WriteRune(mainc)
+		}
+		rendered.WriteByte('\n')
+	}
+	text := rendered.String()
+	for _, placeholder := range []string{"127.0.0.1", "4455"} {
+		if !strings.Contains(text, placeholder) {
+			t.Fatalf("placeholder %q was not drawn:\n%s", placeholder, text)
+		}
 	}
 }
 
