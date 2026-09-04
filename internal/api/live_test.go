@@ -55,6 +55,17 @@ func TestEndpointCatalog(t *testing.T) {
 	}
 }
 
+func TestNewClientUsesSystemProxyTransportByDefault(t *testing.T) {
+	client := NewClient(nil)
+	transport, ok := client.HTTPClient.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("default transport = %T, want *http.Transport", client.HTTPClient.Transport)
+	}
+	if transport.Proxy == nil {
+		t.Fatal("default transport does not have a proxy resolver")
+	}
+}
+
 func TestGetOnlineGoldRank(t *testing.T) {
 	transport := roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		query := r.URL.Query()

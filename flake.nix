@@ -23,7 +23,7 @@
             src = ./.;
             subPackages = [ "cmd/bili-live-tui" ];
             go = pkgs.go_1_26;
-            vendorHash = "sha256-p+cSwHPMCrIFV75+imbh2LBEwXzUnNPfkEDVkd9jngE=";
+            vendorHash = "sha256-vZrR+Ao9BvzIer8ZiQjBvVSNFkN+wu8nX8fiAsVwDGc=";
             overrideModAttrs = _final: _previous: {
               preBuild = ''
                 export GOPROXY=https://goproxy.cn,direct

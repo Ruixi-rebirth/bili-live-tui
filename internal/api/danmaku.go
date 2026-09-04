@@ -322,7 +322,7 @@ func (c *Client) connectDanmaku(ctx context.Context, roomID, sessdata, biliJCT s
 		return nil, fmt.Errorf("弹幕连接信息没有可用的 websocket 地址")
 	}
 	endpoints = c.rotateDanmakuEndpoints(endpoints)
-	dialer := websocket.Dialer{HandshakeTimeout: 10 * time.Second, Proxy: http.ProxyFromEnvironment}
+	dialer := websocket.Dialer{HandshakeTimeout: 10 * time.Second, Proxy: systemProxyFunc()}
 	headers := danmakuWebSocketHeaders(roomID, sessdata, biliJCT, identity)
 	var lastErr error
 	for _, endpoint := range endpoints {

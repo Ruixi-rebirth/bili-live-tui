@@ -23,12 +23,26 @@ import (
 
 	"github.com/gabriel-vasile/mimetype"
 	"github.com/go-resty/resty/v2"
+	"github.com/mattn/go-ieproxy"
 	"github.com/shamspias/fennec"
 	xdraw "golang.org/x/image/draw"
 	_ "golang.org/x/image/webp"
 )
 
 const DefaultBaseURL = "https://api.live.bilibili.com"
+
+var defaultAPITransport = func() *http.Transport {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.Proxy = systemProxyFunc()
+	return transport
+}()
+
+// systemProxyFunc keeps Go's environment-variable behavior and additionally
+// reads the current user's WinINET proxy settings on Windows. This includes
+// static proxies, PAC scripts, and automatic discovery.
+func systemProxyFunc() func(*http.Request) (*url.URL, error) {
+	return ieproxy.GetProxyFunc()
+}
 
 const biliBrowserUserAgent = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0 Safari/537.36"
 
@@ -890,7 +904,7 @@ type Client struct {
 
 func NewClient(httpClient *http.Client) *Client {
 	if httpClient == nil {
-		httpClient = &http.Client{Timeout: 10 * time.Second}
+		httpClient = &http.Client{Transport: defaultAPITransport, Timeout: 10 * time.Second}
 	}
 	return &Client{BaseURL: DefaultBaseURL, HTTPClient: httpClient}
 }

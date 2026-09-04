@@ -9,6 +9,7 @@ require (
 	github.com/gdamore/tcell/v2 v2.8.1
 	github.com/go-resty/resty/v2 v2.17.2
 	github.com/gorilla/websocket v1.5.3
+	github.com/mattn/go-ieproxy v0.0.12
 	github.com/mdp/qrterminal/v3 v3.2.1
 	github.com/rivo/tview v0.42.0
 	github.com/shamspias/fennec v1.0.3
