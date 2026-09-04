@@ -112,6 +112,7 @@ func RunHome(ctx context.Context, startedAt time.Time, roomID string, settings *
 	editing := false
 	var cancelEdit func()
 	var previewBusy atomic.Bool
+	var startPreview func()
 
 	confirm := styleModal(tview.NewModal()).
 		SetText("确定下播并退出吗？").
@@ -129,7 +130,7 @@ func RunHome(ctx context.Context, startedAt time.Time, roomID string, settings *
 	buttons := make([]*tview.Button, 0, 4)
 	buttons = append(buttons, newHomeActionButton("返回弹幕", stopApplication))
 	if preview != nil {
-		buttons = append(buttons, newHomeActionButton("预览直播", func() {
+		startPreview = func() {
 			if !previewBusy.CompareAndSwap(false, true) {
 				return
 			}
@@ -143,6 +144,17 @@ func RunHome(ctx context.Context, startedAt time.Time, roomID string, settings *
 				app.QueueUpdateDraw(func() {
 					previewBusy.Store(false)
 					if err != nil {
+						if missing := executableNotFound(err); missing != nil {
+							showExecutablePathPage(app, pages, missing, func() {
+								app.SetFocus(actionBar)
+								startPreview()
+							}, func() {
+								app.SetFocus(actionBar)
+								notice = "尚未设置 " + missing.DisplayName + " 可执行文件路径"
+								setStatusText()
+							})
+							return
+						}
 						notice = err.Error()
 					} else {
 						notice = ""
@@ -150,7 +162,8 @@ func RunHome(ctx context.Context, startedAt time.Time, roomID string, settings *
 					setStatusText()
 				})
 			}()
-		}))
+		}
+		buttons = append(buttons, newHomeActionButton("预览直播", startPreview))
 	}
 	buttons = append(buttons, newHomeActionButton("修改资料", func() {
 		var saving atomic.Bool
@@ -313,6 +326,9 @@ func RunHome(ctx context.Context, startedAt time.Time, roomID string, settings *
 	}()
 
 	app.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		if pages.HasPage(executablePathPageName) && event.Key() != tcell.KeyCtrlC {
+			return event
+		}
 		switch event.Key() {
 		case tcell.KeyTab, tcell.KeyBacktab:
 			if editing || confirm.HasFocus() {

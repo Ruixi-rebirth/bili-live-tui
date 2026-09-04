@@ -58,6 +58,14 @@ const (
 	ffmpegStableRunDuration    = 10 * time.Second
 )
 
+// ExecutablePath 使用所有外部程序共用的解析和用户配置机制查找 FFmpeg。
+func ExecutablePath() (string, error) {
+	return utils.ResolveExecutableWithProbe("ffmpeg", "FFmpeg", utils.ExecutableProbe{
+		Args:           []string{"-version"},
+		OutputContains: "ffmpeg version",
+	}, "ffmpeg.exe", "ffmpeg")
+}
+
 var ffmpegReconnectDelays = []time.Duration{
 	2 * time.Second,
 	5 * time.Second,
@@ -107,7 +115,7 @@ func (r *TestRuntime) Start(rtmpAddr, streamKey string) error {
 }
 
 func newFFmpegProcess(rtmpAddr, streamKey, orientation string) (*exec.Cmd, io.ReadCloser, error) {
-	ffmpegPath, err := utils.GetExecutablePath("ffmpeg")
+	ffmpegPath, err := ExecutablePath()
 	if err != nil {
 		return nil, nil, err
 	}

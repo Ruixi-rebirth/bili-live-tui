@@ -99,6 +99,9 @@ func main() {
 		return rollbackErr
 	}
 	settings, err := tui.RunLiveSettings(ctx, areas, savedSettings, func(liveSettings *api.LiveSettings) error {
+		if err := preflightStreamExecutable(*liveSettings); err != nil {
+			return err
+		}
 		existingCover := ""
 		if savedSettings != nil {
 			existingCover = strings.TrimSpace(savedSettings.CoverPath)
@@ -327,6 +330,18 @@ func newStreamRuntime(settings api.LiveSettings) (streamruntime.Runtime, error) 
 		return ffmpeg.NewTestRuntime(settings.Orientation), nil
 	default:
 		return nil, fmt.Errorf("不支持的推流方式: %s", settings.StreamMode)
+	}
+}
+
+func preflightStreamExecutable(settings api.LiveSettings) error {
+	switch strings.TrimSpace(settings.StreamMode) {
+	case "", streamruntime.ModeOBS:
+		return obs.Preflight()
+	case streamruntime.ModeFFmpegTest:
+		_, err := ffmpeg.ExecutablePath()
+		return err
+	default:
+		return fmt.Errorf("不支持的推流方式: %s", settings.StreamMode)
 	}
 }
 

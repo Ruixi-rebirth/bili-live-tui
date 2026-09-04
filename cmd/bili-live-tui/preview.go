@@ -42,7 +42,10 @@ func (previewer *livePreviewer) Start(ctx context.Context, client *api.Client, r
 		previewer.setRunning(false)
 	}()
 
-	player, err := utils.GetExecutablePath("mpv.exe", "mpv")
+	player, err := utils.ResolveExecutableWithProbe("mpv", "mpv", utils.ExecutableProbe{
+		Args:           []string{"--version"},
+		OutputContains: "mpv",
+	}, "mpv.exe", "mpv")
 	if err != nil {
 		return err
 	}
