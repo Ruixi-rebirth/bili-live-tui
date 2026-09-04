@@ -7,6 +7,50 @@ import (
 	"github.com/rivo/tview"
 )
 
+// floatingOverlay keeps the current page visible and only draws its content in
+// a centered rectangle. Pages still gives the overlay the full terminal rect so
+// it is automatically re-centered after a terminal resize.
+type floatingOverlay struct {
+	tview.Primitive
+	x, y, width, height int
+	preferredWidth      int
+	preferredHeight     int
+}
+
+func newFloatingOverlay(content tview.Primitive, width, height int) *floatingOverlay {
+	return &floatingOverlay{
+		Primitive:       content,
+		preferredWidth:  width,
+		preferredHeight: height,
+	}
+}
+
+func (overlay *floatingOverlay) SetRect(x, y, width, height int) {
+	overlay.x = x
+	overlay.y = y
+	overlay.width = width
+	overlay.height = height
+}
+
+func (overlay *floatingOverlay) GetRect() (int, int, int, int) {
+	return overlay.x, overlay.y, overlay.width, overlay.height
+}
+
+func (overlay *floatingOverlay) Draw(screen tcell.Screen) {
+	width := min(overlay.preferredWidth, overlay.width)
+	height := min(overlay.preferredHeight, overlay.height)
+	if overlay.width > 4 {
+		width = min(width, overlay.width-4)
+	}
+	if overlay.height > 2 {
+		height = min(height, overlay.height-2)
+	}
+	x := overlay.x + (overlay.width-width)/2
+	y := overlay.y + (overlay.height-height)/2
+	overlay.Primitive.SetRect(x, y, max(width, 1), max(height, 1))
+	overlay.Primitive.Draw(screen)
+}
+
 func applyTheme() {
 	tview.Styles = tview.Theme{
 		PrimitiveBackgroundColor:    tcell.NewHexColor(0xfff1f5),

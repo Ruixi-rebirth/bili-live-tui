@@ -7,6 +7,7 @@ import (
 	"sync/atomic"
 
 	"bili-live-tui/internal/api"
+	"bili-live-tui/internal/utils"
 	"github.com/gdamore/tcell/v2"
 	"github.com/rivo/tview"
 )
@@ -18,6 +19,71 @@ var (
 
 // ErrLiveSettingsCancelled 用于区分用户主动放弃开播和设置/网络错误。
 var ErrLiveSettingsCancelled = errors.New("已取消设置开播信息")
+
+const executablePathPageName = "executable-path"
+
+func executableNotFound(err error) *utils.ExecutableNotFoundError {
+	var missing *utils.ExecutableNotFoundError
+	if errors.As(err, &missing) {
+		return missing
+	}
+	return nil
+}
+
+// showExecutablePathPage 是 OBS、FFmpeg 和 MPV 共用的浮动路径输入框。
+func showExecutablePathPage(app *tview.Application, pages *tview.Pages, missing *utils.ExecutableNotFoundError, onConfigured, onCancel func()) {
+	field := tview.NewInputField().
+		SetLabel("路径").
+		SetText(missing.Suggested).
+		SetPlaceholder("请输入可执行文件完整路径").
+		SetAcceptanceFunc(tview.InputFieldMaxLength(1000))
+	message := tview.NewTextView()
+	message.SetDynamicColors(true)
+	message.SetTextAlign(tview.AlignCenter)
+	message.SetWrap(true)
+	message.SetBackgroundColor(panelColor)
+	message.SetText("[" + mutedColor.String() + "]自动探测失败，请选择可执行文件，保存后下次将自动使用[-]")
+	status := tview.NewTextView()
+	status.SetDynamicColors(true)
+	status.SetTextAlign(tview.AlignCenter)
+	status.SetTextColor(mutedColor)
+	status.SetBackgroundColor(panelColor)
+	form := styleForm(tview.NewForm(), "")
+	form.SetBorder(false)
+	form.SetItemPadding(0)
+	form.AddFormItem(focusedLabelInput(field))
+	panel := tview.NewFlex().SetDirection(tview.FlexRow)
+	panel.SetBackgroundColor(panelColor)
+	panel.SetBorder(true)
+	panel.SetBorderColor(tview.Styles.BorderColor)
+	panel.SetTitle(" 设置 " + missing.DisplayName + " 路径 ")
+	panel.SetTitleColor(tview.Styles.TitleColor)
+	panel.AddItem(message, 2, 0, false)
+	panel.AddItem(form, 0, 1, true)
+	panel.AddItem(status, 0, 0, false)
+	overlay := newFloatingOverlay(panel, 88, 7)
+	closePage := func(callback func()) {
+		pages.RemovePage(executablePathPageName)
+		if callback != nil {
+			callback()
+		}
+	}
+	form.AddButton("保存并重试", func() {
+		if _, err := missing.Configure(field.GetText()); err != nil {
+			panel.ResizeItem(status, 2, 0)
+			overlay.preferredHeight = 9
+			status.SetText("[" + errorColor.String() + "]" + tview.Escape(err.Error()) + "[-]")
+			return
+		}
+		closePage(onConfigured)
+	})
+	form.AddButton("取消", func() { closePage(onCancel) })
+	form.SetCancelFunc(func() { closePage(onCancel) })
+	equalizeButtonWidths(form)
+	pages.AddPage(executablePathPageName, overlay, true, true)
+	form.SetFocus(0)
+	app.SetFocus(form)
+}
 
 // RunLiveSettings 在调用方执行真实开播流程时保持设置页面可见。
 // 回调可以规范化设置（例如把本地封面路径替换为上传后的地址），成功后返回更新值。
@@ -70,25 +136,16 @@ func RunLiveSettings(ctx context.Context, areas []api.LiveArea, initial *api.Liv
 		cancelled = true
 		app.Stop()
 	}
-	form.AddButton("开始直播", func() {
-		if busy.Load() {
-			return
-		}
-		settings := state.settings()
-		if err := settings.Validate(); err != nil {
-			setStatus(err.Error(), true)
-			return
-		}
-		if err := validateCoverInput(settings.CoverPath, state.hasExistingCover); err != nil {
-			setStatus(err.Error(), true)
-			return
-		}
+	var startSubmit func(api.LiveSettings)
+	startSubmit = func(settings api.LiveSettings) {
 		if submit == nil {
 			result = settings
 			app.Stop()
 			return
 		}
-		busy.Store(true)
+		if !busy.CompareAndSwap(false, true) {
+			return
+		}
 		setStatus("正在准备直播，请稍候……", false)
 		go func() {
 			err := submit(&settings)
@@ -99,6 +156,16 @@ func RunLiveSettings(ctx context.Context, areas []api.LiveArea, initial *api.Liv
 					return
 				}
 				if err != nil {
+					if missing := executableNotFound(err); missing != nil {
+						showExecutablePathPage(app, pages, missing, func() {
+							app.SetFocus(form)
+							startSubmit(settings)
+						}, func() {
+							app.SetFocus(form)
+							setStatus("尚未设置 "+missing.DisplayName+" 可执行文件路径", true)
+						})
+						return
+					}
 					setStatus("启动直播失败："+err.Error(), true)
 					return
 				}
@@ -106,6 +173,18 @@ func RunLiveSettings(ctx context.Context, areas []api.LiveArea, initial *api.Liv
 				app.Stop()
 			})
 		}()
+	}
+	form.AddButton("开始直播", func() {
+		settings := state.settings()
+		if err := settings.Validate(); err != nil {
+			setStatus(err.Error(), true)
+			return
+		}
+		if err := validateCoverInput(settings.CoverPath, state.hasExistingCover); err != nil {
+			setStatus(err.Error(), true)
+			return
+		}
+		startSubmit(settings)
 	})
 	form.GetButton(form.GetButtonCount() - 1).SetLabel("  ▶ 开始直播  ").
 		SetStyle(tcell.StyleDefault.Background(accentColor).Foreground(buttonTextColor).Bold(true)).

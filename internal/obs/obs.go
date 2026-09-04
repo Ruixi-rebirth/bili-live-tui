@@ -5,7 +5,10 @@ import (
 	"io"
 	"log"
 	"net"
+	"os"
 	"os/exec"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -27,6 +30,33 @@ const (
 	obsStartupReadyRetryDelay = 500 * time.Millisecond
 )
 
+// ExecutablePath 使用所有外部程序共用的解析和用户配置机制查找 OBS。
+func ExecutablePath() (string, error) {
+	candidates := []string{"obs", "obs-studio"}
+	if runtime.GOOS == "windows" {
+		candidates = []string{"obs64.exe", "obs32.exe"}
+		for _, environmentName := range []string{"ProgramW6432", "ProgramFiles", "ProgramFiles(x86)"} {
+			if root := strings.TrimSpace(os.Getenv(environmentName)); root != "" {
+				candidates = append(candidates, filepath.Join(root, "obs-studio", "bin", "64bit", "obs64.exe"))
+			}
+		}
+	}
+	return utils.ResolveExecutableWithProbe("obs", "OBS Studio", utils.ExecutableProbe{
+		Args:                   []string{"--version"},
+		OutputContains:         "obs",
+		UseExecutableDirectory: true,
+	}, candidates...)
+}
+
+// Preflight 仅在 OBS WebSocket 尚未运行时要求本地存在 OBS 可执行文件。
+func Preflight() error {
+	if isObsRunning(OBSPort) {
+		return nil
+	}
+	_, err := ExecutablePath()
+	return err
+}
+
 // 检查端口是否被占用
 func isObsRunning(port string) bool {
 	timeout := time.Second
@@ -47,11 +77,14 @@ func ensureObsAlive() error {
 		return nil // 已经运行中
 	}
 
-	command, err := utils.GetExecutablePath("obs", "obs-studio")
+	command, err := ExecutablePath()
 	if err != nil {
 		return err
 	}
 	cmd := exec.Command(command)
+	if runtime.GOOS == "windows" {
+		cmd.Dir = filepath.Dir(command)
+	}
 
 	// 异步启动，不阻塞主程序
 	if err := cmd.Start(); err != nil {
