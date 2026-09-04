@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"image"
 	"image/color"
+	"image/jpeg"
 	_ "image/png"
 	"io"
 	"mime/multipart"
@@ -31,12 +32,15 @@ const DefaultBaseURL = "https://api.live.bilibili.com"
 
 const biliBrowserUserAgent = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0 Safari/537.36"
 
-const maxRoomCoverBytes int64 = 5 * 1024 * 1024
+const maxRoomCoverBytes int64 = 2 * 1024 * 1024
+
+const (
+	webRoomCoverWidth   = 720
+	webRoomCoverHeight  = 540
+	webRoomCoverQuality = 95
+)
 
 const maxRoomCoverSourceBytes int64 = 64 * 1024 * 1024
-
-// 上传前会把图片等比调整到 B 站图片服务接受的像素范围。
-const maxRoomCoverDimension = 4096
 
 // 先检查图片配置，避免恶意图片头部诱使解码器分配过大的像素缓冲区。
 const maxRoomCoverSourceDimension = 16384
@@ -44,11 +48,16 @@ const maxRoomCoverSourceDimension = 16384
 // 限制解码前的像素总数，避免恶意压缩图片占用过多内存。
 const maxRoomCoverSourcePixels int64 = 64 * 1024 * 1024
 
-const minRoomCoverWidth = 640
-
-const minRoomCoverProcessingWidth = 656
-
 const maxAPIResponseBytes int64 = 4 * 1024 * 1024
+
+// silentRestyLogger prevents retry diagnostics from being written directly to
+// stderr while the terminal UI owns the screen. The final request error is
+// still returned to the caller and shown in the UI.
+type silentRestyLogger struct{}
+
+func (silentRestyLogger) Errorf(string, ...interface{}) {}
+func (silentRestyLogger) Warnf(string, ...interface{})  {}
+func (silentRestyLogger) Debugf(string, ...interface{}) {}
 
 const (
 	OrientationLandscape = "landscape"
@@ -619,6 +628,9 @@ func (c *Client) UploadRoomCover(ctx context.Context, roomID, sessdata, biliJCT,
 }
 
 func normalizeCoverForUpload(ctx context.Context, file *os.File) ([]byte, string, int, int, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, "", 0, 0, err
+	}
 	if _, err := file.Seek(0, io.SeekStart); err != nil {
 		return nil, "", 0, 0, err
 	}
@@ -644,53 +656,81 @@ func normalizeCoverForUpload(ctx context.Context, file *os.File) ([]byte, string
 	if width <= 0 || height <= 0 {
 		return nil, "", 0, 0, fmt.Errorf("图片尺寸无效")
 	}
-	maxSide := width
-	if height > maxSide {
-		maxSide = height
-	}
-	scale := 1.0
-	if width < minRoomCoverProcessingWidth {
-		scale = float64(minRoomCoverProcessingWidth) / float64(width)
-	}
-	if float64(maxSide)*scale > maxRoomCoverDimension {
-		scale = float64(maxRoomCoverDimension) / float64(maxSide)
-		if float64(width)*scale < minRoomCoverWidth {
-			return nil, "", 0, 0, fmt.Errorf("图片尺寸过于狭长，无法满足封面宽度要求")
-		}
-	}
-	dw, dh := int(float64(width)*scale), int(float64(height)*scale)
-	if dw < 1 {
-		dw = 1
-	}
-	if dh < 1 {
-		dh = 1
-	}
-	dst := image.NewRGBA(image.Rect(0, 0, dw, dh))
-	xdraw.Draw(dst, dst.Bounds(), image.NewUniform(color.White), image.Point{}, xdraw.Src)
-	xdraw.CatmullRom.Scale(dst, dst.Bounds(), src, src.Bounds(), xdraw.Over, nil)
-	return compressCoverWithinLimit(ctx, dst, maxRoomCoverBytes)
-}
 
-func compressCoverWithinLimit(ctx context.Context, src image.Image, limit int64) ([]byte, string, int, int, error) {
-	opts := fennec.DefaultOptions()
-	opts.Format = fennec.JPEG
-	opts.TargetSize = int(limit)
-	opts.MaxWidth = maxRoomCoverDimension
-	opts.MaxHeight = maxRoomCoverDimension
-	opts.AutoOrient = false
-	result, err := fennec.CompressImage(ctx, src, opts)
+	// B 站当前 Web 封面编辑器以画面中心裁出 4:3，再导出为
+	// 720×540、质量 95 的 JPEG。APP 使用完整 4:3 封面，Web 展示时
+	// 再从中间取 16:9；这里复现同一份上传素材。
+	crop := centeredCropRect(src.Bounds(), webRoomCoverWidth, webRoomCoverHeight)
+	dst := image.NewRGBA(image.Rect(0, 0, webRoomCoverWidth, webRoomCoverHeight))
+	xdraw.Draw(dst, dst.Bounds(), image.NewUniform(color.White), image.Point{}, xdraw.Src)
+	xdraw.CatmullRom.Scale(dst, dst.Bounds(), src, crop, xdraw.Over, nil)
+	if err := ctx.Err(); err != nil {
+		return nil, "", 0, 0, err
+	}
+
+	encoded, _, err := encodeJPEGWithinLimit(ctx, dst, maxRoomCoverBytes)
 	if err != nil {
 		return nil, "", 0, 0, err
 	}
-	data := result.Bytes()
-	if int64(len(data)) > limit {
-		return nil, "", 0, 0, fmt.Errorf("图片处理结果仍超过 %d MB", limit/(1024*1024))
+	return encoded, "image/jpeg", webRoomCoverWidth, webRoomCoverHeight, nil
+}
+
+// encodeJPEGWithinLimit first uses the same quality as Bilibili's Web editor.
+// Only when that output is too large does it search for the highest lower
+// quality that fits, instead of failing an otherwise usable cover.
+func encodeJPEGWithinLimit(ctx context.Context, src image.Image, limit int64) ([]byte, int, error) {
+	encode := func(quality int) ([]byte, error) {
+		var encoded bytes.Buffer
+		if err := jpeg.Encode(&encoded, src, &jpeg.Options{Quality: quality}); err != nil {
+			return nil, err
+		}
+		return encoded.Bytes(), nil
 	}
-	width, height := result.FinalDimensions.X, result.FinalDimensions.Y
-	if width < minRoomCoverWidth || height < 1 {
-		return nil, "", 0, 0, fmt.Errorf("图片压缩后的尺寸无效（当前 %d×%d）", width, height)
+
+	data, err := encode(webRoomCoverQuality)
+	if err != nil {
+		return nil, 0, err
 	}
-	return data, "image/jpeg", width, height, nil
+	if int64(len(data)) <= limit {
+		return data, webRoomCoverQuality, nil
+	}
+
+	var best []byte
+	bestQuality := 0
+	low, high := 1, webRoomCoverQuality-1
+	for low <= high {
+		if err := ctx.Err(); err != nil {
+			return nil, 0, err
+		}
+		quality := low + (high-low)/2
+		candidate, err := encode(quality)
+		if err != nil {
+			return nil, 0, err
+		}
+		if int64(len(candidate)) <= limit {
+			best, bestQuality = candidate, quality
+			low = quality + 1
+		} else {
+			high = quality - 1
+		}
+	}
+	if best == nil {
+		return nil, 0, fmt.Errorf("图片即使降低 JPEG 质量后仍超过 %d MB", limit/(1024*1024))
+	}
+	return best, bestQuality, nil
+}
+
+func centeredCropRect(bounds image.Rectangle, targetWidth, targetHeight int) image.Rectangle {
+	width, height := bounds.Dx(), bounds.Dy()
+	cropWidth, cropHeight := width, height
+	if width*targetHeight > height*targetWidth {
+		cropWidth = height * targetWidth / targetHeight
+	} else if width*targetHeight < height*targetWidth {
+		cropHeight = width * targetHeight / targetWidth
+	}
+	left := bounds.Min.X + (width-cropWidth)/2
+	top := bounds.Min.Y + (height-cropHeight)/2
+	return image.Rect(left, top, left+cropWidth, top+cropHeight)
 }
 
 // UploadRoomCoverURL 下载远程图片，再通过与本地文件相同的 B 站接口上传。
@@ -707,6 +747,7 @@ func (c *Client) UploadRoomCoverURL(ctx context.Context, roomID, sessdata, biliJ
 		Timeout:       30 * time.Second,
 	}
 	downloadClient := resty.NewWithClient(downloadHTTPClient).
+		SetLogger(silentRestyLogger{}).
 		SetRetryCount(2).
 		SetRetryWaitTime(200 * time.Millisecond).
 		SetRetryMaxWaitTime(time.Second).

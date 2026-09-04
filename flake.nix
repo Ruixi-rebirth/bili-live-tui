@@ -24,6 +24,11 @@
             subPackages = [ "cmd/bili-live-tui" ];
             go = pkgs.go_1_26;
             vendorHash = "sha256-p+cSwHPMCrIFV75+imbh2LBEwXzUnNPfkEDVkd9jngE=";
+            overrideModAttrs = _final: _previous: {
+              preBuild = ''
+                export GOPROXY=https://goproxy.cn,direct
+              '';
+            };
             ldflags = [
               "-s"
               "-w"

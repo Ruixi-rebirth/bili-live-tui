@@ -270,6 +270,38 @@ func TestUploadRoomCoverURLRejectsHTMLBehindImageURL(t *testing.T) {
 	}
 }
 
+func TestUploadRoomCoverURLDoesNotWriteRetryLogsToTerminal(t *testing.T) {
+	originalStderr := os.Stderr
+	readStderr, writeStderr, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stderr = writeStderr
+	t.Cleanup(func() {
+		os.Stderr = originalStderr
+		_ = readStderr.Close()
+		_ = writeStderr.Close()
+	})
+
+	client := NewClient(&http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return nil, fmt.Errorf("download unavailable")
+	})})
+	_, downloadErr := client.UploadRoomCoverURL(context.Background(), "1", "sess", "jct", "https://apis.example/cover.jpg")
+	if downloadErr == nil {
+		t.Fatal("UploadRoomCoverURL() unexpectedly succeeded")
+	}
+	if err := writeStderr.Close(); err != nil {
+		t.Fatal(err)
+	}
+	written, err := io.ReadAll(readStderr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(written) != 0 {
+		t.Fatalf("cover download wrote outside the TUI: %q", written)
+	}
+}
+
 func TestRemoteCoverExtensionRejectsTruncatedJPEG(t *testing.T) {
 	_, err := remoteCoverExtension([]byte{0xff, 0xd8, 0xff, 0xe0}, "image/jpeg")
 	if err == nil || !strings.Contains(err.Error(), "数据不完整或已损坏") {
@@ -277,7 +309,7 @@ func TestRemoteCoverExtensionRejectsTruncatedJPEG(t *testing.T) {
 	}
 }
 
-func TestNormalizeCoverForUploadUpscalesAndEncodesJPEG(t *testing.T) {
+func TestNormalizeCoverForUploadMatchesWebCoverOutput(t *testing.T) {
 	temp, err := os.CreateTemp(t.TempDir(), "small-cover-*.png")
 	if err != nil {
 		t.Fatal(err)
@@ -292,7 +324,7 @@ func TestNormalizeCoverForUploadUpscalesAndEncodesJPEG(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if contentType != "image/jpeg" || width != 656 || height != 561 {
+	if contentType != "image/jpeg" || width != webRoomCoverWidth || height != webRoomCoverHeight {
 		t.Fatalf("normalized cover = %s %dx%d", contentType, width, height)
 	}
 	config, format, err := image.DecodeConfig(bytes.NewReader(data))
@@ -301,31 +333,54 @@ func TestNormalizeCoverForUploadUpscalesAndEncodesJPEG(t *testing.T) {
 	}
 }
 
-func TestCompressCoverWithinLimitFitsTarget(t *testing.T) {
-	src := image.NewNRGBA(image.Rect(0, 0, 1200, 675))
+func TestEncodeJPEGWithinLimitReducesQualityWhenNeeded(t *testing.T) {
+	src := image.NewNRGBA(image.Rect(0, 0, webRoomCoverWidth, webRoomCoverHeight))
 	state := uint32(1)
-	for i := range src.Pix {
-		state ^= state << 13
-		state ^= state >> 17
-		state ^= state << 5
-		src.Pix[i] = byte(state)
+	for y := 0; y < webRoomCoverHeight; y++ {
+		for x := 0; x < webRoomCoverWidth; x++ {
+			offset := src.PixOffset(x, y)
+			for channel := 0; channel < 3; channel++ {
+				state ^= state << 13
+				state ^= state >> 17
+				state ^= state << 5
+				src.Pix[offset+channel] = byte(state)
+			}
+			src.Pix[offset+3] = 0xff
+		}
 	}
-	const limit = 200 * 1024
-	data, contentType, width, height, err := compressCoverWithinLimit(context.Background(), src, limit)
+
+	const limit = 120 * 1024
+	data, quality, err := encodeJPEGWithinLimit(context.Background(), src, limit)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if int64(len(data)) > limit {
+	if len(data) > limit {
 		t.Fatalf("encoded cover size = %d, limit = %d", len(data), limit)
 	}
-	if contentType != "image/jpeg" {
-		t.Fatalf("encoded cover content type = %q", contentType)
+	if quality <= 0 || quality >= webRoomCoverQuality {
+		t.Fatalf("fallback JPEG quality = %d", quality)
 	}
-	if width < minRoomCoverWidth || width > 1200 || height < 1 {
-		t.Fatalf("encoded cover dimensions = %dx%d", width, height)
+	if config, format, err := image.DecodeConfig(bytes.NewReader(data)); err != nil || format != "jpeg" || config.Width != webRoomCoverWidth || config.Height != webRoomCoverHeight {
+		t.Fatalf("fallback encoded cover = %s %dx%d, err=%v", format, config.Width, config.Height, err)
 	}
-	if _, format, err := image.DecodeConfig(bytes.NewReader(data)); err != nil || format != "jpeg" {
-		t.Fatalf("encoded cover format = %q, err = %v", format, err)
+}
+
+func TestCenteredCropRectUsesImageCenter(t *testing.T) {
+	tests := []struct {
+		name   string
+		bounds image.Rectangle
+		want   image.Rectangle
+	}{
+		{name: "portrait", bounds: image.Rect(0, 0, 400, 800), want: image.Rect(0, 250, 400, 550)},
+		{name: "landscape", bounds: image.Rect(10, 20, 810, 420), want: image.Rect(143, 20, 676, 420)},
+		{name: "four by three", bounds: image.Rect(5, 7, 725, 547), want: image.Rect(5, 7, 725, 547)},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := centeredCropRect(test.bounds, webRoomCoverWidth, webRoomCoverHeight); got != test.want {
+				t.Fatalf("centeredCropRect(%v) = %v, want %v", test.bounds, got, test.want)
+			}
+		})
 	}
 }
 
