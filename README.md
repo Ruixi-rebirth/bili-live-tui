@@ -32,11 +32,11 @@
 nix run github:Ruixi-rebirth/bili-live-tui
 ```
 
-只关闭弹幕页面颜色时可添加 `--no-danmaku-color`，也可以设置标准环境变量 `NO_COLOR`：
+只关闭弹幕页面颜色时可添加 `--no-danmaku-color`，也可以设置环境变量 `NO_DANMAKU_COLOR`：
 
 ```bash
 nix run github:Ruixi-rebirth/bili-live-tui -- --no-danmaku-color
-NO_COLOR=1 nix run github:Ruixi-rebirth/bili-live-tui
+NO_DANMAKU_COLOR=1 nix run github:Ruixi-rebirth/bili-live-tui
 ```
 
 从源码运行需要 Go 1.26 或更高版本：

@@ -101,8 +101,11 @@ func applyTheme() {
 var noColor bool
 var danmakuNoColor bool
 
-// SetNoColor 设置弹幕页面是否关闭主题颜色。
-func SetNoColor(disabled bool) { danmakuNoColor = disabled }
+// SetDanmakuNoColor 设置弹幕页面是否关闭主题颜色。
+func SetDanmakuNoColor(disabled bool) { danmakuNoColor = disabled }
+
+// SetNoColor 设置弹幕页面是否关闭主题颜色（保留旧名称兼容）。
+func SetNoColor(disabled bool) { SetDanmakuNoColor(disabled) }
 
 var (
 	accentColor                   = tcell.NewHexColor(0xe98eaa)
