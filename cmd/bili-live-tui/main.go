@@ -103,6 +103,13 @@ func main() {
 		return rollbackErr
 	}
 	settings, err := tui.RunLiveSettings(ctx, areas, savedSettings, func(liveSettings *api.LiveSettings) error {
+		roomSnapshot, snapshotErr := client.GetRoomSnapshot(ctx, roomID)
+		if snapshotErr != nil {
+			return fmt.Errorf("开播前确认直播间状态失败: %w", snapshotErr)
+		}
+		if err := ensureRoomCanStart(roomSnapshot); err != nil {
+			return err
+		}
 		if err := preflightStreamExecutable(*liveSettings); err != nil {
 			return err
 		}
@@ -292,6 +299,13 @@ func main() {
 	} else {
 		diagnosticLog.Printf("直播已安全结束 room=%s", roomID)
 	}
+}
+
+func ensureRoomCanStart(snapshot api.RoomSnapshot) error {
+	if snapshot.LiveStatus == 1 {
+		return fmt.Errorf("检测到直播间已经开播，请先结束现有推流后再开始")
+	}
+	return nil
 }
 
 func watchStreamOutput(ctx context.Context, done <-chan struct{}, onUnexpectedStop func()) {

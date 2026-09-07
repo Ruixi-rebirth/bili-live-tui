@@ -29,6 +29,7 @@ const DefaultHost = "127.0.0.1"
 
 const (
 	obsControlReconnectWindow = 60 * time.Second
+	obsOutputReconnectWindow  = 60 * time.Second
 	obsStartupReadyAttempts   = 41
 	obsStartupReadyRetryDelay = 500 * time.Millisecond
 )
@@ -60,7 +61,14 @@ func Preflight(host, port, password string) error {
 		if err != nil {
 			return fmt.Errorf("连接 OBS WebSocket 失败: %w。请确认地址、端口和密码正确", err)
 		}
-		_ = client.Disconnect()
+		defer client.Disconnect()
+		status, err := client.Stream.GetStreamStatus(&obsstream.GetStreamStatusParams{})
+		if err != nil {
+			return fmt.Errorf("读取 OBS 推流状态失败: %w", err)
+		}
+		if isOBSOutputRunning(status.OutputActive, status.OutputReconnecting) {
+			return fmt.Errorf("OBS 已在推流或自动重连，请先停止现有推流后再开始")
+		}
 		return nil
 	}
 	if !isLocalOBSHost(host) {
@@ -197,18 +205,19 @@ type Runtime struct {
 	port     string
 	password string
 
-	mu              sync.RWMutex
-	controlMu       sync.Mutex
-	client          *goobs.Client
-	health          streamruntime.Health
-	done            chan struct{}
-	doneOnce        sync.Once
-	monitorStop     chan struct{}
-	monitorStopOnce sync.Once
-	stopping        bool
-	controlFailedAt time.Time
-	lastBytes       float64
-	lastSample      time.Time
+	mu                sync.RWMutex
+	controlMu         sync.Mutex
+	client            *goobs.Client
+	health            streamruntime.Health
+	done              chan struct{}
+	doneOnce          sync.Once
+	monitorStop       chan struct{}
+	monitorStopOnce   sync.Once
+	stopping          bool
+	controlFailedAt   time.Time
+	outputReconnectAt time.Time
+	lastBytes         float64
+	lastSample        time.Time
 }
 
 type healthSample struct {
@@ -254,9 +263,9 @@ func (r *Runtime) Start(rtmpAddr, streamKey string) error {
 		_ = client.Disconnect()
 		return fmt.Errorf("等待 OBS 就绪失败: %w", err)
 	}
-	if status.OutputActive {
+	if isOBSOutputRunning(status.OutputActive, status.OutputReconnecting) {
 		_ = client.Disconnect()
-		return fmt.Errorf("OBS 已在推流，请先停止现有推流后再开始")
+		return fmt.Errorf("OBS 已在推流或自动重连，请先停止现有推流后再开始")
 	}
 
 	serviceType := "rtmp_custom"
@@ -480,14 +489,34 @@ func (r *Runtime) applyHealthSample(sample healthSample, now time.Time) {
 		r.health.CPUPercent = sample.cpuPercent
 		r.health.MemoryMB = sample.memoryMB
 	}
+	timedOut := false
 	if sample.active {
+		r.outputReconnectAt = time.Time{}
 		r.health.LastError = ""
+	} else if sample.reconnecting {
+		// OBS 在 RTMP 被另一路推流抢占时可能进入自动重连：此时
+		// OutputActive=false，但输出任务并未结束。保留运行时，才能让
+		// 用户主动退出时继续发送 StopStream，真正取消后台重连。
+		if r.outputReconnectAt.IsZero() {
+			r.outputReconnectAt = now
+		}
+		if now.Sub(r.outputReconnectAt) >= obsOutputReconnectWindow {
+			r.health.Reconnecting = false
+			r.health.LastError = fmt.Sprintf("OBS 推流在 %d 秒内未恢复，已停止自动重连", int(obsOutputReconnectWindow/time.Second))
+			timedOut = true
+		} else {
+			r.health.LastError = "OBS 与推流服务器的连接中断，正在重连"
+		}
 	} else if !r.stopping {
+		r.outputReconnectAt = time.Time{}
 		r.health.LastError = "OBS 推流已意外停止"
 	}
-	active := r.health.Active
+	outputRunning := r.health.Active || r.health.Reconnecting
 	r.mu.Unlock()
-	if !active {
+	if timedOut {
+		r.monitorStopOnce.Do(func() { close(r.monitorStop) })
+	}
+	if !outputRunning {
 		r.doneOnce.Do(func() { close(r.done) })
 	}
 }
@@ -539,7 +568,7 @@ func (r *Runtime) Stop() (stopErr error) {
 		client = freshClient
 		status, err = client.Stream.GetStreamStatus(&obsstream.GetStreamStatusParams{})
 	}
-	if err == nil && !status.OutputActive {
+	if err == nil && !status.OutputActive && !status.OutputReconnecting {
 		return nil
 	}
 	// 即使状态读取暂时失败，停止请求仍可能成功到达 OBS。
@@ -562,4 +591,8 @@ func isOBSOutputNotRunning(err error) bool {
 	}
 	message := strings.ToLower(err.Error())
 	return strings.Contains(message, "outputnotrunning (501)") || strings.Contains(message, "not active")
+}
+
+func isOBSOutputRunning(active, reconnecting bool) bool {
+	return active || reconnecting
 }

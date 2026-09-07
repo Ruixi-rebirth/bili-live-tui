@@ -21,6 +21,9 @@ import (
 )
 
 const (
+	// DefaultDanmakuMaxLength 只在 B 站的账号/房间约束暂时无法取得时使用。
+	// 正常发送应优先使用 GetDanmakuMaxLength 返回的动态值。
+	DefaultDanmakuMaxLength    = 40
 	danmakuHeaderLength        = 16
 	danmakuProtocolPlain       = 0
 	danmakuProtocolHeartbeat   = 1
@@ -37,6 +40,253 @@ const (
 	danmakuDecodedPayloadLimit = 16 << 20
 	danmakuPacketNestingLimit  = 4
 )
+
+// GetDanmakuMaxLength 返回 B 站网页端为当前账号和直播间下发的弹幕字数上限。
+func (c *Client) GetDanmakuMaxLength(ctx context.Context, roomID, sessdata, biliJCT string) (int, error) {
+	roomID = strings.TrimSpace(roomID)
+	if roomID == "" {
+		return 0, fmt.Errorf("获取弹幕字数限制需要房间号")
+	}
+	path, err := c.endpointByName("GetDanmakuUserInfo")
+	if err != nil {
+		return 0, err
+	}
+	parsed, err := url.Parse(path)
+	if err != nil {
+		return 0, fmt.Errorf("准备获取弹幕字数限制失败: %w", err)
+	}
+	query := parsed.Query()
+	query.Set("room_id", roomID)
+	query.Set("from", "0")
+	parsed.RawQuery = query.Encode()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, parsed.String(), nil)
+	if err != nil {
+		return 0, fmt.Errorf("准备获取弹幕字数限制失败: %w", err)
+	}
+	setBilibiliBrowserHeaders(req)
+	req.Header.Set("Referer", "https://live.bilibili.com/"+roomID)
+	if cookie := browserCookie(sessdata, biliJCT); cookie != "" {
+		req.Header.Set("Cookie", cookie)
+	}
+	resp, err := c.HTTPClient.Do(req)
+	if err != nil {
+		return 0, fmt.Errorf("获取弹幕字数限制失败: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return 0, fmt.Errorf("获取弹幕字数限制失败：远程服务器返回 HTTP %d", resp.StatusCode)
+	}
+	var raw struct {
+		Code    int    `json:"code"`
+		Message string `json:"message"`
+		Msg     string `json:"msg"`
+		Data    *struct {
+			Property struct {
+				Danmaku struct {
+					Length flexibleInt64 `json:"length"`
+				} `json:"danmu"`
+			} `json:"property"`
+		} `json:"data"`
+	}
+	decoder := json.NewDecoder(io.LimitReader(resp.Body, maxAPIResponseBytes+1))
+	if err := decoder.Decode(&raw); err != nil {
+		return 0, fmt.Errorf("解析弹幕字数限制失败: %w", err)
+	}
+	if raw.Code != 0 {
+		message := strings.TrimSpace(raw.Message)
+		if message == "" {
+			message = strings.TrimSpace(raw.Msg)
+		}
+		return 0, fmt.Errorf("获取弹幕字数限制失败（错误码 %d）：%s", raw.Code, message)
+	}
+	if raw.Data == nil {
+		return 0, fmt.Errorf("弹幕字数限制接口未返回数据")
+	}
+	limit := int(raw.Data.Property.Danmaku.Length)
+	if limit <= 0 || limit > 1000 {
+		return 0, fmt.Errorf("B 站返回了无效的弹幕字数限制：%d", limit)
+	}
+	return limit, nil
+}
+
+// UserProfile 是点击弹幕用户名后按需获取的公开资料。
+// 不包含生日、所在地等与直播互动无关的个人信息。
+type UserProfile struct {
+	UserID       string
+	Username     string
+	Signature    string
+	Level        int
+	Official     string
+	VIP          bool
+	VIPLabel     string
+	Followers    int64
+	Following    int64
+	ArchiveCount int64
+	ArticleCount int64
+	IsFollowing  bool
+	IsSelf       bool
+}
+
+// GetUserProfile 获取指定 UID 的 B 站公开用户卡片。
+// 身份和设备 Cookie 与弹幕连接共用，降低网页登录接口误判无头请求的概率。
+func (c *Client) GetUserProfile(ctx context.Context, userID, sessdata, biliJCT string) (UserProfile, error) {
+	userID = strings.TrimSpace(userID)
+	uid, err := strconv.ParseInt(userID, 10, 64)
+	if err != nil || uid <= 0 {
+		return UserProfile{}, fmt.Errorf("无效的用户 UID：%s", userID)
+	}
+	path, err := c.endpointByName("GetUserCard")
+	if err != nil {
+		return UserProfile{}, err
+	}
+	parsed, err := url.Parse(path)
+	if err != nil {
+		return UserProfile{}, fmt.Errorf("准备查询用户资料失败: %w", err)
+	}
+	query := parsed.Query()
+	query.Set("mid", userID)
+	query.Set("photo", "false")
+	parsed.RawQuery = query.Encode()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, parsed.String(), nil)
+	if err != nil {
+		return UserProfile{}, fmt.Errorf("准备查询用户资料失败: %w", err)
+	}
+	setBilibiliBrowserHeaders(req)
+	req.Header.Set("Referer", "https://space.bilibili.com/"+userID+"/")
+	identity, identityErr := c.resolveDanmakuIdentity(ctx, sessdata, biliJCT)
+	if identityErr == nil {
+		req.Header.Set("Cookie", danmakuBrowserCookie(sessdata, biliJCT, identity))
+	} else if cookie := browserCookie(sessdata, biliJCT); cookie != "" {
+		req.Header.Set("Cookie", cookie)
+	}
+	resp, err := c.HTTPClient.Do(req)
+	if err != nil {
+		return UserProfile{}, fmt.Errorf("查询用户资料失败: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return UserProfile{}, fmt.Errorf("查询用户资料失败：远程服务器返回 HTTP %d", resp.StatusCode)
+	}
+	var raw struct {
+		Code    int    `json:"code"`
+		Message string `json:"message"`
+		Data    *struct {
+			Card struct {
+				Mid       flexibleID    `json:"mid"`
+				Name      string        `json:"name"`
+				Sign      string        `json:"sign"`
+				Fans      flexibleInt64 `json:"fans"`
+				Friend    flexibleInt64 `json:"friend"`
+				Attention flexibleInt64 `json:"attention"`
+				LevelInfo struct {
+					CurrentLevel flexibleInt64 `json:"current_level"`
+				} `json:"level_info"`
+				Official struct {
+					Title string `json:"title"`
+				} `json:"Official"`
+				VIP struct {
+					Status flexibleInt64 `json:"status"`
+					Label  struct {
+						Text string `json:"text"`
+					} `json:"label"`
+				} `json:"vip"`
+			} `json:"card"`
+			Following    bool          `json:"following"`
+			Follower     flexibleInt64 `json:"follower"`
+			ArchiveCount flexibleInt64 `json:"archive_count"`
+			ArticleCount flexibleInt64 `json:"article_count"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxAPIResponseBytes+1)).Decode(&raw); err != nil {
+		return UserProfile{}, fmt.Errorf("解析用户资料失败: %w", err)
+	}
+	if raw.Code != 0 {
+		message := strings.TrimSpace(raw.Message)
+		if message == "" {
+			message = "B 站未返回具体原因"
+		}
+		return UserProfile{}, fmt.Errorf("B 站拒绝查询用户资料（错误码 %d）：%s", raw.Code, message)
+	}
+	if raw.Data == nil {
+		return UserProfile{}, fmt.Errorf("用户资料接口未返回数据")
+	}
+	card := raw.Data.Card
+	profile := UserProfile{
+		UserID:       strings.TrimSpace(string(card.Mid)),
+		Username:     strings.TrimSpace(card.Name),
+		Signature:    strings.TrimSpace(card.Sign),
+		Level:        int(card.LevelInfo.CurrentLevel),
+		Official:     strings.TrimSpace(card.Official.Title),
+		VIP:          card.VIP.Status == 1,
+		VIPLabel:     strings.TrimSpace(card.VIP.Label.Text),
+		Followers:    int64(card.Fans),
+		Following:    int64(card.Attention),
+		ArchiveCount: int64(raw.Data.ArchiveCount),
+		ArticleCount: int64(raw.Data.ArticleCount),
+		IsFollowing:  raw.Data.Following,
+	}
+	if profile.UserID == "" {
+		profile.UserID = userID
+	}
+	if identityErr == nil && identity.UID > 0 {
+		profile.IsSelf = profile.UserID == strconv.FormatInt(identity.UID, 10)
+	}
+	if profile.Followers == 0 && raw.Data.Follower > 0 {
+		profile.Followers = int64(raw.Data.Follower)
+	}
+	if profile.Following == 0 {
+		profile.Following = int64(card.Friend)
+	}
+	return profile, nil
+}
+
+// SetUserFollowing 修改当前账号与指定用户的关注关系。
+func (c *Client) SetUserFollowing(ctx context.Context, userID, sessdata, biliJCT string, following bool) error {
+	userID = strings.TrimSpace(userID)
+	uid, err := strconv.ParseInt(userID, 10, 64)
+	if err != nil || uid <= 0 {
+		return fmt.Errorf("无效的用户 UID：%s", userID)
+	}
+	if strings.TrimSpace(sessdata) == "" || strings.TrimSpace(biliJCT) == "" {
+		return fmt.Errorf("修改关注状态需要有效的 SESSDATA 和 bili_jct")
+	}
+	params := url.Values{}
+	params.Set("fid", userID)
+	params.Set("act", "2")
+	if following {
+		params.Set("act", "1")
+	}
+	params.Set("re_src", "0")
+	params.Set("csrf", biliJCT)
+	params.Set("csrf_token", biliJCT)
+	path, err := c.endpointByName("ModifyUserRelation")
+	if err != nil {
+		return err
+	}
+	var result struct {
+		Code    int    `json:"code"`
+		Message string `json:"message"`
+		Msg     string `json:"msg"`
+	}
+	headers := http.Header{
+		"Cookie":     []string{"SESSDATA=" + sessdata + "; bili_jct=" + biliJCT},
+		"User-Agent": []string{biliBrowserUserAgent},
+		"Origin":     []string{"https://space.bilibili.com"},
+		"Referer":    []string{"https://space.bilibili.com/" + userID + "/"},
+	}
+	if err := c.postFormWithHeaders(ctx, path, params, &result, headers); err != nil {
+		return fmt.Errorf("修改关注状态失败: %w", err)
+	}
+	if result.Code != 0 {
+		action := "关注"
+		if !following {
+			action = "取消关注"
+		}
+		return fmt.Errorf("%s失败（错误码 %d）：%s", action, result.Code, responseMessage(result.Message, result.Msg))
+	}
+	return nil
+}
 
 // DanmakuHost 是 B 站公布的一个 WebSocket 服务器地址。
 type DanmakuHost struct {
@@ -222,14 +472,19 @@ const (
 // DanmakuMessage 是与 B 站嵌套数组格式无关的标准化弹幕项。
 // Timestamp 在解析数据包时设置。
 type DanmakuMessage struct {
-	Username   string
-	UserID     string
-	Text       string
-	MedalName  string
-	MedalLevel int
-	GiftName   string
-	GiftCount  int
-	Timestamp  time.Time
+	Username    string
+	UserID      string
+	Text        string
+	MedalName   string
+	MedalLevel  int
+	GuardLevel  int
+	UserLevel   int
+	WealthLevel int
+	IsAdmin     bool
+	IsMystery   bool
+	GiftName    string
+	GiftCount   int
+	Timestamp   time.Time
 }
 
 // DanmakuEvent 由 DanmakuStream.Events 提供。
@@ -809,14 +1064,25 @@ func parseDanmuMessage(raw json.RawMessage, command string) (DanmakuEvent, bool,
 	if err := json.Unmarshal(fields[2], &user); err == nil {
 		message.UserID = jsonStringAt(user, 0)
 		message.Username = jsonStringAt(user, 1)
+		message.IsAdmin = jsonIntAt(user, 2) != 0
 	}
 	if len(fields) > 3 {
 		var medal []json.RawMessage
 		if err := json.Unmarshal(fields[3], &medal); err == nil && len(medal) >= 2 {
 			message.MedalLevel = jsonIntAt(medal, 0)
 			message.MedalName = jsonStringAt(medal, 1)
+			message.GuardLevel = jsonIntAt(medal, 10)
 		}
 	}
+	if len(fields) > 4 {
+		var level []json.RawMessage
+		if err := json.Unmarshal(fields[4], &level); err == nil {
+			message.UserLevel = jsonIntAt(level, 0)
+		}
+	}
+	// 新版弹幕包会在 info[0][15].user 中附带更完整且结构化的用户信息。
+	// 旧包仍以上面的数组字段为准；这里仅覆盖实际存在的值。
+	applyStructuredDanmakuUser(fields[0], &message)
 	if strings.TrimSpace(message.Text) == "" {
 		return DanmakuEvent{}, false, nil
 	}
@@ -825,10 +1091,16 @@ func parseDanmuMessage(raw json.RawMessage, command string) (DanmakuEvent, bool,
 
 func parseGift(raw json.RawMessage, command string) (DanmakuEvent, bool, error) {
 	var data struct {
-		UID      flexibleID    `json:"uid"`
-		Uname    string        `json:"uname"`
-		GiftName string        `json:"giftName"`
-		Num      flexibleInt64 `json:"num"`
+		UID         flexibleID    `json:"uid"`
+		Uname       string        `json:"uname"`
+		GiftName    string        `json:"giftName"`
+		Num         flexibleInt64 `json:"num"`
+		WealthLevel flexibleInt64 `json:"wealth_level"`
+		MedalInfo   struct {
+			MedalName  string        `json:"medal_name"`
+			MedalLevel flexibleInt64 `json:"medal_level"`
+			GuardLevel flexibleInt64 `json:"guard_level"`
+		} `json:"medal_info"`
 	}
 	if err := json.Unmarshal(raw, &data); err != nil {
 		return DanmakuEvent{}, false, fmt.Errorf("解析礼物消息失败: %w", err)
@@ -842,13 +1114,69 @@ func parseGift(raw json.RawMessage, command string) (DanmakuEvent, bool, error) 
 	}
 	text := fmt.Sprintf("送出 %s ×%d", data.GiftName, count)
 	return DanmakuEvent{Kind: DanmakuEventGift, Command: command, Message: DanmakuMessage{
-		Username:  data.Uname,
-		UserID:    string(data.UID),
-		Text:      text,
-		GiftName:  data.GiftName,
-		GiftCount: count,
-		Timestamp: time.Now(),
+		Username:    data.Uname,
+		UserID:      string(data.UID),
+		Text:        text,
+		GiftName:    data.GiftName,
+		GiftCount:   count,
+		MedalName:   strings.TrimSpace(data.MedalInfo.MedalName),
+		MedalLevel:  int(data.MedalInfo.MedalLevel),
+		GuardLevel:  int(data.MedalInfo.GuardLevel),
+		WealthLevel: int(data.WealthLevel),
+		Timestamp:   time.Now(),
 	}}, true, nil
+}
+
+func applyStructuredDanmakuUser(raw json.RawMessage, message *DanmakuMessage) {
+	if message == nil {
+		return
+	}
+	var metadata []json.RawMessage
+	if json.Unmarshal(raw, &metadata) != nil || len(metadata) <= 15 {
+		return
+	}
+	var extra struct {
+		User *struct {
+			UID  flexibleID `json:"uid"`
+			Base struct {
+				Name      string `json:"name"`
+				IsMystery bool   `json:"is_mystery"`
+			} `json:"base"`
+			Medal *struct {
+				Name       string        `json:"name"`
+				Level      flexibleInt64 `json:"level"`
+				GuardLevel flexibleInt64 `json:"guard_level"`
+			} `json:"medal"`
+			Wealth *struct {
+				Level flexibleInt64 `json:"level"`
+			} `json:"wealth"`
+		} `json:"user"`
+	}
+	if json.Unmarshal(metadata[15], &extra) != nil || extra.User == nil {
+		return
+	}
+	user := extra.User
+	if value := strings.TrimSpace(string(user.UID)); value != "" {
+		message.UserID = value
+	}
+	if value := strings.TrimSpace(user.Base.Name); value != "" {
+		message.Username = value
+	}
+	message.IsMystery = user.Base.IsMystery
+	if user.Medal != nil {
+		if value := strings.TrimSpace(user.Medal.Name); value != "" {
+			message.MedalName = value
+		}
+		if user.Medal.Level > 0 {
+			message.MedalLevel = int(user.Medal.Level)
+		}
+		if user.Medal.GuardLevel > 0 {
+			message.GuardLevel = int(user.Medal.GuardLevel)
+		}
+	}
+	if user.Wealth != nil && user.Wealth.Level > 0 {
+		message.WealthLevel = int(user.Wealth.Level)
+	}
 }
 
 func parseLikeInteraction(raw json.RawMessage, command string) (DanmakuEvent, bool, error) {
@@ -939,7 +1267,13 @@ func jsonIntAt(values []json.RawMessage, index int) int {
 }
 
 // SendDanmaku 通过 B 站 Web API 发送一条认证弹幕。
+// 未预先查询房间约束的调用方使用默认的兜底上限。
 func (c *Client) SendDanmaku(ctx context.Context, roomID, sessdata, biliJCT, message string) error {
+	return c.SendDanmakuWithLimit(ctx, roomID, sessdata, biliJCT, message, DefaultDanmakuMaxLength)
+}
+
+// SendDanmakuWithLimit 使用 B 站为当前账号和直播间下发的字数上限发送弹幕。
+func (c *Client) SendDanmakuWithLimit(ctx context.Context, roomID, sessdata, biliJCT, message string, maxLength int) error {
 	if strings.TrimSpace(roomID) == "" {
 		return fmt.Errorf("发送弹幕需要房间号")
 	}
@@ -947,8 +1281,11 @@ func (c *Client) SendDanmaku(ctx context.Context, roomID, sessdata, biliJCT, mes
 	if message == "" {
 		return fmt.Errorf("弹幕内容不能为空")
 	}
-	if len([]rune(message)) > 80 {
-		return fmt.Errorf("弹幕内容不能超过 80 个字符")
+	if maxLength <= 0 {
+		maxLength = DefaultDanmakuMaxLength
+	}
+	if length := len([]rune(message)); length > maxLength {
+		return fmt.Errorf("弹幕内容不能超过 %d 个字符（当前 %d 个）", maxLength, length)
 	}
 	if strings.TrimSpace(sessdata) == "" || strings.TrimSpace(biliJCT) == "" {
 		return fmt.Errorf("发送弹幕需要有效的 SESSDATA 和 bili_jct")

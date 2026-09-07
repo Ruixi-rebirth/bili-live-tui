@@ -88,6 +88,17 @@ func TestAuthenticationErrorClassification(t *testing.T) {
 	}
 }
 
+func TestEnsureRoomCanStartRejectsExistingLiveSession(t *testing.T) {
+	if err := ensureRoomCanStart(api.RoomSnapshot{LiveStatus: 1}); err == nil || !strings.Contains(err.Error(), "已经开播") {
+		t.Fatalf("live room preflight error = %v", err)
+	}
+	for _, status := range []int{0, 2} {
+		if err := ensureRoomCanStart(api.RoomSnapshot{LiveStatus: status}); err != nil {
+			t.Fatalf("room status %d was rejected: %v", status, err)
+		}
+	}
+}
+
 func TestWatchStreamOutputCancelsOnUnexpectedStop(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

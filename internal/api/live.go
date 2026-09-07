@@ -161,6 +161,7 @@ type LiveArea struct {
 // RoomSnapshot 是直播主页使用的公开房间状态摘要。
 // Online 是 B 站返回的当前人气，Watched 是接口提供时的累计观看人数。
 type RoomSnapshot struct {
+	AnchorID       string
 	RoomID         string
 	Title          string
 	Description    string
@@ -191,7 +192,631 @@ type OnlineRankSnapshot struct {
 	Members []OnlineRankMember
 }
 
+const (
+	// These values are the permission constants used by Bilibili's current
+	// live-room Web client (module 80972). Keep them numeric because the API
+	// returns an integer permission list.
+	RoomPermissionMute           = 1
+	RoomPermissionBlacklist      = 2
+	RoomPermissionAnonymousView  = 100
+	RoomPermissionAnonymousMute  = 101
+	RoomPermissionAnonymousBlock = 102
+)
+
+// RoomManagementCapabilities 描述当前登录账号在指定直播间的管理权限。
+// 权限数字来自 getInfoByUser，不能仅凭房管名称推断。
+type RoomManagementCapabilities struct {
+	UserID      string
+	AnchorID    string
+	IsAnchor    bool
+	IsAdmin     bool
+	AdminLevel  int
+	Permissions []int
+}
+
+func (capabilities RoomManagementCapabilities) HasPermission(permission int) bool {
+	for _, candidate := range capabilities.Permissions {
+		if candidate == permission {
+			return true
+		}
+	}
+	return false
+}
+
+func (capabilities RoomManagementCapabilities) CanMute(targetAdminLevel int) bool {
+	return capabilities.IsAnchor || capabilities.IsAdmin &&
+		capabilities.HasPermission(RoomPermissionMute) &&
+		capabilities.AdminLevel > targetAdminLevel
+}
+
+func (capabilities RoomManagementCapabilities) CanBlacklist(targetAdminLevel int) bool {
+	return capabilities.IsAnchor || capabilities.IsAdmin &&
+		capabilities.HasPermission(RoomPermissionBlacklist) &&
+		capabilities.AdminLevel > targetAdminLevel
+}
+
+type roomManagementCapabilitiesWire struct {
+	UID         flexibleID      `json:"uid"`
+	IsAnchor    flexibleBool    `json:"is_anchor"`
+	IsAdmin     flexibleBool    `json:"is_admin"`
+	AdminLevel  flexibleInt64   `json:"admin_level"`
+	Permissions []flexibleInt64 `json:"permissions"`
+	Info        struct {
+		UID flexibleID `json:"uid"`
+	} `json:"info"`
+	Badge struct {
+		IsRoomAdmin flexibleBool    `json:"is_room_admin"`
+		AdminLevel  flexibleInt64   `json:"admin_level"`
+		Permissions []flexibleInt64 `json:"permissions"`
+	} `json:"badge"`
+}
+
+// GetRoomManagementCapabilities 获取当前账号的主播/房管等级和细粒度权限。
+func (c *Client) GetRoomManagementCapabilities(ctx context.Context, roomID, sessdata, biliJCT string) (RoomManagementCapabilities, error) {
+	roomID = strings.TrimSpace(roomID)
+	if roomID == "" {
+		return RoomManagementCapabilities{}, fmt.Errorf("获取房间管理权限需要房间号")
+	}
+	path, err := c.endpointByName("GetDanmakuUserInfo")
+	if err != nil {
+		return RoomManagementCapabilities{}, err
+	}
+	parsed, err := url.Parse(path)
+	if err != nil {
+		return RoomManagementCapabilities{}, fmt.Errorf("准备获取房间管理权限失败: %w", err)
+	}
+	query := parsed.Query()
+	query.Set("room_id", roomID)
+	query.Set("from", "0")
+	parsed.RawQuery = query.Encode()
+	var raw struct {
+		Code    int                            `json:"code"`
+		Message string                         `json:"message"`
+		Msg     string                         `json:"msg"`
+		Data    roomManagementCapabilitiesWire `json:"data"`
+	}
+	if err := c.getLiveCookieJSON(ctx, parsed.String(), sessdata, biliJCT, &raw); err != nil {
+		return RoomManagementCapabilities{}, fmt.Errorf("获取房间管理权限失败: %w", err)
+	}
+	if raw.Code != 0 {
+		return RoomManagementCapabilities{}, fmt.Errorf("获取房间管理权限失败（错误码 %d）：%s", raw.Code, responseMessage(raw.Message, raw.Msg))
+	}
+	capabilities := RoomManagementCapabilities{
+		UserID:     strings.TrimSpace(string(raw.Data.UID)),
+		IsAnchor:   bool(raw.Data.IsAnchor),
+		IsAdmin:    bool(raw.Data.IsAdmin),
+		AdminLevel: int(raw.Data.AdminLevel),
+	}
+	if capabilities.UserID == "" {
+		capabilities.UserID = strings.TrimSpace(string(raw.Data.Info.UID))
+	}
+	if !capabilities.IsAdmin {
+		capabilities.IsAdmin = bool(raw.Data.Badge.IsRoomAdmin)
+	}
+	if capabilities.AdminLevel == 0 {
+		capabilities.AdminLevel = int(raw.Data.Badge.AdminLevel)
+	}
+	permissions := raw.Data.Permissions
+	if len(permissions) == 0 {
+		permissions = raw.Data.Badge.Permissions
+	}
+	for _, permission := range permissions {
+		capabilities.Permissions = append(capabilities.Permissions, int(permission))
+	}
+	if capabilities.UserID == "" {
+		if identity, identityErr := c.resolveDanmakuIdentity(ctx, sessdata, biliJCT); identityErr == nil && identity.UID > 0 {
+			capabilities.UserID = strconv.FormatInt(identity.UID, 10)
+		}
+	}
+	if !capabilities.IsAnchor && capabilities.UserID != "" {
+		if snapshot, snapshotErr := c.GetRoomSnapshot(ctx, roomID); snapshotErr == nil {
+			capabilities.AnchorID = snapshot.AnchorID
+			capabilities.IsAnchor = capabilities.AnchorID != "" && capabilities.AnchorID == capabilities.UserID
+		}
+	}
+	if capabilities.IsAnchor && capabilities.AnchorID == "" {
+		capabilities.AnchorID = capabilities.UserID
+	}
+	if capabilities.IsAnchor {
+		capabilities.IsAdmin = true
+	}
+	return capabilities, nil
+}
+
+type RoomAdmin struct {
+	UserID      string
+	Username    string
+	AppointedAt string
+	Level       int
+}
+
+type RoomAdminPage struct {
+	Items      []RoomAdmin
+	Page       int
+	TotalPages int
+	MaxCount   int
+}
+
+func (c *Client) GetRoomAdminSeniorStatus(ctx context.Context, anchorID, sessdata, biliJCT string) (int, error) {
+	if err := validateLiveUserID("主播 UID", anchorID); err != nil {
+		return 0, err
+	}
+	var raw struct {
+		Code    int    `json:"code"`
+		Message string `json:"message"`
+		Msg     string `json:"msg"`
+		Data    struct {
+			Status flexibleInt64 `json:"status"`
+		} `json:"data"`
+	}
+	if err := c.getLiveEndpointJSON(ctx, "GetRoomAdminSenior", sessdata, biliJCT, url.Values{"anchor_id": {anchorID}}, &raw); err != nil {
+		return 0, fmt.Errorf("获取高级房管状态失败: %w", err)
+	}
+	if raw.Code != 0 {
+		return 0, fmt.Errorf("获取高级房管状态失败（错误码 %d）：%s", raw.Code, responseMessage(raw.Message, raw.Msg))
+	}
+	status := int(raw.Data.Status)
+	if status <= 0 {
+		status = 1
+	}
+	return status, nil
+}
+
+func (c *Client) GetRoomAdmins(ctx context.Context, page int, sessdata, biliJCT string) (RoomAdminPage, error) {
+	if page <= 0 {
+		page = 1
+	}
+	var raw struct {
+		Code    int    `json:"code"`
+		Message string `json:"message"`
+		Msg     string `json:"msg"`
+		Data    struct {
+			Items []struct {
+				UID        flexibleID    `json:"uid"`
+				Username   string        `json:"uname"`
+				CreatedAt  string        `json:"ctime"`
+				AdminLevel flexibleInt64 `json:"admin_level"`
+			} `json:"data"`
+			Page struct {
+				Number     flexibleInt64 `json:"page"`
+				TotalPages flexibleInt64 `json:"total_page"`
+			} `json:"page"`
+			MaxCount flexibleInt64 `json:"max_room_anchors_number"`
+		} `json:"data"`
+	}
+	if err := c.getLiveEndpointJSON(ctx, "GetRoomAdmins", sessdata, biliJCT, url.Values{"page": {strconv.Itoa(page)}}, &raw); err != nil {
+		return RoomAdminPage{}, fmt.Errorf("获取房管列表失败: %w", err)
+	}
+	if raw.Code != 0 {
+		return RoomAdminPage{}, fmt.Errorf("获取房管列表失败（错误码 %d）：%s", raw.Code, responseMessage(raw.Message, raw.Msg))
+	}
+	result := RoomAdminPage{Page: int(raw.Data.Page.Number), TotalPages: int(raw.Data.Page.TotalPages), MaxCount: int(raw.Data.MaxCount)}
+	if result.Page <= 0 {
+		result.Page = page
+	}
+	for _, item := range raw.Data.Items {
+		result.Items = append(result.Items, RoomAdmin{UserID: string(item.UID), Username: strings.TrimSpace(item.Username), AppointedAt: strings.TrimSpace(item.CreatedAt), Level: int(item.AdminLevel)})
+	}
+	return result, nil
+}
+
+func (c *Client) AppointRoomAdmin(ctx context.Context, userID string, level int, sessdata, biliJCT string) error {
+	if strings.TrimSpace(userID) == "" {
+		return fmt.Errorf("任命房管需要 UID 或用户名")
+	}
+	if level != 1 && level != 2 {
+		return fmt.Errorf("无效的房管等级：%d", level)
+	}
+	return c.roomManagementAction(ctx, "AppointRoomAdmin", "任命房管", sessdata, biliJCT, url.Values{"admin": {strings.TrimSpace(userID)}, "admin_level": {strconv.Itoa(level)}})
+}
+
+func (c *Client) DismissRoomAdmin(ctx context.Context, userID, sessdata, biliJCT string) error {
+	if err := validateLiveUserID("用户 UID", userID); err != nil {
+		return err
+	}
+	return c.roomManagementAction(ctx, "DismissRoomAdmin", "撤销房管", sessdata, biliJCT, url.Values{"uid": {userID}})
+}
+
+type RoomUserSearchResult struct {
+	UserID   string
+	Username string
+}
+
+func (c *Client) SearchRoomUsers(ctx context.Context, keyword, sessdata, biliJCT string) ([]RoomUserSearchResult, error) {
+	keyword = strings.TrimSpace(keyword)
+	if keyword == "" {
+		return nil, fmt.Errorf("搜索用户需要 UID 或用户名")
+	}
+	var raw struct {
+		Code    int    `json:"code"`
+		Message string `json:"message"`
+		Msg     string `json:"msg"`
+		Data    struct {
+			Items []struct {
+				UID      flexibleID `json:"uid"`
+				Username string     `json:"uname"`
+			} `json:"items"`
+		} `json:"data"`
+	}
+	if err := c.getLiveEndpointJSON(ctx, "SearchRoomUser", sessdata, biliJCT, url.Values{"search": {keyword}}, &raw); err != nil {
+		return nil, fmt.Errorf("搜索直播用户失败: %w", err)
+	}
+	if raw.Code != 0 {
+		return nil, fmt.Errorf("搜索直播用户失败（错误码 %d）：%s", raw.Code, responseMessage(raw.Message, raw.Msg))
+	}
+	result := make([]RoomUserSearchResult, 0, len(raw.Data.Items))
+	for _, item := range raw.Data.Items {
+		result = append(result, RoomUserSearchResult{UserID: string(item.UID), Username: strings.TrimSpace(item.Username)})
+	}
+	return result, nil
+}
+
+type RoomMutedUser struct {
+	UserID           string
+	Username         string
+	OperatorName     string
+	ExpiresAt        string
+	AdminLevel       int
+	OperatorIsAnchor bool
+}
+
+func (c *Client) GetMutedRoomUsers(ctx context.Context, roomID string, page int, sessdata, biliJCT string) ([]RoomMutedUser, error) {
+	if err := validateLiveUserID("房间号", roomID); err != nil {
+		return nil, err
+	}
+	if page <= 0 {
+		page = 1
+	}
+	var raw struct {
+		Code    int    `json:"code"`
+		Message string `json:"message"`
+		Msg     string `json:"msg"`
+		Data    struct {
+			Items []struct {
+				UID              flexibleID    `json:"tuid"`
+				Username         string        `json:"tname"`
+				OperatorName     string        `json:"name"`
+				ExpiresAt        string        `json:"block_end_time"`
+				AdminLevel       flexibleInt64 `json:"admin_level"`
+				OperatorIsAnchor flexibleBool  `json:"is_anchor"`
+			} `json:"data"`
+		} `json:"data"`
+	}
+	params := url.Values{"room_id": {roomID}, "ps": {strconv.Itoa(page)}}
+	if err := c.postRoomManagementJSON(ctx, "GetMutedUsers", sessdata, biliJCT, params, &raw); err != nil {
+		return nil, fmt.Errorf("获取禁言名单失败: %w", err)
+	}
+	if raw.Code != 0 {
+		return nil, fmt.Errorf("获取禁言名单失败（错误码 %d）：%s", raw.Code, responseMessage(raw.Message, raw.Msg))
+	}
+	result := make([]RoomMutedUser, 0, len(raw.Data.Items))
+	for _, item := range raw.Data.Items {
+		result = append(result, RoomMutedUser{UserID: string(item.UID), Username: strings.TrimSpace(item.Username), OperatorName: strings.TrimSpace(item.OperatorName), ExpiresAt: strings.TrimSpace(item.ExpiresAt), AdminLevel: int(item.AdminLevel), OperatorIsAnchor: bool(item.OperatorIsAnchor)})
+	}
+	return result, nil
+}
+
+type RoomUserMuteDuration string
+
+const (
+	RoomMutePermanent RoomUserMuteDuration = "permanent"
+	RoomMuteSevenDays RoomUserMuteDuration = "seven-days"
+	RoomMuteOneDay    RoomUserMuteDuration = "one-day"
+	RoomMuteFourHours RoomUserMuteDuration = "four-hours"
+	RoomMuteTwoHours  RoomUserMuteDuration = "two-hours"
+	RoomMuteThisLive  RoomUserMuteDuration = "this-live"
+)
+
+func (duration RoomUserMuteDuration) parameters() (muteType, hours int, ok bool) {
+	switch duration {
+	case RoomMutePermanent:
+		return 1, -1, true
+	case RoomMuteSevenDays:
+		return 1, 168, true
+	case RoomMuteOneDay:
+		return 1, 24, true
+	case RoomMuteFourHours:
+		return 1, 4, true
+	case RoomMuteTwoHours:
+		return 1, 2, true
+	case RoomMuteThisLive:
+		return 2, 0, true
+	default:
+		return 0, 0, false
+	}
+}
+
+func (c *Client) MuteRoomUser(ctx context.Context, roomID, userID, message string, duration RoomUserMuteDuration, sessdata, biliJCT string) error {
+	if err := validateLiveUserID("房间号", roomID); err != nil {
+		return err
+	}
+	if err := validateLiveUserID("用户 UID", userID); err != nil {
+		return err
+	}
+	muteType, hours, ok := duration.parameters()
+	if !ok {
+		return fmt.Errorf("无效的禁言时长：%s", duration)
+	}
+	params := url.Values{"room_id": {roomID}, "tuid": {userID}, "msg": {strings.TrimSpace(message)}, "mobile_app": {"web"}, "type": {strconv.Itoa(muteType)}, "hour": {strconv.Itoa(hours)}}
+	return c.roomManagementAction(ctx, "MuteRoomUser", "禁言用户", sessdata, biliJCT, params)
+}
+
+func (c *Client) UnmuteRoomUser(ctx context.Context, roomID, userID, sessdata, biliJCT string) error {
+	if err := validateLiveUserID("房间号", roomID); err != nil {
+		return err
+	}
+	if err := validateLiveUserID("用户 UID", userID); err != nil {
+		return err
+	}
+	return c.roomManagementAction(ctx, "UnmuteRoomUser", "解除用户禁言", sessdata, biliJCT, url.Values{"room_id": {roomID}, "tuid": {userID}, "mobi_app": {"web"}})
+}
+
+type RoomBlacklistedUser struct {
+	UserID    string
+	Username  string
+	CreatedAt string
+}
+
+type RoomBlacklistPage struct {
+	Items      []RoomBlacklistedUser
+	Page       int
+	TotalPages int
+	Total      int
+}
+
+func (c *Client) GetRoomBlacklist(ctx context.Context, anchorID string, page, pageSize int, sessdata, biliJCT string) (RoomBlacklistPage, error) {
+	if err := validateLiveUserID("主播 UID", anchorID); err != nil {
+		return RoomBlacklistPage{}, err
+	}
+	if page <= 0 {
+		page = 1
+	}
+	if pageSize <= 0 {
+		pageSize = 20
+	}
+	var raw struct {
+		Code    int    `json:"code"`
+		Message string `json:"message"`
+		Msg     string `json:"msg"`
+		Data    struct {
+			Items []struct {
+				UID        flexibleID `json:"uid"`
+				TargetUID  flexibleID `json:"tuid"`
+				Username   string     `json:"uname"`
+				TargetName string     `json:"tname"`
+				Name       string     `json:"name"`
+				CreatedAt  string     `json:"ctime"`
+				ModifiedAt string     `json:"mtime"`
+			} `json:"data"`
+			Page       flexibleInt64 `json:"pn"`
+			TotalPages flexibleInt64 `json:"total_page"`
+			Total      flexibleInt64 `json:"total"`
+		} `json:"data"`
+	}
+	query := url.Values{
+		"anchor_id": {anchorID},
+		"pn":        {strconv.Itoa(page)},
+		"ps":        {strconv.Itoa(pageSize)},
+	}
+	if err := c.getLiveEndpointJSON(ctx, "GetRoomBlacklist", sessdata, biliJCT, query, &raw); err != nil {
+		return RoomBlacklistPage{}, fmt.Errorf("获取直播间黑名单失败: %w", err)
+	}
+	if raw.Code != 0 {
+		return RoomBlacklistPage{}, fmt.Errorf("获取直播间黑名单失败（错误码 %d）：%s", raw.Code, responseMessage(raw.Message, raw.Msg))
+	}
+	result := RoomBlacklistPage{Page: int(raw.Data.Page), TotalPages: int(raw.Data.TotalPages), Total: int(raw.Data.Total)}
+	if result.Page <= 0 {
+		result.Page = page
+	}
+	for _, item := range raw.Data.Items {
+		userID := strings.TrimSpace(string(item.UID))
+		if userID == "" {
+			userID = strings.TrimSpace(string(item.TargetUID))
+		}
+		username := strings.TrimSpace(item.Username)
+		if username == "" {
+			username = strings.TrimSpace(item.TargetName)
+		}
+		if username == "" {
+			username = strings.TrimSpace(item.Name)
+		}
+		createdAt := strings.TrimSpace(item.CreatedAt)
+		if createdAt == "" {
+			createdAt = strings.TrimSpace(item.ModifiedAt)
+		}
+		result.Items = append(result.Items, RoomBlacklistedUser{UserID: userID, Username: username, CreatedAt: createdAt})
+	}
+	if result.Total == 0 {
+		result.Total = len(result.Items)
+	}
+	return result, nil
+}
+
+func (c *Client) BlacklistRoomUser(ctx context.Context, anchorID, userID, sessdata, biliJCT string) error {
+	if err := validateLiveUserID("主播 UID", anchorID); err != nil {
+		return err
+	}
+	if err := validateLiveUserID("用户 UID", userID); err != nil {
+		return err
+	}
+	return c.roomManagementAction(ctx, "BlacklistRoomUser", "将用户加入直播间黑名单", sessdata, biliJCT, url.Values{
+		"anchor_id": {anchorID},
+		"tuid":      {userID},
+		"spmid":     {"444.8.0.0"},
+	})
+}
+
+func (c *Client) UnblacklistRoomUser(ctx context.Context, anchorID, userID, sessdata, biliJCT string) error {
+	if err := validateLiveUserID("主播 UID", anchorID); err != nil {
+		return err
+	}
+	if err := validateLiveUserID("用户 UID", userID); err != nil {
+		return err
+	}
+	return c.roomManagementAction(ctx, "UnblacklistRoomUser", "将用户移出直播间黑名单", sessdata, biliJCT, url.Values{
+		"anchor_id": {anchorID},
+		"tuid":      {userID},
+		"spmid":     {"444.8.0.0"},
+	})
+}
+
+type RoomShieldKeywordState struct {
+	Keywords []string
+	MaxCount int
+}
+
+func (c *Client) GetRoomShieldKeywords(ctx context.Context, roomID, sessdata, biliJCT string) (RoomShieldKeywordState, error) {
+	if err := validateLiveUserID("房间号", roomID); err != nil {
+		return RoomShieldKeywordState{}, err
+	}
+	var raw struct {
+		Code    int    `json:"code"`
+		Message string `json:"message"`
+		Msg     string `json:"msg"`
+		Data    struct {
+			KeywordList []struct {
+				Keyword string `json:"keyword"`
+			} `json:"keyword_list"`
+			MaxCount flexibleInt64 `json:"max_limit"`
+		} `json:"data"`
+	}
+	if err := c.postRoomManagementJSON(ctx, "GetShieldKeywords", sessdata, biliJCT, url.Values{"room_id": {roomID}}, &raw); err != nil {
+		return RoomShieldKeywordState{}, fmt.Errorf("获取直播间屏蔽词失败: %w", err)
+	}
+	if raw.Code != 0 {
+		return RoomShieldKeywordState{}, fmt.Errorf("获取直播间屏蔽词失败（错误码 %d）：%s", raw.Code, responseMessage(raw.Message, raw.Msg))
+	}
+	result := RoomShieldKeywordState{MaxCount: int(raw.Data.MaxCount)}
+	for _, item := range raw.Data.KeywordList {
+		if keyword := strings.TrimSpace(item.Keyword); keyword != "" {
+			result.Keywords = append(result.Keywords, keyword)
+		}
+	}
+	return result, nil
+}
+
+func validateRoomShieldKeyword(keyword string) (string, error) {
+	keyword = strings.TrimSpace(keyword)
+	if keyword == "" {
+		return "", fmt.Errorf("屏蔽词不能为空")
+	}
+	if len([]rune(keyword)) > 15 {
+		return "", fmt.Errorf("屏蔽词最多 15 个字")
+	}
+	return keyword, nil
+}
+
+func (c *Client) AddRoomShieldKeyword(ctx context.Context, roomID, keyword, sessdata, biliJCT string) error {
+	if err := validateLiveUserID("房间号", roomID); err != nil {
+		return err
+	}
+	keyword, err := validateRoomShieldKeyword(keyword)
+	if err != nil {
+		return err
+	}
+	return c.roomManagementAction(ctx, "AddShieldKeyword", "添加直播间屏蔽词", sessdata, biliJCT, url.Values{"room_id": {roomID}, "keyword": {keyword}})
+}
+
+func (c *Client) DeleteRoomShieldKeyword(ctx context.Context, roomID, keyword, sessdata, biliJCT string) error {
+	if err := validateLiveUserID("房间号", roomID); err != nil {
+		return err
+	}
+	keyword, err := validateRoomShieldKeyword(keyword)
+	if err != nil {
+		return err
+	}
+	return c.roomManagementAction(ctx, "DeleteShieldKeyword", "删除直播间屏蔽词", sessdata, biliJCT, url.Values{"room_id": {roomID}, "keyword": {keyword}})
+}
+
+type RoomSilentState struct {
+	Enabled          bool
+	Audience         string
+	Level            int
+	DurationMinutes  int
+	RemainingSeconds int
+}
+
+const (
+	RoomSilentAll       = "all"
+	RoomSilentNonFans   = "follow"
+	RoomSilentWealth    = "wealth"
+	RoomSilentMedal     = "medal"
+	RoomSilentNonMember = "member"
+	RoomSilentOff       = "off"
+)
+
+func (c *Client) GetRoomSilentState(ctx context.Context, roomID, sessdata, biliJCT string) (RoomSilentState, error) {
+	if err := validateLiveUserID("房间号", roomID); err != nil {
+		return RoomSilentState{}, err
+	}
+	var raw struct {
+		Code    int    `json:"code"`
+		Message string `json:"message"`
+		Msg     string `json:"msg"`
+		Data    struct {
+			Type   string        `json:"type"`
+			Level  flexibleInt64 `json:"level"`
+			Minute flexibleInt64 `json:"minute"`
+			Second flexibleInt64 `json:"second"`
+		} `json:"data"`
+	}
+	if err := c.getLiveEndpointJSON(ctx, "GetRoomSilent", sessdata, biliJCT, url.Values{"room_id": {roomID}}, &raw); err != nil {
+		return RoomSilentState{}, fmt.Errorf("获取直播间全局禁言状态失败: %w", err)
+	}
+	if raw.Code != 0 {
+		return RoomSilentState{}, fmt.Errorf("获取直播间全局禁言状态失败（错误码 %d）：%s", raw.Code, responseMessage(raw.Message, raw.Msg))
+	}
+	audience := strings.TrimSpace(raw.Data.Type)
+	return RoomSilentState{
+		Enabled:          audience != "" && audience != RoomSilentOff && int(raw.Data.Second) != 0,
+		Audience:         audience,
+		Level:            int(raw.Data.Level),
+		DurationMinutes:  int(raw.Data.Minute),
+		RemainingSeconds: int(raw.Data.Second),
+	}, nil
+}
+
+func validateRoomSilent(audience string, level, minutes int) error {
+	switch audience {
+	case RoomSilentOff, RoomSilentAll, RoomSilentNonFans, RoomSilentNonMember:
+		if level != 1 {
+			return fmt.Errorf("该全局禁言类型不使用等级")
+		}
+	case RoomSilentWealth:
+		if level < 1 || level > 80 {
+			return fmt.Errorf("财富等级必须在 1 到 80 之间")
+		}
+	case RoomSilentMedal:
+		if level < 1 || level > 120 {
+			return fmt.Errorf("粉丝牌等级必须在 1 到 120 之间")
+		}
+	default:
+		return fmt.Errorf("无效的全局禁言类型：%s", audience)
+	}
+	if minutes < 0 {
+		return fmt.Errorf("全局禁言时长不能为负数")
+	}
+	return nil
+}
+
+func (c *Client) SetRoomSilentState(ctx context.Context, roomID, audience string, level, minutes int, sessdata, biliJCT string) error {
+	if err := validateLiveUserID("房间号", roomID); err != nil {
+		return err
+	}
+	audience = strings.TrimSpace(audience)
+	if err := validateRoomSilent(audience, level, minutes); err != nil {
+		return err
+	}
+	return c.roomManagementAction(ctx, "SetRoomSilent", "设置直播间全局禁言", sessdata, biliJCT, url.Values{
+		"room_id": {roomID},
+		"type":    {audience},
+		"level":   {strconv.Itoa(level)},
+		"minute":  {strconv.Itoa(minutes)},
+	})
+}
+
 type roomInfoWire struct {
+	AnchorID       flexibleID     `json:"uid"`
 	RoomID         flexibleID     `json:"room_id"`
 	Title          string         `json:"title"`
 	Description    string         `json:"description"`
@@ -294,6 +919,7 @@ func (c *Client) getRoomSnapshotAt(ctx context.Context, path, roomID string) (Ro
 		watched = int64(*raw.Data.WatchedShow.Num)
 	}
 	return RoomSnapshot{
+		AnchorID:       string(info.AnchorID),
 		RoomID:         string(info.RoomID),
 		Title:          info.Title,
 		Description:    info.Description,
@@ -859,6 +1485,47 @@ type flexibleID string
 
 type flexibleInt64 int64
 
+type flexibleBool bool
+
+func (value *flexibleBool) UnmarshalJSON(data []byte) error {
+	trimmed := strings.TrimSpace(string(data))
+	if trimmed == "" || trimmed == "null" {
+		*value = false
+		return nil
+	}
+	if trimmed == "true" || trimmed == "false" {
+		var boolean bool
+		if err := json.Unmarshal(data, &boolean); err != nil {
+			return err
+		}
+		*value = flexibleBool(boolean)
+		return nil
+	}
+	if strings.HasPrefix(trimmed, `"`) {
+		var text string
+		if err := json.Unmarshal(data, &text); err != nil {
+			return err
+		}
+		text = strings.TrimSpace(strings.ToLower(text))
+		switch text {
+		case "", "0", "false":
+			*value = false
+			return nil
+		case "1", "true":
+			*value = true
+			return nil
+		default:
+			return fmt.Errorf("无法将 %q 解析为布尔值", text)
+		}
+	}
+	number, err := strconv.ParseInt(trimmed, 10, 64)
+	if err != nil {
+		return err
+	}
+	*value = flexibleBool(number != 0)
+	return nil
+}
+
 func (value *flexibleInt64) UnmarshalJSON(data []byte) error {
 	if string(data) == "null" || len(data) == 0 {
 		*value = 0
@@ -1158,6 +1825,94 @@ func (c *Client) postLiveCookieForm(ctx context.Context, endpointName, sessdata,
 		"Origin":     []string{"https://live.bilibili.com"},
 	}
 	return c.postFormWithHeaders(ctx, path, params, out, headers)
+}
+
+func validateLiveUserID(label, value string) error {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return fmt.Errorf("%s不能为空", label)
+	}
+	parsed, err := strconv.ParseInt(value, 10, 64)
+	if err != nil || parsed <= 0 {
+		return fmt.Errorf("%s必须是正整数", label)
+	}
+	return nil
+}
+
+func (c *Client) getLiveCookieJSON(ctx context.Context, path, sessdata, biliJCT string, out any) error {
+	if strings.TrimSpace(sessdata) == "" || strings.TrimSpace(biliJCT) == "" {
+		return fmt.Errorf("调用直播接口需要有效的 SESSDATA 和 bili_jct")
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.endpoint(path), nil)
+	if err != nil {
+		return err
+	}
+	setBilibiliBrowserHeaders(req)
+	req.Header.Set("Cookie", browserCookie(sessdata, biliJCT))
+	req.Header.Set("Referer", "https://live.bilibili.com/")
+	resp, err := c.HTTPClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("B 站接口返回 HTTP %d", resp.StatusCode)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxAPIResponseBytes+1))
+	if err != nil {
+		return err
+	}
+	if int64(len(body)) > maxAPIResponseBytes {
+		return fmt.Errorf("B 站接口响应超过 %d MiB 限制", maxAPIResponseBytes/(1024*1024))
+	}
+	if err := json.Unmarshal(body, out); err != nil {
+		return fmt.Errorf("解析 B 站响应失败: %w", err)
+	}
+	return nil
+}
+
+func (c *Client) getLiveEndpointJSON(ctx context.Context, endpointName, sessdata, biliJCT string, query url.Values, out any) error {
+	path, err := c.endpointByName(endpointName)
+	if err != nil {
+		return err
+	}
+	parsed, err := url.Parse(path)
+	if err != nil {
+		return err
+	}
+	values := parsed.Query()
+	for key, entries := range query {
+		for _, entry := range entries {
+			values.Add(key, entry)
+		}
+	}
+	parsed.RawQuery = values.Encode()
+	return c.getLiveCookieJSON(ctx, parsed.String(), sessdata, biliJCT, out)
+}
+
+func (c *Client) postRoomManagementJSON(ctx context.Context, endpointName, sessdata, biliJCT string, params url.Values, out any) error {
+	values := make(url.Values, len(params)+2)
+	for key, entries := range params {
+		values[key] = append([]string(nil), entries...)
+	}
+	values.Set("csrf", biliJCT)
+	values.Set("csrf_token", biliJCT)
+	return c.postLiveCookieForm(ctx, endpointName, sessdata, biliJCT, values, out)
+}
+
+func (c *Client) roomManagementAction(ctx context.Context, endpointName, action, sessdata, biliJCT string, params url.Values) error {
+	var raw struct {
+		Code    int    `json:"code"`
+		Message string `json:"message"`
+		Msg     string `json:"msg"`
+	}
+	if err := c.postRoomManagementJSON(ctx, endpointName, sessdata, biliJCT, params, &raw); err != nil {
+		return fmt.Errorf("%s失败: %w", action, err)
+	}
+	if raw.Code != 0 {
+		return fmt.Errorf("%s失败（错误码 %d）：%s", action, raw.Code, responseMessage(raw.Message, raw.Msg))
+	}
+	return nil
 }
 
 // UpdateRoomNews 更新直播间公告。

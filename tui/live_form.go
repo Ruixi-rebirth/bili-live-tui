@@ -260,6 +260,31 @@ func focusedLabelDropDown(field tview.FormItem) tview.FormItem {
 	return &focusedLabelItem{FormItem: field}
 }
 
+// Ctrl+U 清空当前获得焦点的可编辑字段。把处理器装在字段本身，
+// 开播页和直播中的资料编辑页无需分别维护一套全局快捷键判断。
+func enableClearInputShortcut(field *tview.InputField) {
+	field.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		if matchesControlShortcut(event, tcell.KeyCtrlU, 'u') {
+			field.SetText("")
+			// SetText 不会主动刷新 InputField 的自动补全列表。
+			// 立即重算，避免分区字段继续保留清空前的旧候选项。
+			field.Autocomplete()
+			return nil
+		}
+		return event
+	})
+}
+
+func enableClearTextAreaShortcut(field *tview.TextArea) {
+	field.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		if matchesControlShortcut(event, tcell.KeyCtrlU, 'u') {
+			field.SetText("", false)
+			return nil
+		}
+		return event
+	})
+}
+
 func styleLabel(item tview.FormItem, focused bool) {
 	var style tcell.Style
 	switch field := item.(type) {
@@ -359,6 +384,20 @@ func newLiveFormWithOptions(areas []api.LiveArea, initial *api.LiveSettings, tit
 		if initial.Orientation == api.OrientationPortrait {
 			state.orientation.SetCurrentOption(1)
 		}
+	}
+	for _, field := range []*tview.InputField{
+		state.title,
+		state.tags,
+		state.area.field,
+		state.cover,
+		state.obsHost,
+		state.obsPort,
+		state.obsPassword,
+	} {
+		enableClearInputShortcut(field)
+	}
+	for _, field := range []*tview.TextArea{state.description, state.announcement} {
+		enableClearTextAreaShortcut(field)
 	}
 
 	form := styleForm(tview.NewForm(), title)
@@ -655,6 +694,10 @@ func newAreaField(areas []api.LiveArea) *areaField {
 
 func (a *areaField) matches(query string) []areaOption {
 	query = strings.ToLower(strings.TrimSpace(query))
+	// 空查询不展示候选列表，让 Ctrl+U 真正清空并关闭之前的搜索结果。
+	if query == "" {
+		return nil
+	}
 	result := make([]areaOption, 0, 10)
 	for _, option := range a.options {
 		if query != "" && !strings.Contains(strings.ToLower(option.label), query) {

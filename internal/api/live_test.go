@@ -51,7 +51,7 @@ func TestLiveSettingsValidate(t *testing.T) {
 }
 
 func TestEndpointCatalog(t *testing.T) {
-	for _, name := range []string{"GetMyRoomID", "GetRoomSnapshot", "GetOnlineGoldRank", "GetRoomPlaybackURL", "GetDanmakuInfo", "GetDanmakuInfoLegacy", "SendDanmaku", "GetLiveAreas", "UploadRoomCover", "AddLiveTag", "DeleteLiveTag", "UpdateRoomNews", "UpdatePreLiveInfo", "UpdateLiveInfo", "StartLive", "StopLive", "GetTVQRCode", "CheckQRStatus"} {
+	for _, name := range []string{"GetMyRoomID", "GetRoomSnapshot", "GetOnlineGoldRank", "GetRoomPlaybackURL", "GetDanmakuInfo", "GetDanmakuInfoLegacy", "GetDanmakuUserInfo", "GetUserCard", "ModifyUserRelation", "GetRoomAdminSenior", "GetRoomAdmins", "AppointRoomAdmin", "DismissRoomAdmin", "SearchRoomUser", "GetMutedUsers", "MuteRoomUser", "UnmuteRoomUser", "GetRoomBlacklist", "BlacklistRoomUser", "UnblacklistRoomUser", "GetShieldKeywords", "AddShieldKeyword", "DeleteShieldKeyword", "GetRoomSilent", "SetRoomSilent", "SendDanmaku", "GetLiveAreas", "UploadRoomCover", "AddLiveTag", "DeleteLiveTag", "UpdateRoomNews", "UpdatePreLiveInfo", "UpdateLiveInfo", "StartLive", "StopLive", "GetTVQRCode", "CheckQRStatus"} {
 		endpoint, ok := EndpointByName(name)
 		if !ok || endpoint.Path == "" || endpoint.Method == "" {
 			t.Fatalf("endpoint %q missing from catalog", name)
@@ -126,7 +126,7 @@ func TestGetRoomSnapshot(t *testing.T) {
 		}
 		return &http.Response{
 			StatusCode: http.StatusOK,
-			Body:       io.NopCloser(strings.NewReader(`{"code":0,"data":{"room_info":{"room_id":1,"title":"标题","description":"简介","tags":"游戏,聊天","area_name":"单机游戏","parent_area_name":"主机游戏","live_status":1,"online":"42"},"watched_show":{"num":1234}}}`)),
+			Body:       io.NopCloser(strings.NewReader(`{"code":0,"data":{"room_info":{"uid":99,"room_id":1,"title":"标题","description":"简介","tags":"游戏,聊天","area_name":"单机游戏","parent_area_name":"主机游戏","live_status":1,"online":"42"},"watched_show":{"num":1234}}}`)),
 			Header:     make(http.Header),
 		}, nil
 	})
@@ -136,8 +136,140 @@ func TestGetRoomSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetRoomSnapshot() error = %v", err)
 	}
-	if snapshot.RoomID != "1" || snapshot.AreaName != "单机游戏" || snapshot.Online != 42 || !snapshot.OnlineKnown || snapshot.Watched != 1234 || !snapshot.WatchedKnown {
+	if snapshot.AnchorID != "99" || snapshot.RoomID != "1" || snapshot.AreaName != "单机游戏" || snapshot.Online != 42 || !snapshot.OnlineKnown || snapshot.Watched != 1234 || !snapshot.WatchedKnown {
 		t.Fatalf("GetRoomSnapshot() = %#v", snapshot)
+	}
+}
+
+func TestGetRoomManagementCapabilitiesUsesBadgePermissionsAndAnchorIdentity(t *testing.T) {
+	transport := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		switch r.URL.Path {
+		case "/xlive/web-room/v1/index/getInfoByUser":
+			if r.URL.Query().Get("room_id") != "1" || r.Header.Get("Cookie") != "SESSDATA=sess; bili_jct=jct" {
+				t.Errorf("capability request = %s, cookie %q", r.URL.String(), r.Header.Get("Cookie"))
+			}
+			return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"code":0,"data":{"info":{"uid":"99"},"badge":{"is_room_admin":1,"admin_level":"2","permissions":[1,"2",100]}}}`)), Header: make(http.Header)}, nil
+		case "/xlive/web-room/v1/index/getInfoByRoom":
+			return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"code":0,"data":{"room_info":{"uid":99,"room_id":1}}}`)), Header: make(http.Header)}, nil
+		default:
+			return nil, fmt.Errorf("unexpected path %s", r.URL.Path)
+		}
+	})
+	client := NewClient(&http.Client{Transport: transport})
+	client.BaseURL = "http://test.invalid"
+	capabilities, err := client.GetRoomManagementCapabilities(context.Background(), "1", "sess", "jct")
+	if err != nil {
+		t.Fatalf("GetRoomManagementCapabilities() error = %v", err)
+	}
+	if capabilities.UserID != "99" || capabilities.AnchorID != "99" || !capabilities.IsAnchor || !capabilities.IsAdmin || capabilities.AdminLevel != 2 || !capabilities.HasPermission(RoomPermissionBlacklist) {
+		t.Fatalf("capabilities = %#v", capabilities)
+	}
+	if !capabilities.CanMute(2) || !capabilities.CanBlacklist(99) {
+		t.Fatalf("anchor capabilities should override target admin level: %#v", capabilities)
+	}
+}
+
+func TestRoomManagementPermissionHierarchy(t *testing.T) {
+	capabilities := RoomManagementCapabilities{IsAdmin: true, AdminLevel: 2, Permissions: []int{RoomPermissionMute}}
+	if !capabilities.CanMute(1) || capabilities.CanMute(2) || capabilities.CanBlacklist(0) {
+		t.Fatalf("permission hierarchy mismatch: %#v", capabilities)
+	}
+}
+
+func TestRoomManagementMutationsMatchWebRequests(t *testing.T) {
+	wantPath := ""
+	wantValues := url.Values{}
+	transport := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.Method != http.MethodPost || r.URL.Path != wantPath {
+			t.Errorf("request = %s %s, want POST %s", r.Method, r.URL.Path, wantPath)
+		}
+		body, _ := io.ReadAll(r.Body)
+		values, err := url.ParseQuery(string(body))
+		if err != nil {
+			t.Errorf("parse form: %v", err)
+		}
+		for key, want := range wantValues {
+			if got := values[key]; fmt.Sprint(got) != fmt.Sprint(want) {
+				t.Errorf("%s = %v, want %v", key, got, want)
+			}
+		}
+		if values.Get("csrf") != "jct" || values.Get("csrf_token") != "jct" {
+			t.Errorf("csrf values = %v", values)
+		}
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"code":0}`)), Header: make(http.Header)}, nil
+	})
+	client := NewClient(&http.Client{Transport: transport})
+	client.BaseURL = "http://test.invalid"
+
+	wantPath = "/xlive/web-ucenter/v1/banned/AddSilentUser"
+	wantValues = url.Values{"room_id": {"1"}, "tuid": {"42"}, "msg": {"原弹幕"}, "mobile_app": {"web"}, "type": {"1"}, "hour": {"168"}}
+	if err := client.MuteRoomUser(context.Background(), "1", "42", "原弹幕", RoomMuteSevenDays, "sess", "jct"); err != nil {
+		t.Fatalf("MuteRoomUser() error = %v", err)
+	}
+
+	wantPath = "/xlive/app-ucenter/v2/xbanned/banned/AddBlack"
+	wantValues = url.Values{"anchor_id": {"99"}, "tuid": {"42"}, "spmid": {"444.8.0.0"}}
+	if err := client.BlacklistRoomUser(context.Background(), "99", "42", "sess", "jct"); err != nil {
+		t.Fatalf("BlacklistRoomUser() error = %v", err)
+	}
+
+	wantPath = "/xlive/web-room/v1/banned/RoomSilent"
+	wantValues = url.Values{"room_id": {"1"}, "type": {"wealth"}, "level": {"80"}, "minute": {"0"}}
+	if err := client.SetRoomSilentState(context.Background(), "1", RoomSilentWealth, 80, 0, "sess", "jct"); err != nil {
+		t.Fatalf("SetRoomSilentState() error = %v", err)
+	}
+}
+
+func TestRoomManagementInputValidation(t *testing.T) {
+	client := NewClient(&http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return nil, fmt.Errorf("request should not be sent")
+	})})
+	if err := client.AddRoomShieldKeyword(context.Background(), "1", strings.Repeat("词", 16), "sess", "jct"); err == nil {
+		t.Fatal("overlong shield keyword was accepted")
+	}
+	if err := client.SetRoomSilentState(context.Background(), "1", RoomSilentWealth, 81, 0, "sess", "jct"); err == nil {
+		t.Fatal("invalid wealth level was accepted")
+	}
+	if err := client.MuteRoomUser(context.Background(), "1", "0", "", RoomMutePermanent, "sess", "jct"); err == nil {
+		t.Fatal("invalid target UID was accepted")
+	}
+}
+
+func TestRoomManagementListResponses(t *testing.T) {
+	transport := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		var response string
+		switch r.URL.Path {
+		case "/xlive/app-ucenter/v1/roomAdmin/get_by_anchor":
+			response = `{"code":0,"data":{"data":[{"uid":42,"uname":"房管甲","ctime":"2026-09-01","admin_level":2}],"page":{"page":1,"total_page":3},"max_room_anchors_number":10}}`
+		case "/xlive/web-ucenter/v1/banned/GetSilentUserList":
+			response = `{"code":0,"data":{"data":[{"tuid":43,"tname":"用户乙","name":"主播","block_end_time":"永久","admin_level":0,"is_anchor":1}]}}`
+		case "/xlive/app-ucenter/v2/xbanned/banned/GetBlackList":
+			response = `{"code":0,"data":{"data":[{"uid":44,"name":"用户丙","mtime":"2026-09-02","operator_name":"主播"}]}}`
+		case "/xlive/web-ucenter/v1/banned/GetShieldKeywordList":
+			response = `{"code":0,"data":{"keyword_list":[{"keyword":"测试词"}],"max_limit":20}}`
+		default:
+			return nil, fmt.Errorf("unexpected path %s", r.URL.Path)
+		}
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(response)), Header: make(http.Header)}, nil
+	})
+	client := NewClient(&http.Client{Transport: transport})
+	client.BaseURL = "http://test.invalid"
+
+	admins, err := client.GetRoomAdmins(context.Background(), 1, "sess", "jct")
+	if err != nil || len(admins.Items) != 1 || admins.Items[0].Level != 2 || admins.TotalPages != 3 || admins.MaxCount != 10 {
+		t.Fatalf("admins = %#v, err = %v", admins, err)
+	}
+	muted, err := client.GetMutedRoomUsers(context.Background(), "1", 1, "sess", "jct")
+	if err != nil || len(muted) != 1 || muted[0].UserID != "43" || !muted[0].OperatorIsAnchor {
+		t.Fatalf("muted = %#v, err = %v", muted, err)
+	}
+	blacklist, err := client.GetRoomBlacklist(context.Background(), "99", 1, 10, "sess", "jct")
+	if err != nil || len(blacklist.Items) != 1 || blacklist.Items[0].Username != "用户丙" || blacklist.Items[0].CreatedAt != "2026-09-02" || blacklist.Total != 1 {
+		t.Fatalf("blacklist = %#v, err = %v", blacklist, err)
+	}
+	keywords, err := client.GetRoomShieldKeywords(context.Background(), "1", "sess", "jct")
+	if err != nil || len(keywords.Keywords) != 1 || keywords.Keywords[0] != "测试词" || keywords.MaxCount != 20 {
+		t.Fatalf("keywords = %#v, err = %v", keywords, err)
 	}
 }
 

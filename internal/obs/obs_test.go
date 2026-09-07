@@ -89,6 +89,17 @@ func TestApplyHealthSampleTracksOutputAndUnexpectedStop(t *testing.T) {
 	default:
 	}
 
+	runtime.applyHealthSample(healthSample{reconnecting: true, bytes: 2000}, now.Add(time.Second))
+	health = runtime.Health()
+	if health.Active || !health.Reconnecting || !strings.Contains(health.LastError, "正在重连") {
+		t.Fatalf("reconnecting output health = %#v", health)
+	}
+	select {
+	case <-runtime.Done():
+		t.Fatal("reconnecting OBS output was reported as done")
+	default:
+	}
+
 	runtime.applyHealthSample(healthSample{bytes: 2000}, now.Add(2*time.Second))
 	health = runtime.Health()
 	if health.Active || health.LastError != "OBS 推流已意外停止" {
@@ -151,6 +162,49 @@ func TestSuccessfulHealthSampleResetsControlReconnectWindow(t *testing.T) {
 	}
 }
 
+func TestOutputReconnectStopsAfterWindow(t *testing.T) {
+	runtime := NewRuntime("", "", "")
+	started := time.Unix(100, 0)
+	runtime.applyHealthSample(healthSample{reconnecting: true}, started)
+	select {
+	case <-runtime.Done():
+		t.Fatal("OBS reconnect stopped before its window elapsed")
+	default:
+	}
+	runtime.applyHealthSample(healthSample{reconnecting: true}, started.Add(obsOutputReconnectWindow-time.Second))
+	select {
+	case <-runtime.Done():
+		t.Fatal("OBS reconnect stopped before its deadline")
+	default:
+	}
+	runtime.applyHealthSample(healthSample{reconnecting: true}, started.Add(obsOutputReconnectWindow))
+	health := runtime.Health()
+	if health.Active || health.Reconnecting || !strings.Contains(health.LastError, "60 秒内未恢复") {
+		t.Fatalf("timed-out output health = %#v", health)
+	}
+	select {
+	case <-runtime.Done():
+	default:
+		t.Fatal("output reconnect timeout did not close Done")
+	}
+}
+
+func TestSuccessfulOutputResetsReconnectWindow(t *testing.T) {
+	runtime := NewRuntime("", "", "")
+	started := time.Unix(100, 0)
+	runtime.applyHealthSample(healthSample{reconnecting: true}, started)
+	runtime.applyHealthSample(healthSample{active: true}, started.Add(30*time.Second))
+	if !runtime.outputReconnectAt.IsZero() {
+		t.Fatalf("output reconnect timestamp = %v, want reset", runtime.outputReconnectAt)
+	}
+	runtime.applyHealthSample(healthSample{reconnecting: true}, started.Add(obsOutputReconnectWindow+time.Second))
+	select {
+	case <-runtime.Done():
+		t.Fatal("new output reconnect reused the previous reconnect window")
+	default:
+	}
+}
+
 func TestRetryOBSNotReadyEventuallySucceeds(t *testing.T) {
 	attempts := 0
 	err := retryOBSNotReady(3, 0, func() error {
@@ -206,6 +260,23 @@ func TestOBSStopErrorClassification(t *testing.T) {
 	for _, message := range []string{"request StopStream: OutputNotRunning (501)", "output is not active"} {
 		if !isOBSOutputNotRunning(assertError(message)) {
 			t.Fatalf("inactive output error %q was not recognized", message)
+		}
+	}
+}
+
+func TestOBSOutputRunningIncludesAutomaticReconnect(t *testing.T) {
+	for _, state := range []struct {
+		active       bool
+		reconnecting bool
+		want         bool
+	}{
+		{active: true, want: true},
+		{reconnecting: true, want: true},
+		{active: true, reconnecting: true, want: true},
+		{},
+	} {
+		if got := isOBSOutputRunning(state.active, state.reconnecting); got != state.want {
+			t.Fatalf("isOBSOutputRunning(%v, %v) = %v, want %v", state.active, state.reconnecting, got, state.want)
 		}
 	}
 }

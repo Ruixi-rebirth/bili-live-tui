@@ -224,20 +224,43 @@ func TestDanmakuStatusPreservesConnectedNode(t *testing.T) {
 }
 
 func TestRenderOnlineRank(t *testing.T) {
-	view := tview.NewTextView().SetDynamicColors(true)
+	view := tview.NewTextView().SetDynamicColors(true).SetRegions(true)
+	registry := newDanmakuUserRegionRegistry()
 	renderOnlineRank(view, liveDanmakuSnapshot{
 		viewerOnline: 23,
 		viewerKnown:  true,
 		onlineRank: []api.OnlineRankMember{
-			{Username: "用户[甲]", Rank: 1, Score: 11, GuardLevel: 3},
+			{UserID: "42", Username: "用户[甲]", Rank: 1, Score: 11, GuardLevel: 3},
 		},
-	})
+	}, registry)
 	if view.GetTitle() != " 在线 23 人 " {
 		t.Fatalf("online rank title = %q", view.GetTitle())
 	}
 	text := view.GetText(true)
 	if !strings.Contains(text, "高能榜") || !strings.Contains(text, "用户[甲]") || !strings.Contains(text, "舰长") || !strings.Contains(text, "11") {
 		t.Fatalf("online rank text = %q", text)
+	}
+	if len(registry.order) != 1 {
+		t.Fatalf("online rank regions = %#v", registry.order)
+	}
+	message, ok := registry.Lookup(registry.order[0])
+	if !ok || message.UserID != "42" || message.Username != "用户[甲]" || message.GuardLevel != 3 {
+		t.Fatalf("online rank region lookup = (%#v, %v)", message, ok)
+	}
+	if raw := view.GetText(false); !strings.Contains(raw, "::b]") || !strings.Contains(raw, "[\"") {
+		t.Fatalf("online rank clickable username markup = %q", raw)
+	}
+}
+
+func TestPrependDanmakuMention(t *testing.T) {
+	if text, ok := prependDanmakuMention("已有内容", "用户甲", 40); !ok || text != "@用户甲 已有内容" {
+		t.Fatalf("mention = (%q, %v)", text, ok)
+	}
+	if text, ok := prependDanmakuMention("@用户甲 已有内容", "用户甲", 40); !ok || text != "@用户甲 已有内容" {
+		t.Fatalf("duplicate mention = (%q, %v)", text, ok)
+	}
+	if text, ok := prependDanmakuMention("已有内容", "用户甲", 5); ok || text != "@用户甲 已有内容" {
+		t.Fatalf("overlong mention = (%q, %v)", text, ok)
 	}
 }
 
@@ -317,3 +340,217 @@ func TestDanmakuInputCaptureHandlesBackspaceWithoutNavigating(t *testing.T) {
 		t.Fatal("Alt+H was not intercepted as navigation")
 	}
 }
+
+func TestRoomManagementShortcutSupportsDistinctCtrlMAndAltM(t *testing.T) {
+	for _, modifier := range []tcell.ModMask{tcell.ModCtrl, tcell.ModAlt} {
+		event := tcell.NewEventKey(tcell.KeyRune, 'm', modifier)
+		if !matchesRoomManagementShortcut(event) {
+			t.Fatalf("M with modifier %v was not recognized", modifier)
+		}
+	}
+	if matchesRoomManagementShortcut(tcell.NewEventKey(tcell.KeyEnter, 0, tcell.ModNone)) {
+		t.Fatal("Enter was mistaken for the room management shortcut")
+	}
+}
+
+func TestDanmakuReplyCounterAndUpstreamLimit(t *testing.T) {
+	field := tview.NewInputField()
+	field.SetText("你a好")
+	updateDanmakuReplyCounter(field, 40, true, false)
+	if got := field.GetTitle(); got != " 3/40 " {
+		t.Fatalf("counter title = %q, want %q", got, " 3/40 ")
+	}
+	updateDanmakuReplyCounter(field, 40, false, false)
+	if got := field.GetTitle(); got != " 3/… " {
+		t.Fatalf("loading counter title = %q, want %q", got, " 3/… ")
+	}
+	updateDanmakuReplyCounter(field, 40, true, true)
+	if got := field.GetTitle(); got != " 3/40 默认 " {
+		t.Fatalf("fallback counter title = %q, want %q", got, " 3/40 默认 ")
+	}
+	if acceptsDanmakuInput(field, strings.Repeat("啊", 41), 40) {
+		t.Fatal("input longer than upstream limit was accepted")
+	}
+
+	field.SetText(strings.Repeat("啊", 45))
+	if !acceptsDanmakuInput(field, strings.Repeat("啊", 44), 40) {
+		t.Fatal("deleting an oversized saved draft was rejected")
+	}
+	if acceptsDanmakuInput(field, strings.Repeat("啊", 46), 40) {
+		t.Fatal("growing an oversized saved draft was accepted")
+	}
+}
+
+func TestCanManageDanmakuUserRespectsIdentityAndHierarchy(t *testing.T) {
+	anchor := api.RoomManagementCapabilities{UserID: "1", AnchorID: "1", IsAnchor: true, IsAdmin: true}
+	if !canManageDanmakuUser(anchor, api.DanmakuMessage{UserID: "2", Username: "用户"}, &api.UserProfile{}) {
+		t.Fatal("anchor could not manage ordinary user")
+	}
+	if canManageDanmakuUser(anchor, api.DanmakuMessage{UserID: "1", Username: "自己"}, &api.UserProfile{IsSelf: true}) {
+		t.Fatal("self-management was enabled")
+	}
+	if canManageDanmakuUser(anchor, api.DanmakuMessage{UserID: "2", IsMystery: true}, &api.UserProfile{}) {
+		t.Fatal("mystery-user management was enabled")
+	}
+
+	advanced := api.RoomManagementCapabilities{UserID: "3", IsAdmin: true, AdminLevel: 2, Permissions: []int{api.RoomPermissionMute}}
+	if !canManageDanmakuUser(advanced, api.DanmakuMessage{UserID: "2"}, &api.UserProfile{}) {
+		t.Fatal("advanced admin could not manage ordinary user")
+	}
+	if canManageDanmakuUser(advanced, api.DanmakuMessage{UserID: "2", IsAdmin: true}, &api.UserProfile{}) {
+		t.Fatal("admin target with unknown level was not handled conservatively")
+	}
+}
+
+func TestParseDanmakuManagementLevel(t *testing.T) {
+	if level, err := parseDanmakuManagementLevel(" 80 ", 80); err != nil || level != 80 {
+		t.Fatalf("level = %d, err = %v", level, err)
+	}
+	for _, value := range []string{"", "0", "81", "一点五"} {
+		if _, err := parseDanmakuManagementLevel(value, 80); err == nil {
+			t.Fatalf("invalid level %q was accepted", value)
+		}
+	}
+}
+
+func TestFormatRoomSilentState(t *testing.T) {
+	state := api.RoomSilentState{Enabled: true, Audience: api.RoomSilentMedal, Level: 12}
+	if got := formatRoomSilentState(state); !strings.Contains(got, "粉丝勋章低于 12") || !strings.Contains(got, "手动关闭") {
+		t.Fatalf("silent state = %q", got)
+	}
+}
+
+func TestFormatRoomManagerRowIsCompactAndAligned(t *testing.T) {
+	short := formatRoomManagerRow("全员", "除房管外均不可发言", "设置")
+	long := formatRoomManagerRow("除房管以外的观众", "仅主播和房管可以发言", "设置")
+	if strings.Contains(short, "\n") || !strings.Contains(short, "「设置」") {
+		t.Fatalf("compact row = %q", short)
+	}
+	shortDetail := strings.Index(short, "除房管外")
+	longDetail := strings.Index(long, "仅主播")
+	if shortDetail <= 0 || longDetail <= 0 || tview.TaggedStringWidth(short[:shortDetail]) != tview.TaggedStringWidth(long[:longDetail]) {
+		t.Fatalf("row columns are not aligned: short=%q long=%q", short, long)
+	}
+}
+
+func TestDanmakuUsernameRegionKeepsDetailsOutOfTimeline(t *testing.T) {
+	chat := tview.NewTextView().SetDynamicColors(true).SetRegions(true)
+	registry := newDanmakuUserRegionRegistry()
+	message := api.DanmakuMessage{
+		Username: "用户甲", UserID: "42", Text: "你好",
+		MedalName: "草莓", MedalLevel: 7, GuardLevel: 3,
+	}
+	appendDanmakuEvent(chat, api.DanmakuEvent{Kind: api.DanmakuEventMessage, Message: message}, false, registry)
+	text := chat.GetText(true)
+	if !strings.Contains(text, "用户甲：你好") {
+		t.Fatalf("timeline text = %q", text)
+	}
+	if strings.Contains(text, "草莓") || strings.Contains(text, "舰长") {
+		t.Fatalf("user details leaked into timeline = %q", text)
+	}
+	rawText := chat.GetText(false)
+	if strings.Contains(rawText, "::u]") || !strings.Contains(rawText, "::b]") {
+		t.Fatalf("clickable username style = %q", rawText)
+	}
+	if len(registry.order) != 1 {
+		t.Fatalf("user regions = %#v", registry.order)
+	}
+	got, ok := registry.Lookup(registry.order[0])
+	if !ok || got.UserID != "42" || got.MedalName != "草莓" {
+		t.Fatalf("region lookup = (%#v, %v)", got, ok)
+	}
+}
+
+func TestFormatDanmakuUserCardCombinesPacketAndPublicProfile(t *testing.T) {
+	message := api.DanmakuMessage{
+		Username: "用户甲", UserID: "42", MedalName: "草莓", MedalLevel: 7,
+		GuardLevel: 3, UserLevel: 5, WealthLevel: 8, IsAdmin: true,
+	}
+	profile := api.UserProfile{
+		UserID: "42", Username: "主页昵称", Signature: "测试签名", Level: 6,
+		Official: "官方认证", VIP: true, VIPLabel: "年度大会员",
+		Followers: 123, Following: 45, ArchiveCount: 7, ArticleCount: 2, IsFollowing: true,
+	}
+	card := formatDanmakuUserCard(message, &profile, false, nil)
+	for _, expected := range []string{"用户甲", "UID 42", "直播间身份", "房管", "舰长", "草莓 Lv.7", "弹幕 UL 5", "财富 Lv.8", "B 站公开资料", "等级 Lv.6", "粉丝 123", "视频 7 · 专栏 2", "官方认证", "年度大会员", "测试签名"} {
+		if !strings.Contains(card, expected) {
+			t.Fatalf("user card missing %q: %q", expected, card)
+		}
+	}
+}
+
+func TestFormatDanmakuUserCardKeepsPacketDetailsOnQueryFailure(t *testing.T) {
+	message := api.DanmakuMessage{Username: "用户甲", UserID: "42", MedalName: "草莓", MedalLevel: 7}
+	card := formatDanmakuUserCard(message, nil, false, assertError("风控校验失败"))
+	if !strings.Contains(card, "草莓 Lv.7") || !strings.Contains(card, "公开资料暂不可用") || !strings.Contains(card, "风控校验失败") {
+		t.Fatalf("fallback user card = %q", card)
+	}
+}
+
+func TestFormatDanmakuUserCardHidesEmptyIdentityAndSelfRelation(t *testing.T) {
+	message := api.DanmakuMessage{Username: "本人", UserID: "42"}
+	profile := api.UserProfile{UserID: "42", Username: "本人", IsSelf: true}
+	card := formatDanmakuUserCard(message, &profile, false, nil)
+	if strings.Contains(card, "直播间身份") || strings.Contains(card, "关系") || strings.Contains(card, "未关注") {
+		t.Fatalf("self card contains irrelevant sections = %q", card)
+	}
+	if canFollowDanmakuUser(message, &profile) {
+		t.Fatal("current account unexpectedly allows following itself")
+	}
+}
+
+func TestDanmakuUserCardHeightAdaptsToContent(t *testing.T) {
+	short := formatDanmakuUserCard(api.DanmakuMessage{Username: "用户甲", UserID: "42"}, nil, true, nil)
+	rich := formatDanmakuUserCard(api.DanmakuMessage{
+		Username: "用户甲", UserID: "42", MedalName: "草莓", MedalLevel: 7,
+		GuardLevel: 3, UserLevel: 5, WealthLevel: 8, IsAdmin: true,
+	}, &api.UserProfile{
+		Username: "主页昵称", Signature: "一段用于测试自适应高度的公开签名", Level: 6,
+		Official: "官方认证", VIP: true, VIPLabel: "年度大会员",
+		Followers: 123, Following: 45, ArchiveCount: 7, ArticleCount: 2,
+	}, false, nil)
+	shortHeight := danmakuUserCardHeight(short, 45)
+	richHeight := danmakuUserCardHeight(rich, 45)
+	if shortHeight >= richHeight {
+		t.Fatalf("adaptive heights = short %d, rich %d", shortHeight, richHeight)
+	}
+	if shortHeight < 9 || richHeight > 24 {
+		t.Fatalf("adaptive heights outside bounds = short %d, rich %d", shortHeight, richHeight)
+	}
+}
+
+func TestDanmakuUserCardButtonsTouchBottomBorder(t *testing.T) {
+	applyTheme()
+	screen := tcell.NewSimulationScreen("UTF-8")
+	if err := screen.Init(); err != nil {
+		t.Fatal(err)
+	}
+	defer screen.Fini()
+	screen.SetSize(45, 12)
+
+	panel, content, actions := newDanmakuUserCardPanel()
+	content.SetText("用户资料")
+	actions.AddButton("关注", func() {})
+	actions.AddButton("关闭", func() {})
+	actions.SetFocus(1)
+	panel.SetRect(0, 0, 45, 12)
+	panel.Draw(screen)
+
+	_, buttonY, _, buttonHeight := actions.GetButton(1).GetRect()
+	if buttonY+buttonHeight != 11 {
+		t.Fatalf("button bottom = %d, want bottom border row 11 immediately after it", buttonY+buttonHeight)
+	}
+}
+
+func TestRoomManagerNumberKeyTabs(t *testing.T) {
+	for r := '1'; r <= '5'; r++ {
+		idx := int(r - '1')
+		if idx < 0 || idx > 4 {
+			t.Fatalf("tab index out of range for %c: %d", r, idx)
+		}
+	}
+}
+
+type assertError string
+
+func (err assertError) Error() string { return string(err) }

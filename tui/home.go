@@ -234,9 +234,6 @@ func RunHome(ctx context.Context, startedAt time.Time, roomID string, settings *
 	body.AddItem(actionBar, 1, 0, true)
 	setStatusText()
 	footerText := "Tab 选择　Enter 执行　Esc 下播"
-	if loader != nil {
-		footerText = "房间每 30 秒自动刷新　" + footerText
-	}
 	if healthLoader != nil || statsLoader != nil {
 		go func() {
 			ticker := time.NewTicker(2 * time.Second)

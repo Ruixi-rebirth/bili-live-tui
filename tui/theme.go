@@ -12,9 +12,11 @@ import (
 // it is automatically re-centered after a terminal resize.
 type floatingOverlay struct {
 	tview.Primitive
-	x, y, width, height int
-	preferredWidth      int
-	preferredHeight     int
+	x, y, width, height   int
+	preferredWidth        int
+	preferredHeight       int
+	opaqueBackground      bool
+	opaqueBackgroundColor tcell.Color
 }
 
 func newFloatingOverlay(content tview.Primitive, width, height int) *floatingOverlay {
@@ -23,6 +25,22 @@ func newFloatingOverlay(content tview.Primitive, width, height int) *floatingOve
 		preferredWidth:  width,
 		preferredHeight: height,
 	}
+}
+
+func (overlay *floatingOverlay) SetPreferredSize(width, height int) {
+	if overlay == nil {
+		return
+	}
+	overlay.preferredWidth = width
+	overlay.preferredHeight = height
+}
+
+func (overlay *floatingOverlay) SetOpaqueBackground(color tcell.Color) *floatingOverlay {
+	if overlay != nil {
+		overlay.opaqueBackground = true
+		overlay.opaqueBackgroundColor = color
+	}
+	return overlay
 }
 
 func (overlay *floatingOverlay) SetRect(x, y, width, height int) {
@@ -47,6 +65,21 @@ func (overlay *floatingOverlay) Draw(screen tcell.Screen) {
 	}
 	x := overlay.x + (overlay.width-width)/2
 	y := overlay.y + (overlay.height-height)/2
+	if overlay.opaqueBackground {
+		style := tcell.StyleDefault.
+			Background(overlay.opaqueBackgroundColor).
+			Foreground(tview.Styles.PrimaryTextColor)
+		// 终端里的全角字符会占两个单元格。只清理浮窗自身矩形时，紧贴
+		// 左右边缘的底层全角字符仍可能把延伸单元格画到边框上。
+		// 多清理左右各一列作为隔离带，不改变浮窗本身的位置和尺寸。
+		clearLeft := max(x-1, overlay.x)
+		clearRight := min(x+width+1, overlay.x+overlay.width)
+		for row := y; row < y+height; row++ {
+			for column := clearLeft; column < clearRight; column++ {
+				screen.SetContent(column, row, ' ', nil, style)
+			}
+		}
+	}
 	overlay.Primitive.SetRect(x, y, max(width, 1), max(height, 1))
 	overlay.Primitive.Draw(screen)
 }

@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/andybalholm/brotli"
 )
@@ -321,8 +322,51 @@ func TestSendDanmaku(t *testing.T) {
 	if err := client.SendDanmaku(context.Background(), "123", "sess", "csrf", "测试弹幕"); err != nil {
 		t.Fatalf("SendDanmaku() error = %v", err)
 	}
-	if err := client.SendDanmaku(context.Background(), "123", "sess", "csrf", strings.Repeat("啊", 81)); err == nil {
+	if err := client.SendDanmaku(context.Background(), "123", "sess", "csrf", strings.Repeat("啊", DefaultDanmakuMaxLength+1)); err == nil {
 		t.Fatal("expected length validation error")
+	}
+}
+
+func TestGetDanmakuMaxLength(t *testing.T) {
+	transport := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if got := r.URL.Path; got != "/xlive/web-room/v1/index/getInfoByUser" {
+			t.Fatalf("path = %q", got)
+		}
+		if got := r.URL.Query().Get("room_id"); got != "123" {
+			t.Fatalf("room_id = %q", got)
+		}
+		if got := r.URL.Query().Get("from"); got != "0" {
+			t.Fatalf("from = %q", got)
+		}
+		if got := r.Header.Get("Cookie"); got != "SESSDATA=sess; bili_jct=csrf" {
+			t.Fatalf("cookie = %q", got)
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(strings.NewReader(`{"code":0,"data":{"property":{"danmu":{"length":"30"}}}}`)),
+			Header:     make(http.Header),
+		}, nil
+	})
+	client := NewClient(&http.Client{Transport: transport})
+	client.BaseURL = "http://test.invalid"
+	limit, err := client.GetDanmakuMaxLength(context.Background(), "123", "sess", "csrf")
+	if err != nil {
+		t.Fatalf("GetDanmakuMaxLength() error = %v", err)
+	}
+	if limit != 30 {
+		t.Fatalf("GetDanmakuMaxLength() = %d, want 30", limit)
+	}
+}
+
+func TestSendDanmakuUsesUpstreamLimit(t *testing.T) {
+	transport := roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"code":0}`)), Header: make(http.Header)}, nil
+	})
+	client := NewClient(&http.Client{Transport: transport})
+	client.BaseURL = "http://test.invalid"
+	message := strings.Repeat("啊", DefaultDanmakuMaxLength+1)
+	if err := client.SendDanmakuWithLimit(context.Background(), "123", "sess", "csrf", message, 50); err != nil {
+		t.Fatalf("SendDanmakuWithLimit() error = %v", err)
 	}
 }
 
@@ -351,4 +395,148 @@ func makeDanmakuPacket(operation uint32, version uint16, body []byte) []byte {
 	binary.BigEndian.PutUint32(packet[12:16], 1)
 	copy(packet[danmakuHeaderLength:], body)
 	return packet
+}
+
+func TestParseDanmakuMessageIncludesStructuredUserDetails(t *testing.T) {
+	metadata := make([]any, 16)
+	metadata[15] = map[string]any{
+		"user": map[string]any{
+			"uid":    "42",
+			"base":   map[string]any{"name": "新版用户", "is_mystery": true},
+			"medal":  map[string]any{"name": "草莓", "level": 12, "guard_level": 3},
+			"wealth": map[string]any{"level": 8},
+		},
+	}
+	info := []any{metadata, "测试弹幕", []any{7, "旧用户名", 1}, []any{6, "旧粉丝牌"}, []any{5}}
+	raw, err := json.Marshal(info)
+	if err != nil {
+		t.Fatal(err)
+	}
+	event, ok, err := parseDanmuMessage(raw, "DANMU_MSG")
+	if err != nil || !ok {
+		t.Fatalf("parseDanmuMessage() = (%#v, %v, %v)", event, ok, err)
+	}
+	message := event.Message
+	if message.UserID != "42" || message.Username != "新版用户" || !message.IsAdmin || !message.IsMystery {
+		t.Fatalf("structured identity = %#v", message)
+	}
+	if message.MedalName != "草莓" || message.MedalLevel != 12 || message.GuardLevel != 3 || message.UserLevel != 5 || message.WealthLevel != 8 {
+		t.Fatalf("structured badges = %#v", message)
+	}
+}
+
+func TestParseGiftIncludesUserDetails(t *testing.T) {
+	raw := json.RawMessage(`{"uid":42,"uname":"送礼用户","giftName":"小花花","num":2,"wealth_level":7,"medal_info":{"medal_name":"草莓","medal_level":9,"guard_level":2}}`)
+	event, ok, err := parseGift(raw, "SEND_GIFT")
+	if err != nil || !ok {
+		t.Fatalf("parseGift() = (%#v, %v, %v)", event, ok, err)
+	}
+	message := event.Message
+	if message.MedalName != "草莓" || message.MedalLevel != 9 || message.GuardLevel != 2 || message.WealthLevel != 7 {
+		t.Fatalf("gift user details = %#v", message)
+	}
+}
+
+func TestGetUserProfileParsesPublicCard(t *testing.T) {
+	transport := roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		if request.URL.Path != "/x/web-interface/card" || request.URL.Query().Get("mid") != "42" {
+			t.Fatalf("user card request = %s", request.URL.String())
+		}
+		if got := request.Header.Get("Referer"); got != "https://space.bilibili.com/42/" {
+			t.Fatalf("referer = %q", got)
+		}
+		body := `{"code":0,"data":{"card":{"mid":"42","name":"用户甲","sign":"一个签名","fans":123,"attention":45,"level_info":{"current_level":6},"Official":{"title":"官方认证"},"vip":{"status":1,"label":{"text":"年度大会员"}}},"following":true,"archive_count":7,"article_count":2}}`
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(body)), Header: make(http.Header)}, nil
+	})
+	client := NewClient(&http.Client{Transport: transport})
+	profile, err := client.GetUserProfile(context.Background(), "42", "", "")
+	if err != nil {
+		t.Fatalf("GetUserProfile() error = %v", err)
+	}
+	if profile.UserID != "42" || profile.Username != "用户甲" || profile.Signature != "一个签名" || profile.Level != 6 {
+		t.Fatalf("profile identity = %#v", profile)
+	}
+	if profile.Followers != 123 || profile.Following != 45 || profile.ArchiveCount != 7 || profile.ArticleCount != 2 || !profile.IsFollowing {
+		t.Fatalf("profile counts = %#v", profile)
+	}
+	if !profile.VIP || profile.VIPLabel != "年度大会员" || profile.Official != "官方认证" {
+		t.Fatalf("profile badges = %#v", profile)
+	}
+}
+
+func TestGetUserProfileReportsRiskControl(t *testing.T) {
+	client := NewClient(&http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"code":-352,"message":"风控校验失败"}`)), Header: make(http.Header)}, nil
+	})})
+	_, err := client.GetUserProfile(context.Background(), "42", "", "")
+	if err == nil || !strings.Contains(err.Error(), "-352") || !strings.Contains(err.Error(), "风控") {
+		t.Fatalf("risk-control error = %v", err)
+	}
+}
+
+func TestGetUserProfileMarksCurrentAccount(t *testing.T) {
+	client := NewClient(&http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		if request.URL.Path != "/x/web-interface/card" {
+			t.Fatalf("unexpected profile request = %s", request.URL.String())
+		}
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"code":0,"data":{"card":{"mid":"42","name":"本人"}}}`)), Header: make(http.Header)}, nil
+	})})
+	client.danmakuIdentity = danmakuIdentity{UID: 42, Buvid: "device-id"}
+	client.danmakuIdentityFor = "sess"
+	client.danmakuIdentityAt = time.Now()
+
+	profile, err := client.GetUserProfile(context.Background(), "42", "sess", "jct")
+	if err != nil {
+		t.Fatalf("GetUserProfile() error = %v", err)
+	}
+	if !profile.IsSelf {
+		t.Fatalf("current account profile = %#v, want IsSelf", profile)
+	}
+}
+
+func TestGetUserProfileRejectsInvalidUIDWithoutRequest(t *testing.T) {
+	client := NewClient(&http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		t.Fatal("invalid UID triggered a network request")
+		return nil, nil
+	})})
+	if _, err := client.GetUserProfile(context.Background(), "not-a-uid", "", ""); err == nil {
+		t.Fatal("invalid UID was accepted")
+	}
+}
+
+func TestSetUserFollowingUsesWebRelationAction(t *testing.T) {
+	for _, test := range []struct {
+		following bool
+		wantAct   string
+	}{{following: true, wantAct: "1"}, {following: false, wantAct: "2"}} {
+		transport := roundTripFunc(func(request *http.Request) (*http.Response, error) {
+			if request.URL.Path != "/x/relation/modify" {
+				t.Fatalf("relation path = %q", request.URL.Path)
+			}
+			if err := request.ParseForm(); err != nil {
+				return nil, err
+			}
+			if request.PostForm.Get("fid") != "42" || request.PostForm.Get("act") != test.wantAct || request.PostForm.Get("csrf") != "jct" {
+				t.Fatalf("relation form = %#v", request.PostForm)
+			}
+			if got := request.Header.Get("Cookie"); got != "SESSDATA=sess; bili_jct=jct" {
+				t.Fatalf("relation cookie = %q", got)
+			}
+			return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"code":0}`)), Header: make(http.Header)}, nil
+		})
+		client := NewClient(&http.Client{Transport: transport})
+		if err := client.SetUserFollowing(context.Background(), "42", "sess", "jct", test.following); err != nil {
+			t.Fatalf("SetUserFollowing(%v) error = %v", test.following, err)
+		}
+	}
+}
+
+func TestSetUserFollowingKeepsServerError(t *testing.T) {
+	client := NewClient(&http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"code":22014,"message":"已经关注"}`)), Header: make(http.Header)}, nil
+	})})
+	err := client.SetUserFollowing(context.Background(), "42", "sess", "jct", true)
+	if err == nil || !strings.Contains(err.Error(), "22014") || !strings.Contains(err.Error(), "已经关注") {
+		t.Fatalf("relation error = %v", err)
+	}
 }

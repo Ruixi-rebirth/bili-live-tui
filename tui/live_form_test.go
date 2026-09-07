@@ -35,6 +35,61 @@ func TestResponsiveLiveFormDensity(t *testing.T) {
 	}
 }
 
+func TestLiveFormCtrlUClearsFocusedEditableField(t *testing.T) {
+	_, state := newLiveFormWithOptions(nil, nil, "开播信息", true)
+	for _, test := range []struct {
+		name  string
+		field *tview.InputField
+	}{
+		{"title", state.title},
+		{"tags", state.tags},
+		{"area", state.area.field},
+		{"cover", state.cover},
+		{"obs host", state.obsHost},
+		{"obs port", state.obsPort},
+		{"obs password", state.obsPassword},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			test.field.SetText("待清空")
+			test.field.InputHandler()(tcell.NewEventKey(tcell.KeyCtrlU, 0, tcell.ModNone), func(tview.Primitive) {})
+			if got := test.field.GetText(); got != "" {
+				t.Fatalf("Ctrl+U left %q", got)
+			}
+		})
+	}
+	for _, test := range []struct {
+		name  string
+		field *tview.TextArea
+	}{
+		{"description", state.description},
+		{"announcement", state.announcement},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			test.field.SetText("第一行\n第二行", false)
+			test.field.InputHandler()(tcell.NewEventKey(tcell.KeyCtrlU, 0, tcell.ModNone), func(tview.Primitive) {})
+			if got := test.field.GetText(); got != "" {
+				t.Fatalf("Ctrl+U left %q", got)
+			}
+		})
+	}
+}
+
+func TestAreaCtrlUClearsStaleAutocompleteSelection(t *testing.T) {
+	chooser := newAreaField([]api.LiveArea{
+		{ID: "376", Name: "单机游戏"},
+		{ID: "12", Name: "手游"},
+	})
+	enableClearInputShortcut(chooser.field)
+	chooser.field.SetText("手")
+	chooser.field.Autocomplete()
+	chooser.field.InputHandler()(tcell.NewEventKey(tcell.KeyCtrlU, 0, tcell.ModNone), func(tview.Primitive) {})
+	// 若清空时没有关闭旧列表，Enter 会把清空前的“手游”重新填回。
+	chooser.field.InputHandler()(tcell.NewEventKey(tcell.KeyEnter, 0, tcell.ModNone), func(tview.Primitive) {})
+	if got := chooser.field.GetText(); got != "" {
+		t.Fatalf("stale autocomplete restored %q after Ctrl+U", got)
+	}
+}
+
 func TestPreferredLiveFormHeightCollapsesOBSGroup(t *testing.T) {
 	form, state := newLiveFormWithOptions(nil, nil, "开播信息", true)
 	withOBS := preferredLiveFormHeight(form, 1)
@@ -451,4 +506,3 @@ func TestStartLiveButtonArrowNavigation(t *testing.T) {
 		t.Fatalf("Left arrow on cancelButton did not focus startButton: got %v focus %v", got, app.GetFocus())
 	}
 }
-

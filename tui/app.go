@@ -194,7 +194,7 @@ func RunLiveSettings(ctx context.Context, areas []api.LiveArea, initial *api.Liv
 	root := tallWideFormPage(
 		pageHeader("设置开播信息", "填写房间资料，确认后立即开始直播"),
 		body,
-		pageFooter("Tab 切换　Enter 确认　Esc/Ctrl+C 取消开播　支持鼠标点击"),
+		pageFooter("Tab 切换　Enter 确认　Ctrl+U 清空当前项　Esc/Ctrl+C 取消开播　支持鼠标点击"),
 	)
 	pages.AddPage("main", root, true, true)
 
@@ -350,7 +350,7 @@ func newLiveEditPage(app *tview.Application, initial api.LiveSettings, areas []a
 	root := wideFormPage(
 		pageHeader("修改直播资料", "保存后会立即同步到直播间"),
 		body,
-		pageFooter("Tab 切换　Enter 确认　Esc/Ctrl+C 放弃修改　支持鼠标点击"),
+		pageFooter("Tab 切换　Enter 确认　Ctrl+U 清空当前项　Esc/Ctrl+C 放弃修改　支持鼠标点击"),
 	)
 	return &liveEditPage{root: root, form: form, setStatus: setStatus, cancel: onCancel}
 }
