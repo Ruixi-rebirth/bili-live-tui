@@ -236,6 +236,26 @@ func RunLiveSettings(ctx context.Context, areas []api.LiveArea, initial *api.Liv
 				return nil
 			}
 		}
+		if startButton.HasFocus() {
+			switch event.Key() {
+			case tcell.KeyRight, tcell.KeyLeft:
+				app.SetFocus(cancelButton)
+				return nil
+			case tcell.KeyUp:
+				focusLastLiveFormItem(app, form, state)
+				return nil
+			}
+		}
+		if cancelButton.HasFocus() {
+			switch event.Key() {
+			case tcell.KeyLeft, tcell.KeyRight:
+				app.SetFocus(startButton)
+				return nil
+			case tcell.KeyUp:
+				focusLastLiveFormItem(app, form, state)
+				return nil
+			}
+		}
 		return event
 	})
 	viewDone := make(chan struct{})

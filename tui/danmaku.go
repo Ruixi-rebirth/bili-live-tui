@@ -276,8 +276,37 @@ func RunDanmaku(ctx context.Context, session *LiveDanmakuSession, client *api.Cl
 	}()
 
 	app.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		if confirm.HasFocus() {
+			switch event.Key() {
+			case tcell.KeyEscape:
+				pages.HidePage("confirm-stop")
+				if previousFocus != nil {
+					app.SetFocus(previousFocus)
+				} else {
+					app.SetFocus(reply)
+				}
+				return nil
+			case tcell.KeyCtrlC:
+				navigation = NavigationQuit
+				stopApplication()
+				return nil
+			default:
+				return event
+			}
+		}
+
 		switch {
 		case matchesControlShortcut(event, tcell.KeyCtrlH, 'h') || matchesModifiedRuneShortcut(event, tcell.ModAlt, 'h'):
+			// 在终端中，Backspace 通常与 Ctrl+H 等价（ASCII 8）。
+			// 当输入框获得焦点时，放行该按键用于退格删除，避免误跳回房间概览。
+			if reply.HasFocus() {
+				if event.Key() == tcell.KeyCtrlH || event.Key() == tcell.KeyBackspace {
+					return event
+				}
+				if event.Key() == tcell.KeyRune && (event.Rune() == '\b' || event.Rune() == 8) {
+					return tcell.NewEventKey(tcell.KeyBackspace, 0, tcell.ModNone)
+				}
+			}
 			navigation = NavigationHome
 			stopApplication()
 			return nil
@@ -301,15 +330,6 @@ func RunDanmaku(ctx context.Context, session *LiveDanmakuSession, client *api.Cl
 			}
 			return event
 		case tcell.KeyEscape:
-			if confirm.HasFocus() {
-				pages.HidePage("confirm-stop")
-				if previousFocus != nil {
-					app.SetFocus(previousFocus)
-				} else {
-					app.SetFocus(reply)
-				}
-				return nil
-			}
 			openStopConfirm()
 			return nil
 		default:

@@ -416,3 +416,39 @@ func TestMascotDimensions(t *testing.T) {
 		t.Fatal("rabbit has invalid width")
 	}
 }
+
+func TestStartLiveButtonArrowNavigation(t *testing.T) {
+	app := tview.NewApplication()
+	startButton := newActionButton("开始直播", nil)
+	cancelButton := newActionButton("取消开播", nil)
+
+	handler := func(event *tcell.EventKey) *tcell.EventKey {
+		if startButton.HasFocus() {
+			switch event.Key() {
+			case tcell.KeyRight, tcell.KeyLeft:
+				app.SetFocus(cancelButton)
+				return nil
+			}
+		}
+		if cancelButton.HasFocus() {
+			switch event.Key() {
+			case tcell.KeyLeft, tcell.KeyRight:
+				app.SetFocus(startButton)
+				return nil
+			}
+		}
+		return event
+	}
+
+	app.SetFocus(startButton)
+	rightEvent := tcell.NewEventKey(tcell.KeyRight, 0, tcell.ModNone)
+	if got := handler(rightEvent); got != nil || app.GetFocus() != cancelButton {
+		t.Fatalf("Right arrow on startButton did not focus cancelButton: got %v focus %v", got, app.GetFocus())
+	}
+
+	leftEvent := tcell.NewEventKey(tcell.KeyLeft, 0, tcell.ModNone)
+	if got := handler(leftEvent); got != nil || app.GetFocus() != startButton {
+		t.Fatalf("Left arrow on cancelButton did not focus startButton: got %v focus %v", got, app.GetFocus())
+	}
+}
+

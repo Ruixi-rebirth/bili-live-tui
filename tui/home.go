@@ -330,17 +330,18 @@ func RunHome(ctx context.Context, startedAt time.Time, roomID string, settings *
 			return event
 		}
 		switch event.Key() {
-		case tcell.KeyTab, tcell.KeyBacktab:
+		case tcell.KeyTab, tcell.KeyBacktab, tcell.KeyRight, tcell.KeyLeft:
 			if editing || confirm.HasFocus() {
 				return event
 			}
-			// 按钮是普通控件而非 Form 项，因此显式循环焦点，让概览中的 Tab 行为稳定；弹窗焦点不处理。
+			isPrev := event.Key() == tcell.KeyBacktab || event.Key() == tcell.KeyLeft
+			// 按钮是普通控件而非 Form 项，因此显式循环焦点，让概览中的 Tab 和左右方向键行为稳定；弹窗焦点不处理。
 			for index, button := range buttons {
 				if app.GetFocus() != button {
 					continue
 				}
 				next := index + 1
-				if event.Key() == tcell.KeyBacktab {
+				if isPrev {
 					next = index - 1
 				}
 				if next < 0 {
@@ -352,7 +353,7 @@ func RunHome(ctx context.Context, startedAt time.Time, roomID string, settings *
 				return nil
 			}
 			next := 0
-			if event.Key() == tcell.KeyBacktab {
+			if isPrev {
 				next = len(buttons) - 1
 			}
 			app.SetFocus(buttons[next])

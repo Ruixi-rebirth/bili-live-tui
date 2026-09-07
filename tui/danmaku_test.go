@@ -274,3 +274,46 @@ func TestUpdateDanmakuHistoryHandlesClearAndCoalescedAppend(t *testing.T) {
 		t.Fatalf("history after clear = %q, revision=%d", text, revision)
 	}
 }
+
+func TestDanmakuInputCaptureHandlesBackspaceWithoutNavigating(t *testing.T) {
+	reply := tview.NewInputField()
+	reply.SetText("测试文本")
+
+	app := tview.NewApplication()
+	app.SetFocus(reply)
+
+	handler := func(event *tcell.EventKey) *tcell.EventKey {
+		switch {
+		case matchesControlShortcut(event, tcell.KeyCtrlH, 'h') || matchesModifiedRuneShortcut(event, tcell.ModAlt, 'h'):
+			if reply.HasFocus() {
+				if event.Key() == tcell.KeyCtrlH || event.Key() == tcell.KeyBackspace {
+					return event
+				}
+				if event.Key() == tcell.KeyRune && (event.Rune() == '\b' || event.Rune() == 8) {
+					return tcell.NewEventKey(tcell.KeyBackspace, 0, tcell.ModNone)
+				}
+			}
+			return nil
+		default:
+			return event
+		}
+	}
+
+	// 1. 测试标准 KeyCtrlH / KeyBackspace（ASCII 8）
+	bsEvent := tcell.NewEventKey(tcell.KeyCtrlH, 0, tcell.ModNone)
+	if got := handler(bsEvent); got == nil {
+		t.Fatal("KeyCtrlH (Backspace) was intercepted as navigation instead of being passed to input field")
+	}
+
+	// 2. 测试 rune '\b'
+	rawControl := tcell.NewEventKey(tcell.KeyRune, '\b', tcell.ModNone)
+	if got := handler(rawControl); got == nil || got.Key() != tcell.KeyBackspace {
+		t.Fatal("Raw rune '\\b' was intercepted as navigation instead of being converted to KeyBackspace")
+	}
+
+	// 3. 测试 Alt+H 仍能触发导航
+	altH := tcell.NewEventKey(tcell.KeyRune, 'h', tcell.ModAlt)
+	if got := handler(altH); got != nil {
+		t.Fatal("Alt+H was not intercepted as navigation")
+	}
+}
