@@ -176,6 +176,71 @@ func TestRoomManagementPermissionHierarchy(t *testing.T) {
 	}
 }
 
+func TestSearchRoomUsersSupportsArrayAndObjectPayloads(t *testing.T) {
+	tests := []struct {
+		name     string
+		response string
+	}{
+		{
+			name:     "array",
+			response: `{"code":0,"data":[{"uid":42,"uname":"用户甲","admin_level":2},{"uid":42,"uname":"重复用户"},{"uname":"缺少UID"}]}`,
+		},
+		{
+			name:     "object items",
+			response: `{"code":0,"data":{"items":[{"tuid":"43","tname":"用户乙","admin_level":"1"}]}}`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			transport := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+				if r.Method != http.MethodGet || r.URL.Path != "/banned_service/v2/Silent/search_user" || r.URL.Query().Get("search") != "用户" {
+					t.Errorf("search request = %s %s", r.Method, r.URL.String())
+				}
+				return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(tt.response)), Header: make(http.Header)}, nil
+			})
+			client := NewClient(&http.Client{Transport: transport})
+			client.BaseURL = "http://test.invalid"
+
+			results, err := client.SearchRoomUsers(context.Background(), " 用户 ", "sess", "jct")
+			if err != nil {
+				t.Fatalf("SearchRoomUsers() error = %v", err)
+			}
+			if len(results) != 1 || results[0].UserID == "" || results[0].Username == "" || results[0].AdminLevel == 0 {
+				t.Fatalf("search results = %#v", results)
+			}
+		})
+	}
+}
+
+func TestSearchRoomUsersPreservesAPIErrorWithArrayData(t *testing.T) {
+	transport := roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"code":3,"message":"请先登录","data":[]}`)), Header: make(http.Header)}, nil
+	})
+	client := NewClient(&http.Client{Transport: transport})
+	client.BaseURL = "http://test.invalid"
+
+	_, err := client.SearchRoomUsers(context.Background(), "42", "sess", "jct")
+	if err == nil || !strings.Contains(err.Error(), "请先登录") {
+		t.Fatalf("SearchRoomUsers() error = %v", err)
+	}
+}
+
+func TestGetRoomAdminSeniorStatusKeepsDisabledState(t *testing.T) {
+	transport := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Query().Get("anchor_id") != "99" {
+			t.Errorf("anchor_id = %q", r.URL.Query().Get("anchor_id"))
+		}
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"code":0,"data":{"status":0}}`)), Header: make(http.Header)}, nil
+	})
+	client := NewClient(&http.Client{Transport: transport})
+	client.BaseURL = "http://test.invalid"
+
+	status, err := client.GetRoomAdminSeniorStatus(context.Background(), "99", "sess", "jct")
+	if err != nil || status != 0 {
+		t.Fatalf("GetRoomAdminSeniorStatus() = %d, %v", status, err)
+	}
+}
+
 func TestRoomManagementMutationsMatchWebRequests(t *testing.T) {
 	wantPath := ""
 	wantValues := url.Values{}
@@ -220,6 +285,29 @@ func TestRoomManagementMutationsMatchWebRequests(t *testing.T) {
 	}
 }
 
+func TestGetRoomSilentStateTreatsZeroDurationAsActive(t *testing.T) {
+	transport := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.Method != http.MethodGet || r.URL.Path != "/xlive/web-room/v1/banned/GetRoomSilent" || r.URL.Query().Get("room_id") != "1" {
+			t.Errorf("room silent request = %s %s", r.Method, r.URL.String())
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(strings.NewReader(`{"code":0,"data":{"type":"medal","level":12,"minute":0,"second":0}}`)),
+			Header:     make(http.Header),
+		}, nil
+	})
+	client := NewClient(&http.Client{Transport: transport})
+	client.BaseURL = "http://test.invalid"
+
+	state, err := client.GetRoomSilentState(context.Background(), "1", "sess", "jct")
+	if err != nil {
+		t.Fatalf("GetRoomSilentState() error = %v", err)
+	}
+	if !state.Enabled || state.Audience != RoomSilentMedal || state.Level != 12 || state.RemainingSeconds != 0 {
+		t.Fatalf("room silent state = %#v", state)
+	}
+}
+
 func TestRoomManagementInputValidation(t *testing.T) {
 	client := NewClient(&http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
 		return nil, fmt.Errorf("request should not be sent")
@@ -242,7 +330,7 @@ func TestRoomManagementListResponses(t *testing.T) {
 		case "/xlive/app-ucenter/v1/roomAdmin/get_by_anchor":
 			response = `{"code":0,"data":{"data":[{"uid":42,"uname":"房管甲","ctime":"2026-09-01","admin_level":2}],"page":{"page":1,"total_page":3},"max_room_anchors_number":10}}`
 		case "/xlive/web-ucenter/v1/banned/GetSilentUserList":
-			response = `{"code":0,"data":{"data":[{"tuid":43,"tname":"用户乙","name":"主播","block_end_time":"永久","admin_level":0,"is_anchor":1}]}}`
+			response = `{"code":0,"data":{"data":[{"tuid":43,"tname":"用户乙","name":"主播","block_end_time":"永久","admin_level":0,"is_anchor":1}],"total":21,"total_page":3}}`
 		case "/xlive/app-ucenter/v2/xbanned/banned/GetBlackList":
 			response = `{"code":0,"data":{"data":[{"uid":44,"name":"用户丙","mtime":"2026-09-02","operator_name":"主播"}]}}`
 		case "/xlive/web-ucenter/v1/banned/GetShieldKeywordList":
@@ -260,7 +348,7 @@ func TestRoomManagementListResponses(t *testing.T) {
 		t.Fatalf("admins = %#v, err = %v", admins, err)
 	}
 	muted, err := client.GetMutedRoomUsers(context.Background(), "1", 1, "sess", "jct")
-	if err != nil || len(muted) != 1 || muted[0].UserID != "43" || !muted[0].OperatorIsAnchor {
+	if err != nil || len(muted.Items) != 1 || muted.Items[0].UserID != "43" || !muted.Items[0].OperatorIsAnchor || muted.Page != 1 || muted.Total != 21 || muted.TotalPages != 3 {
 		t.Fatalf("muted = %#v, err = %v", muted, err)
 	}
 	blacklist, err := client.GetRoomBlacklist(context.Background(), "99", 1, 10, "sess", "jct")

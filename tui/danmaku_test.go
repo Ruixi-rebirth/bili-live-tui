@@ -420,16 +420,14 @@ func TestFormatRoomSilentState(t *testing.T) {
 	}
 }
 
-func TestFormatRoomManagerRowIsCompactAndAligned(t *testing.T) {
-	short := formatRoomManagerRow("全员", "除房管外均不可发言", "设置")
-	long := formatRoomManagerRow("除房管以外的观众", "仅主播和房管可以发言", "设置")
-	if strings.Contains(short, "\n") || !strings.Contains(short, "「设置」") {
-		t.Fatalf("compact row = %q", short)
+func TestRoomManagerTableCells(t *testing.T) {
+	if got := formatRoomManagerTableUser("黑名单用户", "3001"); got != "黑名单用户 · UID 3001" {
+		t.Fatalf("table user = %q", got)
 	}
-	shortDetail := strings.Index(short, "除房管外")
-	longDetail := strings.Index(long, "仅主播")
-	if shortDetail <= 0 || longDetail <= 0 || tview.TaggedStringWidth(short[:shortDetail]) != tview.TaggedStringWidth(long[:longDetail]) {
-		t.Fatalf("row columns are not aligned: short=%q long=%q", short, long)
+	clicked := false
+	actionCell := roomManagerTableActionCell("删除", errorColor, func() { clicked = true })
+	if actionCell.Text != "删除" || actionCell.Clicked == nil || !actionCell.Clicked() || !clicked {
+		t.Fatalf("table action cell is not clickable: %#v", actionCell)
 	}
 }
 
@@ -539,15 +537,6 @@ func TestDanmakuUserCardButtonsTouchBottomBorder(t *testing.T) {
 	_, buttonY, _, buttonHeight := actions.GetButton(1).GetRect()
 	if buttonY+buttonHeight != 11 {
 		t.Fatalf("button bottom = %d, want bottom border row 11 immediately after it", buttonY+buttonHeight)
-	}
-}
-
-func TestRoomManagerNumberKeyTabs(t *testing.T) {
-	for r := '1'; r <= '5'; r++ {
-		idx := int(r - '1')
-		if idx < 0 || idx > 4 {
-			t.Fatalf("tab index out of range for %c: %d", r, idx)
-		}
 	}
 }
 

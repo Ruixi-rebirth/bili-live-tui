@@ -33,7 +33,7 @@ var Endpoints = map[string]Endpoint{
 	"MuteRoomUser":          {Name: "MuteRoomUser", Method: http.MethodPost, Path: "/xlive/web-ucenter/v1/banned/AddSilentUser", Description: "禁言直播间用户"},
 	"UnmuteRoomUser":        {Name: "UnmuteRoomUser", Method: http.MethodPost, Path: "/xlive/web-ucenter/v1/banned/DelSilentUser", Description: "解除直播间用户禁言"},
 	"GetRoomBlacklist":      {Name: "GetRoomBlacklist", Method: http.MethodGet, Path: "/xlive/app-ucenter/v2/xbanned/banned/GetBlackList", Description: "获取直播间黑名单"},
-	"BlacklistRoomUser":     {Name: "BlacklistRoomUser", Method: http.MethodPost, Path: "/xlive/app-ucenter/v2/xbanned/banned/AddBlack", Description: "将用户加入直播间黑名单"},
+	"BlacklistRoomUser":     {Name: "BlacklistRoomUser", Method: http.MethodPost, Path: "/xlive/app-ucenter/v2/xbanned/banned/AddBlack", Description: "将用户添加到直播间黑名单"},
 	"UnblacklistRoomUser":   {Name: "UnblacklistRoomUser", Method: http.MethodPost, Path: "/xlive/app-ucenter/v2/xbanned/banned/DelBlack", Description: "将用户移出直播间黑名单"},
 	"GetShieldKeywords":     {Name: "GetShieldKeywords", Method: http.MethodPost, Path: "/xlive/web-ucenter/v1/banned/GetShieldKeywordList", Description: "获取直播间屏蔽词"},
 	"AddShieldKeyword":      {Name: "AddShieldKeyword", Method: http.MethodPost, Path: "/xlive/web-ucenter/v1/banned/AddShieldKeyword", Description: "添加直播间屏蔽词"},

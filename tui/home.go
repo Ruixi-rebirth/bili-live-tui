@@ -532,13 +532,10 @@ func newActionButton(label string, selected func()) *tview.Button {
 			Bold(true))
 }
 
-func centeredActionBar(buttons []*tview.Button) *tview.Flex {
-	bar := tview.NewFlex()
-	bar.SetDirection(tview.FlexColumn)
-	bar.SetBackgroundColor(panelColor)
-
+func populateCenteredActionBar(bar *tview.Flex, buttons []*tview.Button) {
+	bar.Clear()
 	if len(buttons) == 0 {
-		return bar
+		return
 	}
 
 	buttonWidth := 0
@@ -558,5 +555,12 @@ func centeredActionBar(buttons []*tview.Button) *tview.Flex {
 		}
 	}
 	bar.AddItem(nil, 0, 1, false)
+}
+
+func centeredActionBar(buttons []*tview.Button) *tview.Flex {
+	bar := tview.NewFlex()
+	bar.SetDirection(tview.FlexColumn)
+	bar.SetBackgroundColor(panelColor)
+	populateCenteredActionBar(bar, buttons)
 	return bar
 }

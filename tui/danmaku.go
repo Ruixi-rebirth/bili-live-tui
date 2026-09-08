@@ -375,8 +375,8 @@ func RunDanmaku(ctx context.Context, session *LiveDanmakuSession, client *api.Cl
 			})
 		}
 		if managementCapabilities.CanBlacklist(targetAdminLevel) && strings.TrimSpace(managementCapabilities.AnchorID) != "" {
-			addAction("加入直播间黑名单", "将无法观看、发言和送礼", func() {
-				openManagementConfirm("拉黑 "+username, "确定将 "+username+" 加入直播间黑名单吗？\n\n对方会被移出直播间，无法观看和互动，当前排行及贡献会被清除。", func(requestCtx context.Context) error {
+			addAction("添加至黑名单", "将无法观看、发言和送礼", func() {
+				openManagementConfirm("拉黑 "+username, "确定将 "+username+" 添加到直播间黑名单吗？\n\n对方会被移出直播间，无法观看和互动，当前排行及贡献会被清除。", func(requestCtx context.Context) error {
 					return client.BlacklistRoomUser(requestCtx, managementCapabilities.AnchorID, message.UserID, sessdata, biliJCT)
 				})
 			})
@@ -389,7 +389,7 @@ func RunDanmaku(ctx context.Context, session *LiveDanmakuSession, client *api.Cl
 					})
 				})
 			} else {
-				addAction("设为房管", "可禁言用户和设置屏蔽词", func() {
+				addAction("设为房管", "可按权限禁言或拉黑普通用户", func() {
 					openManagementConfirm("任命房管 "+username, "确定任命 "+username+" 为房管吗？", func(requestCtx context.Context) error {
 						return client.AppointRoomAdmin(requestCtx, message.UserID, 1, sessdata, biliJCT)
 					})
@@ -405,13 +405,11 @@ func RunDanmaku(ctx context.Context, session *LiveDanmakuSession, client *api.Cl
 		app.SetFocus(managementMenu)
 	}
 
-	roomManagerList := newDanmakuManagementList("")
-	roomManagerList.SetBorder(false)
-	roomManagerList.SetBorderPadding(0, 0, 1, 1)
-	roomManagerList.ShowSecondaryText(false)
-	roomManagerList.SetSelectedFocusOnly(true)
-	roomManagerTabs := tview.NewTextView().SetDynamicColors(true).SetRegions(true).SetTextAlign(tview.AlignCenter)
-	roomManagerTabs.SetBackgroundColor(panelColor)
+	roomManagerNavigation := newDanmakuManagementList(" 栏目 ")
+	roomManagerNavigation.ShowSecondaryText(false)
+	roomManagerNavigation.SetHighlightFullLine(true)
+	roomManagerNavigation.SetSelectedFocusOnly(false)
+	roomManagerNavigation.SetBorderPadding(1, 0, 1, 1)
 	roomManagerSection := tview.NewTextView().SetDynamicColors(true).SetTextAlign(tview.AlignCenter)
 	roomManagerSection.SetBackgroundColor(panelColor)
 	roomManagerSection.SetTextColor(tview.Styles.SecondaryTextColor)
@@ -424,31 +422,150 @@ func RunDanmaku(ctx context.Context, session *LiveDanmakuSession, client *api.Cl
 	roomManagerEmptyCenter.AddItem(nil, 0, 1, false)
 	roomManagerEmptyCenter.AddItem(roomManagerEmpty, 4, 0, false)
 	roomManagerEmptyCenter.AddItem(nil, 0, 1, false)
+	roomManagerErrorText := tview.NewTextView().SetDynamicColors(true).SetTextAlign(tview.AlignCenter)
+	roomManagerErrorText.SetBackgroundColor(panelColor)
+	roomManagerErrorCenter := tview.NewFlex().SetDirection(tview.FlexRow)
+	roomManagerErrorCenter.SetBackgroundColor(panelColor)
+	roomManagerErrorCenter.AddItem(nil, 0, 1, false)
+	roomManagerErrorCenter.AddItem(roomManagerErrorText, 6, 0, false)
+	roomManagerErrorCenter.AddItem(nil, 0, 1, false)
 	roomManagerInput := newDanmakuManagementForm("")
 	roomManagerInput.SetItemPadding(1)
 	roomManagerInputCard := newFloatingOverlay(roomManagerInput, 56, 9)
-	roomManagerBackButton := newActionButton("返回弹幕 (Esc)", nil)
+	var roomManagerPrevPage func()
+	var roomManagerNextPage func()
+	roomManagerBackButton := newActionButton("返回弹幕", nil)
+	roomManagerRetryButton := newActionButton("重新加载", nil)
+	roomManagerAddAdminButton := newActionButton("添加房管", nil)
+	roomManagerMuteUserButton := newActionButton("禁言用户", nil)
+	roomManagerBlacklistUserButton := newActionButton("添加黑名单用户", nil)
+	roomManagerAddKeywordButton := newActionButton("添加屏蔽词", nil)
+	roomManagerCloseSilentButton := newActionButton("关闭全局禁言", nil)
+	roomManagerSearchAgainButton := newActionButton("重新查找", nil)
+	roomManagerFlowBackButton := newActionButton("返回列表", nil)
+	roomManagerPrevButton := newActionButton("上一页", nil)
+	roomManagerNextButton := newActionButton("下一页", nil)
+	roomManagerCanPrevPage := false
+	roomManagerCanNextPage := false
+	var roomManagerCurrentButtons []*tview.Button
+	roomManagerBaseActionMode := "default"
+	roomManagerFlowSearchable := false
 	roomManagerActionBar := centeredActionBar([]*tview.Button{roomManagerBackButton})
-	roomManagerListLayout := tview.NewGrid().SetColumns(-1, -12, -1)
-	roomManagerListLayout.SetBackgroundColor(panelColor)
-	roomManagerListLayout.AddItem(roomManagerList, 0, 1, 1, 1, 0, 0, true)
+	updateRoomManagerActionBar := func(mode string) {
+		previousFocus := app.GetFocus()
+		wasActionButton := previousFocus == roomManagerBackButton ||
+			previousFocus == roomManagerRetryButton ||
+			previousFocus == roomManagerAddAdminButton ||
+			previousFocus == roomManagerMuteUserButton ||
+			previousFocus == roomManagerBlacklistUserButton ||
+			previousFocus == roomManagerAddKeywordButton ||
+			previousFocus == roomManagerCloseSilentButton ||
+			previousFocus == roomManagerSearchAgainButton ||
+			previousFocus == roomManagerFlowBackButton ||
+			previousFocus == roomManagerPrevButton ||
+			previousFocus == roomManagerNextButton
+		roomManagerCurrentButtons = roomManagerCurrentButtons[:0]
+		if mode == "error" {
+			roomManagerCurrentButtons = []*tview.Button{roomManagerRetryButton, roomManagerBackButton}
+		} else {
+			switch mode {
+			case "admin":
+				roomManagerCurrentButtons = append(roomManagerCurrentButtons, roomManagerAddAdminButton)
+			case "mute":
+				roomManagerCurrentButtons = append(roomManagerCurrentButtons, roomManagerMuteUserButton)
+			case "blacklist":
+				roomManagerCurrentButtons = append(roomManagerCurrentButtons, roomManagerBlacklistUserButton)
+			case "keyword":
+				roomManagerCurrentButtons = append(roomManagerCurrentButtons, roomManagerAddKeywordButton)
+			case "silent-active":
+				roomManagerCurrentButtons = append(roomManagerCurrentButtons, roomManagerCloseSilentButton)
+			case "flow":
+				if roomManagerFlowSearchable {
+					roomManagerCurrentButtons = append(roomManagerCurrentButtons, roomManagerSearchAgainButton)
+				}
+				roomManagerCurrentButtons = append(roomManagerCurrentButtons, roomManagerFlowBackButton)
+			}
+			if roomManagerCanPrevPage {
+				roomManagerCurrentButtons = append(roomManagerCurrentButtons, roomManagerPrevButton)
+			}
+			if roomManagerCanNextPage {
+				roomManagerCurrentButtons = append(roomManagerCurrentButtons, roomManagerNextButton)
+			}
+			roomManagerCurrentButtons = append(roomManagerCurrentButtons, roomManagerBackButton)
+		}
+		populateCenteredActionBar(roomManagerActionBar, roomManagerCurrentButtons)
+		if wasActionButton {
+			focusStillVisible := false
+			for _, button := range roomManagerCurrentButtons {
+				if previousFocus == button {
+					focusStillVisible = true
+					break
+				}
+			}
+			if !focusStillVisible {
+				app.SetFocus(roomManagerNavigation)
+			}
+		}
+	}
+	updateRoomManagerActionBar("default")
+	isActionBarFocused := func() bool {
+		for _, btn := range roomManagerCurrentButtons {
+			if btn != nil && btn.HasFocus() {
+				return true
+			}
+		}
+		return false
+	}
+	focusedButtonIndex := func() int {
+		for i, btn := range roomManagerCurrentButtons {
+			if btn != nil && btn.HasFocus() {
+				return i
+			}
+		}
+		return -1
+	}
+	roomManagerTable := tview.NewTable()
+	roomManagerTable.SetBackgroundColor(panelColor)
+	roomManagerTable.SetBorderPadding(0, 0, 1, 1)
+	roomManagerTable.SetBorders(false)
+	roomManagerTable.SetFixed(1, 0)
+	roomManagerTable.SetSelectable(true, false)
+	roomManagerTable.SetEvaluateAllRows(true)
+	roomManagerTable.SetSelectedStyle(tcell.StyleDefault.
+		Background(tview.Styles.MoreContrastBackgroundColor).
+		Foreground(tview.Styles.PrimaryTextColor).
+		Bold(true))
+	roomManagerTableActions := make(map[int]func())
+	roomManagerTable.SetSelectedFunc(func(row, _ int) {
+		if action := roomManagerTableActions[row]; action != nil {
+			action()
+		}
+	})
+	roomManagerTableLayout := tview.NewGrid().SetColumns(0)
+	roomManagerTableLayout.SetBackgroundColor(panelColor)
+	roomManagerTableLayout.AddItem(roomManagerTable, 0, 0, 1, 1, 0, 0, true)
 	roomManagerContent := tview.NewPages()
 	roomManagerContent.SetBackgroundColor(panelColor)
-	roomManagerContent.AddPage("list", roomManagerListLayout, true, true)
+	roomManagerContent.AddPage("table", roomManagerTableLayout, true, true)
 	roomManagerContent.AddPage("input", roomManagerInputCard, true, false)
 	roomManagerContent.AddPage("empty", roomManagerEmptyCenter, true, false)
-	roomManagerPanel := tview.NewFlex().SetDirection(tview.FlexRow)
+	roomManagerContent.AddPage("error", roomManagerErrorCenter, true, false)
+	roomManagerContentPanel := tview.NewFlex().SetDirection(tview.FlexRow)
+	roomManagerContentPanel.SetBackgroundColor(panelColor)
+	roomManagerContentPanel.SetBorder(true)
+	roomManagerContentPanel.SetBorderColor(tview.Styles.BorderColor)
+	roomManagerContentPanel.AddItem(roomManagerSection, 1, 0, false)
+	roomManagerContentPanel.AddItem(roomManagerNotice, 1, 0, false)
+	roomManagerContentPanel.AddItem(roomManagerContent, 0, 1, true)
+	roomManagerContentPanel.AddItem(roomManagerActionBar, 1, 0, true)
+	roomManagerPanel := tview.NewFlex().SetDirection(tview.FlexColumn)
 	roomManagerPanel.SetBackgroundColor(panelColor)
-	roomManagerPanel.SetBorder(true)
-	roomManagerPanel.SetBorderColor(tview.Styles.BorderColor)
-	roomManagerPanel.AddItem(roomManagerTabs, 1, 0, false)
-	roomManagerPanel.AddItem(roomManagerSection, 1, 0, false)
-	roomManagerPanel.AddItem(roomManagerNotice, 1, 0, false)
-	roomManagerPanel.AddItem(roomManagerContent, 0, 1, true)
-	roomManagerPanel.AddItem(roomManagerActionBar, 1, 0, true)
-	roomManagerPageFooter := pageFooter("1~5 切换栏目 · ←/→ 切换 · ↑/↓ 选择 · Enter 操作 · r 刷新 · [ / ] 翻页 · Esc 返回")
+	roomManagerPanel.AddItem(roomManagerNavigation, 16, 0, true)
+	roomManagerPanel.AddItem(nil, 1, 0, false)
+	roomManagerPanel.AddItem(roomManagerContentPanel, 0, 1, true)
+	roomManagerPageFooter := pageFooter("↑/↓ 选择 · ←/→ 切换区域 · Tab 切换焦点 · Enter 操作 · [ / ] 翻页 · Esc 返回")
 	roomManagerPage := workspacePage(
-		workspaceHeader("房间管理工作台"),
+		workspaceHeader("房间管理"),
 		roomManagerPanel,
 		roomManagerPageFooter,
 	)
@@ -456,7 +573,6 @@ func RunDanmaku(ctx context.Context, session *LiveDanmakuSession, client *api.Cl
 	roomManagerVisible := false
 	roomManagerConfirmVisible := false
 	roomManagerInputVisible := false
-	roomManagerEmptyVisible := false
 	roomManagerGeneration := uint64(0)
 	type roomManagerTab struct {
 		label string
@@ -464,14 +580,13 @@ func RunDanmaku(ctx context.Context, session *LiveDanmakuSession, client *api.Cl
 	}
 	roomManagerTabsAvailable := make([]roomManagerTab, 0, 5)
 	roomManagerTabIndex := 0
+	roomManagerNavigationSyncing := false
 	roomAdminPage := 1
 	mutedUserPage := 1
 	blacklistPage := 1
 	roomAdminTotalPages := 1
 	blacklistTotalPages := 1
-	mutedHasNextPage := false
-	var roomManagerPrevPage func()
-	var roomManagerNextPage func()
+	mutedTotalPages := 1
 	var showRoomManagerRoot func()
 	var loadRoomAdmins func()
 	var loadMutedUsers func()
@@ -480,13 +595,65 @@ func RunDanmaku(ctx context.Context, session *LiveDanmakuSession, client *api.Cl
 	var loadRoomSilent func()
 	var selectRoomManagerTab func(int)
 	var roomManagerReload func()
+	var roomManagerRetryAction func()
+	var triggerAddRoomAdmin func()
+	var triggerMuteRoomUser func()
+	var triggerBlacklistRoomUser func()
+	var triggerAddShieldKeyword func()
+	var triggerCloseRoomSilent func()
+	var roomManagerFlowBack func()
 	var pendingRoomManagerAction func(context.Context) error
 	pendingRoomManagerLabel := ""
+	roomManagerFocusContentAfterLoad := false
+	type roomManagerUserOperation int
+	const (
+		roomManagerUserAddAdmin roomManagerUserOperation = iota
+		roomManagerUserMute
+		roomManagerUserBlacklist
+	)
+	roomManagerSearchOperation := roomManagerUserAddAdmin
+	roomManagerSearchQuery := ""
+	roomManagerSearchResults := make([]api.RoomUserSearchResult, 0)
+	roomManagerAdminLevels := make(map[string]int)
+	roomManagerSeniorAdminKnown := false
+	roomManagerSeniorAdminEnabled := false
+	roomManagerSeniorAdminLoading := false
+	var renderRoomManagerSearchResults func()
+	var showRoomManagerAdminChoices func(api.RoomUserSearchResult, bool)
+	var showRoomManagerMuteChoices func(api.RoomUserSearchResult)
+	var searchRoomManagerUsers func(roomManagerUserOperation, string)
+	var openRoomManagerUserSearch func(roomManagerUserOperation)
+	focusRoomManagerContent := func() {
+		frontPage, _ := roomManagerContent.GetFrontPage()
+		switch {
+		case frontPage == "table" && roomManagerTable.GetRowCount() > 1:
+			app.SetFocus(roomManagerTable)
+		case frontPage == "error" && roomManagerRetryAction != nil:
+			app.SetFocus(roomManagerRetryButton)
+		case len(roomManagerCurrentButtons) > 0:
+			app.SetFocus(roomManagerCurrentButtons[0])
+		default:
+			app.SetFocus(roomManagerNavigation)
+		}
+	}
+	restoreRoomManagerFocusAfterLoad := func() {
+		if !roomManagerFocusContentAfterLoad {
+			return
+		}
+		roomManagerFocusContentAfterLoad = false
+		focusRoomManagerContent()
+	}
 	setRoomManagerNotice := func(message string, failed bool) {
 		message = strings.TrimSpace(message)
 		if message == "" {
 			roomManagerNotice.SetText("")
 			return
+		}
+		msgRunes := []rune(strings.Join(strings.Fields(message), " "))
+		if len(msgRunes) > 60 {
+			message = string(msgRunes[:60]) + "…"
+		} else {
+			message = string(msgRunes)
 		}
 		color := accentActiveColor
 		if failed {
@@ -494,44 +661,108 @@ func RunDanmaku(ctx context.Context, session *LiveDanmakuSession, client *api.Cl
 		}
 		roomManagerNotice.SetText("[" + color.String() + "]" + tview.Escape(message) + "[-]")
 	}
-	addRoomManagerItem := func(title, detail, action string, shortcut rune, selected func()) {
-		roomManagerList.AddItem(formatRoomManagerRow(title, detail, action), "", shortcut, selected)
-	}
-	showRoomManagerListView := func() {
-		roomManagerEmptyVisible = false
+	showRoomManagerTableView := func() {
 		roomManagerInputVisible = false
-		roomManagerContent.SwitchToPage("list")
-		app.SetFocus(roomManagerList)
+		roomManagerRetryAction = nil
+		retryWasFocused := app.GetFocus() == roomManagerRetryButton
+		updateRoomManagerActionBar(roomManagerBaseActionMode)
+		roomManagerContent.SwitchToPage("table")
+		if retryWasFocused {
+			app.SetFocus(roomManagerNavigation)
+		}
 	}
 	showRoomManagerEmptyView := func(message string) {
-		roomManagerEmptyVisible = true
 		roomManagerInputVisible = false
-		emptyContent := fmt.Sprintf("[%s]•  •  •[-]\n[%s::b]%s[-:-:-]\n[%s]可使用上方标签切换其它栏目，或按 r 刷新[-]",
-			accentColor.String(),
+		emptyContent := fmt.Sprintf("[%s::b]%s[-:-:-]",
 			tview.Styles.PrimaryTextColor.String(),
 			tview.Escape(message),
-			mutedColor.String(),
 		)
 		roomManagerEmpty.SetText(emptyContent)
 		roomManagerContent.SwitchToPage("empty")
-		app.SetFocus(roomManagerBackButton)
+		if app.GetFocus() == roomManagerTable {
+			app.SetFocus(roomManagerNavigation)
+		}
 	}
 	closeRoomManager := func() {
 		roomManagerGeneration++
 		roomManagerVisible = false
 		roomManagerConfirmVisible = false
 		roomManagerInputVisible = false
+		roomManagerRetryAction = nil
+		roomManagerFlowBack = nil
+		roomManagerFlowSearchable = false
+		roomManagerFocusContentAfterLoad = false
 		pendingRoomManagerAction = nil
 		setRoomManagerNotice("", false)
 		pages.HidePage("room-manager-confirm")
-		pages.HidePage("room-manager")
+		// 房间管理是独立工作区，不与弹幕页叠加绘制。切回主页面时也用
+		// SwitchToPage 恢复唯一可见页，避免宽字符残留在下一帧。
+		pages.SwitchToPage("main")
 		app.SetFocus(reply)
 	}
 	roomManagerBackButton.SetSelectedFunc(closeRoomManager)
-	showRoomManagerLoading := func(title string) uint64 {
+	roomManagerRetryButton.SetSelectedFunc(func() {
+		if roomManagerRetryAction != nil {
+			roomManagerFocusContentAfterLoad = true
+			roomManagerRetryAction()
+		}
+	})
+	roomManagerAddAdminButton.SetSelectedFunc(func() {
+		if triggerAddRoomAdmin != nil {
+			triggerAddRoomAdmin()
+		}
+	})
+	roomManagerMuteUserButton.SetSelectedFunc(func() {
+		if triggerMuteRoomUser != nil {
+			triggerMuteRoomUser()
+		}
+	})
+	roomManagerBlacklistUserButton.SetSelectedFunc(func() {
+		if triggerBlacklistRoomUser != nil {
+			triggerBlacklistRoomUser()
+		}
+	})
+	roomManagerAddKeywordButton.SetSelectedFunc(func() {
+		if triggerAddShieldKeyword != nil {
+			triggerAddShieldKeyword()
+		}
+	})
+	roomManagerFlowBackButton.SetSelectedFunc(func() {
+		if roomManagerFlowBack != nil {
+			roomManagerFocusContentAfterLoad = true
+			roomManagerFlowBack()
+		}
+	})
+	roomManagerCloseSilentButton.SetSelectedFunc(func() {
+		if triggerCloseRoomSilent != nil {
+			triggerCloseRoomSilent()
+		}
+	})
+	roomManagerSearchAgainButton.SetSelectedFunc(func() {
+		if openRoomManagerUserSearch != nil {
+			openRoomManagerUserSearch(roomManagerSearchOperation)
+		}
+	})
+	roomManagerPrevButton.SetSelectedFunc(func() {
+		if roomManagerPrevPage != nil {
+			roomManagerFocusContentAfterLoad = true
+			roomManagerPrevPage()
+		}
+	})
+	roomManagerNextButton.SetSelectedFunc(func() {
+		if roomManagerNextPage != nil {
+			roomManagerFocusContentAfterLoad = true
+			roomManagerNextPage()
+		}
+	})
+	showRoomManagerLoading := func(_ string) uint64 {
 		roomManagerGeneration++
 		generation := roomManagerGeneration
-		roomManagerSection.SetText("[" + mutedColor.String() + "]" + tview.Escape(title) + " · 正在加载[-]")
+		roomManagerRetryAction = nil
+		roomManagerCanPrevPage = false
+		roomManagerCanNextPage = false
+		updateRoomManagerActionBar("default")
+		roomManagerSection.SetText("[" + mutedColor.String() + "]正在加载……[-]")
 		showRoomManagerEmptyView("正在加载……")
 		return generation
 	}
@@ -539,12 +770,21 @@ func RunDanmaku(ctx context.Context, session *LiveDanmakuSession, client *api.Cl
 		if !roomManagerVisible || generation != roomManagerGeneration {
 			return
 		}
-		showRoomManagerListView()
-		roomManagerList.Clear()
-		roomManagerSection.SetText("[" + errorColor.String() + "]" + tview.Escape(title) + " · 加载失败[-]")
-		addRoomManagerItem("加载失败", compactDanmakuManagementError(err), "", 0, nil)
-		addRoomManagerItem("重试", "", "重试", 'r', retry)
-		roomManagerList.SetCurrentItem(1)
+		roomManagerInputVisible = false
+		roomManagerRetryAction = retry
+		roomManagerSection.SetText("[" + errorColor.String() + "]请求异常[-]")
+		setRoomManagerNotice("请求失败："+compactDanmakuManagementError(err), true)
+		errCard := fmt.Sprintf("[%s::b]%s 加载失败[-:-:-]\n\n[%s]%s[-]",
+			errorColor.String(),
+			tview.Escape(title),
+			tview.Styles.PrimaryTextColor.String(),
+			compactDanmakuManagementError(err),
+		)
+		roomManagerErrorText.SetText(errCard)
+		roomManagerContent.SwitchToPage("error")
+		updateRoomManagerActionBar("error")
+		roomManagerFocusContentAfterLoad = false
+		app.SetFocus(roomManagerRetryButton)
 	}
 	runRoomManagerAction := func() {
 		action := pendingRoomManagerAction
@@ -552,6 +792,8 @@ func RunDanmaku(ctx context.Context, session *LiveDanmakuSession, client *api.Cl
 		pendingRoomManagerAction = nil
 		roomManagerConfirmVisible = false
 		pages.HidePage("room-manager-confirm")
+		roomManagerFocusContentAfterLoad = true
+		app.SetFocus(roomManagerNavigation)
 		generation := showRoomManagerLoading(label)
 		setRoomManagerNotice("正在"+label+"……", false)
 		go func() {
@@ -585,7 +827,7 @@ func RunDanmaku(ctx context.Context, session *LiveDanmakuSession, client *api.Cl
 		pendingRoomManagerAction = nil
 		pages.HidePage("room-manager-confirm")
 		pages.SendToFront("room-manager")
-		app.SetFocus(roomManagerList)
+		focusRoomManagerContent()
 	})
 	openRoomManagerConfirm := func(label, warning string, action func(context.Context) error) {
 		pendingRoomManagerLabel = label
@@ -597,24 +839,29 @@ func RunDanmaku(ctx context.Context, session *LiveDanmakuSession, client *api.Cl
 		app.SetFocus(roomManagerConfirm)
 	}
 	roomManagerSectionBeforeInput := ""
+	roomManagerPageBeforeInput := "table"
 	closeRoomManagerInput := func() {
 		roomManagerInputVisible = false
-		roomManagerContent.SwitchToPage("list")
+		roomManagerContent.SwitchToPage(roomManagerPageBeforeInput)
 		roomManagerSection.SetText(roomManagerSectionBeforeInput)
 		setRoomManagerNotice("", false)
-		app.SetFocus(roomManagerList)
+		focusRoomManagerContent()
 	}
 	roomManagerInput.SetCancelFunc(closeRoomManagerInput)
-	openRoomManagerInput := func(title, label, initial string, maxLength int, validate func(string) error, submitted func(string)) {
+	openRoomManagerInput := func(title, label, initial string, maxLength int, submitLabel string, validate func(string) error, submitted func(string)) {
 		roomManagerInput.Clear(true)
 		roomManagerSectionBeforeInput = roomManagerSection.GetText(false)
-		roomManagerSection.SetText("[" + tview.Styles.TitleColor.String() + "]" + tview.Escape(title) + "[-]")
+		roomManagerPageBeforeInput, _ = roomManagerContent.GetFrontPage()
+		roomManagerSection.SetText("[" + mutedColor.String() + "]填写后确认操作[-]")
 		setRoomManagerNotice("", false)
 		roomManagerInput.SetTitle(" " + title + " ")
 		roomManagerInput.AddInputField(label, initial, maxLength, nil, func(string) {
 			setRoomManagerNotice("", false)
 		})
-		roomManagerInput.AddButton("保存", func() {
+		if strings.TrimSpace(submitLabel) == "" {
+			submitLabel = "保存"
+		}
+		roomManagerInput.AddButton(submitLabel, func() {
 			value := roomManagerInput.GetFormItem(0).(*tview.InputField).GetText()
 			if validate != nil {
 				if err := validate(value); err != nil {
@@ -631,6 +878,241 @@ func RunDanmaku(ctx context.Context, session *LiveDanmakuSession, client *api.Cl
 		roomManagerContent.SwitchToPage("input")
 		app.SetFocus(roomManagerInput)
 	}
+	returnToRoomManagerList := func() {
+		roomManagerFlowBack = nil
+		roomManagerFlowSearchable = false
+		roomManagerFocusContentAfterLoad = true
+		setRoomManagerNotice("", false)
+		if roomManagerReload != nil {
+			roomManagerReload()
+		}
+	}
+	setRoomManagerFlowBack := func(label string, action func(), searchable bool) {
+		roomManagerFlowBackButton.SetLabel(label)
+		roomManagerFlowBack = action
+		roomManagerFlowSearchable = searchable
+		roomManagerCanPrevPage = false
+		roomManagerCanNextPage = false
+		updateRoomManagerActionBar("flow")
+	}
+	showRoomManagerAdminChoices = func(target api.RoomUserSearchResult, fromSearch bool) {
+		showRoomManagerTableView()
+		roomManagerTable.Clear()
+		clear(roomManagerTableActions)
+		currentLevel := target.AdminLevel
+		if knownLevel := roomManagerAdminLevels[target.UserID]; knownLevel > 0 {
+			currentLevel = knownLevel
+		}
+		roomManagerSection.SetText(fmt.Sprintf("[%s::b]管理房管[-:-:-] [%s]· %s[-]", tview.Styles.PrimaryTextColor.String(), mutedColor.String(), displayDanmakuManagedUser(target.Username, target.UserID)))
+		setRoomManagerNotice("", false)
+		roomManagerTable.SetCell(0, 0, roomManagerTableHeaderCell("房管身份", 18, 1))
+		roomManagerTable.SetCell(0, 1, roomManagerTableHeaderCell("说明", 42, 2))
+		roomManagerTable.SetCell(0, 2, roomManagerTableHeaderCell("操作", 8, 0).SetAlign(tview.AlignCenter))
+		addLevel := func(row, level int, label, detail string) {
+			roomManagerTable.SetCell(row, 0, roomManagerTableTextCell(label, 18, 1))
+			roomManagerTable.SetCell(row, 1, roomManagerTableMutedCell(detail, 42, 2))
+			if currentLevel == level {
+				roomManagerTable.SetCell(row, 2, roomManagerTableMutedCell("当前", 8, 0).SetAlign(tview.AlignCenter))
+				return
+			}
+			actionLabel := "任命"
+			if currentLevel > 0 {
+				actionLabel = "调整"
+			}
+			action := func() {
+				openRoomManagerConfirm(actionLabel+"房管", "确定将 "+displayDanmakuManagedUser(target.Username, target.UserID)+" 设为"+label+"吗？", func(actionCtx context.Context) error {
+					return client.AppointRoomAdmin(actionCtx, target.UserID, level, sessdata, biliJCT)
+				})
+			}
+			roomManagerTableActions[row] = action
+			roomManagerTable.SetCell(row, 2, roomManagerTableActionCell(actionLabel, accentActiveColor, action))
+		}
+		row := 1
+		addLevel(row, 1, "普通房管", "可按权限禁言或拉黑普通用户")
+		row++
+		if roomManagerSeniorAdminEnabled || currentLevel == 2 {
+			addLevel(row, 2, "高级房管", "还可按权限禁言或拉黑普通房管")
+			row++
+		} else if !roomManagerSeniorAdminKnown {
+			setRoomManagerNotice("未能确认高级房管功能，暂只提供普通房管。", false)
+		}
+		if currentLevel > 0 {
+			revokeRow := row
+			action := func() {
+				openRoomManagerConfirm("撤销房管", "确定撤销 "+displayDanmakuManagedUser(target.Username, target.UserID)+" 的房管权限吗？", func(actionCtx context.Context) error {
+					return client.DismissRoomAdmin(actionCtx, target.UserID, sessdata, biliJCT)
+				})
+			}
+			roomManagerTableActions[revokeRow] = action
+			roomManagerTable.SetCell(revokeRow, 0, roomManagerTableTextCell("撤销房管", 18, 1))
+			roomManagerTable.SetCell(revokeRow, 1, roomManagerTableMutedCell("移除该用户的直播间管理权限", 42, 2))
+			roomManagerTable.SetCell(revokeRow, 2, roomManagerTableActionCell("撤销", errorColor, action))
+		}
+		if fromSearch {
+			setRoomManagerFlowBack("返回搜索结果", renderRoomManagerSearchResults, false)
+		} else {
+			setRoomManagerFlowBack("返回房管列表", returnToRoomManagerList, false)
+		}
+		roomManagerTable.Select(1, 0).ScrollToBeginning()
+	}
+	showRoomManagerMuteChoices = func(target api.RoomUserSearchResult) {
+		showRoomManagerTableView()
+		roomManagerTable.Clear()
+		clear(roomManagerTableActions)
+		roomManagerSection.SetText(fmt.Sprintf("[%s::b]禁言用户[-:-:-] [%s]· %s[-]", tview.Styles.PrimaryTextColor.String(), mutedColor.String(), displayDanmakuManagedUser(target.Username, target.UserID)))
+		setRoomManagerNotice("", false)
+		roomManagerTable.SetCell(0, 0, roomManagerTableHeaderCell("禁言时长", 18, 1))
+		roomManagerTable.SetCell(0, 1, roomManagerTableHeaderCell("说明", 42, 2))
+		roomManagerTable.SetCell(0, 2, roomManagerTableHeaderCell("操作", 8, 0).SetAlign(tview.AlignCenter))
+		durations := []struct {
+			label    string
+			detail   string
+			duration api.RoomUserMuteDuration
+		}{
+			{"仅本场直播", "本次直播结束后自动解除", api.RoomMuteThisLive},
+			{"2 小时", "禁言 2 小时", api.RoomMuteTwoHours},
+			{"4 小时", "禁言 4 小时", api.RoomMuteFourHours},
+			{"24 小时", "禁言 1 天", api.RoomMuteOneDay},
+			{"7 天", "禁言 7 天", api.RoomMuteSevenDays},
+			{"永久", "直到手动解除禁言", api.RoomMutePermanent},
+		}
+		for index, item := range durations {
+			item := item
+			row := index + 1
+			action := func() {
+				openRoomManagerConfirm("禁言用户", "确定禁言 "+displayDanmakuManagedUser(target.Username, target.UserID)+"（"+item.label+"）吗？", func(actionCtx context.Context) error {
+					return client.MuteRoomUser(actionCtx, roomID, target.UserID, "", item.duration, sessdata, biliJCT)
+				})
+			}
+			roomManagerTableActions[row] = action
+			roomManagerTable.SetCell(row, 0, roomManagerTableTextCell(item.label, 18, 1))
+			roomManagerTable.SetCell(row, 1, roomManagerTableMutedCell(item.detail, 42, 2))
+			roomManagerTable.SetCell(row, 2, roomManagerTableActionCell("选择", accentActiveColor, action))
+		}
+		setRoomManagerFlowBack("返回搜索结果", renderRoomManagerSearchResults, false)
+		roomManagerTable.Select(1, 0).ScrollToBeginning()
+	}
+	renderRoomManagerSearchResults = func() {
+		showRoomManagerTableView()
+		roomManagerTable.Clear()
+		clear(roomManagerTableActions)
+		roomManagerSection.SetText(fmt.Sprintf("[%s::b]搜索结果[-:-:-] [%s]· %s[-]", tview.Styles.PrimaryTextColor.String(), mutedColor.String(), tview.Escape(roomManagerSearchQuery)))
+		setRoomManagerNotice("请核对用户名和 UID 后再操作。", false)
+		roomManagerTable.SetCell(0, 0, roomManagerTableHeaderCell("用户", 32, 2))
+		roomManagerTable.SetCell(0, 1, roomManagerTableHeaderCell("UID", 20, 1))
+		roomManagerTable.SetCell(0, 2, roomManagerTableHeaderCell("状态", 12, 0))
+		roomManagerTable.SetCell(0, 3, roomManagerTableHeaderCell("操作", 8, 0).SetAlign(tview.AlignCenter))
+		setRoomManagerFlowBack("返回列表", returnToRoomManagerList, true)
+		if len(roomManagerSearchResults) == 0 {
+			showRoomManagerEmptyView("未找到匹配用户")
+			updateRoomManagerActionBar("flow")
+			restoreRoomManagerFocusAfterLoad()
+			return
+		}
+		for index, result := range roomManagerSearchResults {
+			result := result
+			row := index + 1
+			currentLevel := result.AdminLevel
+			if knownLevel := roomManagerAdminLevels[result.UserID]; knownLevel > 0 {
+				currentLevel = knownLevel
+				result.AdminLevel = knownLevel
+			}
+			statusText := "可操作"
+			actionLabel := "选择"
+			canOperate := true
+			switch {
+			case result.UserID == strings.TrimSpace(managementCapabilities.UserID):
+				statusText, canOperate = "当前账号", false
+			case result.UserID == strings.TrimSpace(managementCapabilities.AnchorID):
+				statusText, canOperate = "主播", false
+			case roomManagerSearchOperation == roomManagerUserMute && !managementCapabilities.CanMute(currentLevel):
+				statusText, canOperate = "无权禁言", false
+			case roomManagerSearchOperation == roomManagerUserBlacklist && !managementCapabilities.CanBlacklist(currentLevel):
+				statusText, canOperate = "无权拉黑", false
+			case roomManagerSearchOperation == roomManagerUserAddAdmin && currentLevel == 1:
+				statusText, actionLabel = "普通房管", "管理"
+			case roomManagerSearchOperation == roomManagerUserAddAdmin && currentLevel == 2:
+				statusText, actionLabel = "高级房管", "管理"
+			}
+			var action func()
+			if canOperate {
+				action = func() {
+					switch roomManagerSearchOperation {
+					case roomManagerUserAddAdmin:
+						showRoomManagerAdminChoices(result, true)
+					case roomManagerUserMute:
+						showRoomManagerMuteChoices(result)
+					case roomManagerUserBlacklist:
+						openRoomManagerConfirm("添加黑名单用户", "确定将 "+displayDanmakuManagedUser(result.Username, result.UserID)+" 添加到直播间黑名单吗？\n\n对方将无法观看、发言和互动。", func(actionCtx context.Context) error {
+							return client.BlacklistRoomUser(actionCtx, managementCapabilities.AnchorID, result.UserID, sessdata, biliJCT)
+						})
+					}
+				}
+				roomManagerTableActions[row] = action
+			}
+			roomManagerTable.SetCell(row, 0, roomManagerTableTextCell(fallbackDanmakuManagementText(result.Username, "用户名未知"), 32, 2))
+			roomManagerTable.SetCell(row, 1, roomManagerTableMutedCell(tview.Escape(result.UserID), 20, 1))
+			roomManagerTable.SetCell(row, 2, roomManagerTableMutedCell(statusText, 12, 0))
+			if canOperate {
+				roomManagerTable.SetCell(row, 3, roomManagerTableActionCell(actionLabel, accentActiveColor, action))
+			} else {
+				roomManagerTable.SetCell(row, 3, roomManagerTableMutedCell("不可操作", 8, 0).SetAlign(tview.AlignCenter))
+			}
+		}
+		roomManagerTable.Select(1, 0).ScrollToBeginning()
+		restoreRoomManagerFocusAfterLoad()
+	}
+	searchRoomManagerUsers = func(operation roomManagerUserOperation, query string) {
+		query = strings.TrimSpace(query)
+		roomManagerSearchOperation = operation
+		roomManagerSearchQuery = query
+		roomManagerFocusContentAfterLoad = true
+		generation := showRoomManagerLoading("查找用户")
+		roomManagerSection.SetText(fmt.Sprintf("[%s]正在查找 %s……[-]", mutedColor.String(), tview.Escape(query)))
+		setRoomManagerFlowBack("返回列表", returnToRoomManagerList, false)
+		go func() {
+			requestCtx, cancelRequest := context.WithTimeout(streamCtx, 10*time.Second)
+			defer cancelRequest()
+			results, err := client.SearchRoomUsers(requestCtx, query, sessdata, biliJCT)
+			queueUI(func() {
+				if !roomManagerVisible || generation != roomManagerGeneration {
+					return
+				}
+				if err != nil {
+					roomManagerSection.SetText(fmt.Sprintf("[%s]查找失败[-]", errorColor.String()))
+					setRoomManagerNotice(compactDanmakuManagementError(err), true)
+					showRoomManagerEmptyView("未能完成用户查找")
+					setRoomManagerFlowBack("返回列表", returnToRoomManagerList, true)
+					restoreRoomManagerFocusAfterLoad()
+					return
+				}
+				roomManagerSearchResults = results
+				renderRoomManagerSearchResults()
+			})
+		}()
+	}
+	openRoomManagerUserSearch = func(operation roomManagerUserOperation) {
+		title := "查找用户"
+		switch operation {
+		case roomManagerUserAddAdmin:
+			title = "添加房管"
+		case roomManagerUserMute:
+			title = "禁言用户"
+		case roomManagerUserBlacklist:
+			title = "添加黑名单用户"
+		}
+		openRoomManagerInput(title, "UID 或用户名 ", "", 50, "查找", func(value string) error {
+			if strings.TrimSpace(value) == "" {
+				return fmt.Errorf("请输入 UID 或用户名。")
+			}
+			return nil
+		}, func(value string) {
+			searchRoomManagerUsers(operation, value)
+		})
+	}
+	triggerAddRoomAdmin = func() { openRoomManagerUserSearch(roomManagerUserAddAdmin) }
+	triggerMuteRoomUser = func() { openRoomManagerUserSearch(roomManagerUserMute) }
+	triggerBlacklistRoomUser = func() { openRoomManagerUserSearch(roomManagerUserBlacklist) }
 	roomManagerPrevPage = func() {
 		if len(roomManagerTabsAvailable) == 0 || roomManagerTabIndex >= len(roomManagerTabsAvailable) {
 			return
@@ -638,16 +1120,19 @@ func RunDanmaku(ctx context.Context, session *LiveDanmakuSession, client *api.Cl
 		switch roomManagerTabsAvailable[roomManagerTabIndex].label {
 		case "房管":
 			if roomAdminPage > 1 {
+				roomManagerFocusContentAfterLoad = true
 				roomAdminPage--
 				loadRoomAdmins()
 			}
 		case "禁言":
 			if mutedUserPage > 1 {
+				roomManagerFocusContentAfterLoad = true
 				mutedUserPage--
 				loadMutedUsers()
 			}
 		case "黑名单":
 			if blacklistPage > 1 {
+				roomManagerFocusContentAfterLoad = true
 				blacklistPage--
 				loadBlacklistedUsers()
 			}
@@ -660,16 +1145,19 @@ func RunDanmaku(ctx context.Context, session *LiveDanmakuSession, client *api.Cl
 		switch roomManagerTabsAvailable[roomManagerTabIndex].label {
 		case "房管":
 			if roomAdminPage < roomAdminTotalPages {
+				roomManagerFocusContentAfterLoad = true
 				roomAdminPage++
 				loadRoomAdmins()
 			}
 		case "禁言":
-			if mutedHasNextPage {
+			if mutedUserPage < mutedTotalPages {
+				roomManagerFocusContentAfterLoad = true
 				mutedUserPage++
 				loadMutedUsers()
 			}
 		case "黑名单":
-			if blacklistPage < blacklistTotalPages {
+			if roomManagerCanNextPage {
+				roomManagerFocusContentAfterLoad = true
 				blacklistPage++
 				loadBlacklistedUsers()
 			}
@@ -704,6 +1192,15 @@ func RunDanmaku(ctx context.Context, session *LiveDanmakuSession, client *api.Cl
 		if roomManagerTabIndex >= len(roomManagerTabsAvailable) {
 			roomManagerTabIndex = 0
 		}
+		roomManagerNavigationSyncing = true
+		roomManagerNavigation.Clear()
+		for _, tab := range roomManagerTabsAvailable {
+			roomManagerNavigation.AddItem(tab.label, "", 0, func() {
+				focusRoomManagerContent()
+			})
+		}
+		roomManagerNavigation.SetCurrentItem(roomManagerTabIndex)
+		roomManagerNavigationSyncing = false
 		selectRoomManagerTab(roomManagerTabIndex)
 	}
 	selectRoomManagerTab = func(index int) {
@@ -713,42 +1210,57 @@ func RunDanmaku(ctx context.Context, session *LiveDanmakuSession, client *api.Cl
 		}
 		index = (index%len(roomManagerTabsAvailable) + len(roomManagerTabsAvailable)) % len(roomManagerTabsAvailable)
 		roomManagerTabIndex = index
-		var tabs strings.Builder
-		for tabIndex, tab := range roomManagerTabsAvailable {
-			if tabIndex > 0 {
-				tabs.WriteString("   ")
-			}
-			regionID := fmt.Sprintf("room-manager-tab-%d", tabIndex)
-			tabNumber := tabIndex + 1
-			if tabIndex == index {
-				fmt.Fprintf(&tabs, "[\"%s\"][%s:%s:b] %d %s [-:-:-][\"\"]", regionID, buttonActiveTextColor.String(), accentActiveColor.String(), tabNumber, tview.Escape(tab.label))
-			} else {
-				fmt.Fprintf(&tabs, "[\"%s\"][%s]%d [%s]%s[-:-:-][\"\"]", regionID, accentColor.String(), tabNumber, tview.Styles.PrimaryTextColor.String(), tview.Escape(tab.label))
-			}
-		}
-		roomManagerTabs.SetText(tabs.String())
-		roomManagerContent.SwitchToPage("list")
-		roomManagerInputVisible = false
-		setRoomManagerNotice("", false)
+		roomManagerNavigationSyncing = true
+		roomManagerNavigation.SetCurrentItem(index)
+		roomManagerNavigationSyncing = false
 		tab := roomManagerTabsAvailable[index]
+		switch tab.label {
+		case "房管":
+			roomManagerBaseActionMode = "admin"
+		case "禁言":
+			roomManagerBaseActionMode = "mute"
+		case "黑名单":
+			roomManagerBaseActionMode = "blacklist"
+		case "屏蔽词":
+			roomManagerBaseActionMode = "keyword"
+		default:
+			roomManagerBaseActionMode = "default"
+		}
+		roomManagerCanPrevPage = false
+		roomManagerCanNextPage = false
+		roomManagerFlowSearchable = false
+		roomManagerFocusContentAfterLoad = false
+		showRoomManagerTableView()
+		setRoomManagerNotice("", false)
 		roomManagerReload = tab.load
 		tab.load()
-		app.SetFocus(roomManagerList)
 	}
-	roomManagerTabs.SetHighlightedFunc(func(added, _, _ []string) {
-		if len(added) == 0 {
+	roomManagerNavigation.SetChangedFunc(func(index int, _, _ string, _ rune) {
+		if roomManagerNavigationSyncing || !roomManagerVisible || roomManagerConfirmVisible || roomManagerInputVisible {
 			return
 		}
-		roomManagerTabs.Highlight()
-		indexText := strings.TrimPrefix(added[0], "room-manager-tab-")
-		index, err := strconv.Atoi(indexText)
-		if err == nil && roomManagerVisible && !roomManagerConfirmVisible && !roomManagerInputVisible {
+		if index >= 0 && index < len(roomManagerTabsAvailable) && index != roomManagerTabIndex {
 			selectRoomManagerTab(index)
 		}
 	})
 	loadRoomAdmins = func() {
 		generation := showRoomManagerLoading("房管")
 		roomManagerReload = loadRoomAdmins
+		if !roomManagerSeniorAdminKnown && !roomManagerSeniorAdminLoading && strings.TrimSpace(managementCapabilities.AnchorID) != "" {
+			roomManagerSeniorAdminLoading = true
+			go func(anchorID string) {
+				requestCtx, cancelRequest := context.WithTimeout(streamCtx, 6*time.Second)
+				defer cancelRequest()
+				status, err := client.GetRoomAdminSeniorStatus(requestCtx, anchorID, sessdata, biliJCT)
+				queueUI(func() {
+					roomManagerSeniorAdminLoading = false
+					if err == nil {
+						roomManagerSeniorAdminKnown = true
+						roomManagerSeniorAdminEnabled = status > 0
+					}
+				})
+			}(managementCapabilities.AnchorID)
+		}
 		go func() {
 			requestCtx, cancelRequest := context.WithTimeout(streamCtx, 10*time.Second)
 			defer cancelRequest()
@@ -761,46 +1273,56 @@ func RunDanmaku(ctx context.Context, session *LiveDanmakuSession, client *api.Cl
 				if !roomManagerVisible || generation != roomManagerGeneration {
 					return
 				}
-				showRoomManagerListView()
-				roomManagerList.Clear()
-				adminCount := fmt.Sprintf("第 %d 页", roomAdminPage)
-				if result.MaxCount > 0 {
-					adminCount += fmt.Sprintf(" · 最多 %d 人", result.MaxCount)
-				}
-				roomManagerSection.SetText(fmt.Sprintf("[%s]房管 · %s[-]", mutedColor.String(), adminCount))
-				if len(result.Items) == 0 && roomAdminPage == 1 {
-					showRoomManagerEmptyView("暂无房管")
-					return
-				}
-				for _, admin := range result.Items {
-					admin := admin
-					level := "普通房管"
-					if admin.Level == 2 {
-						level = "高级房管"
-					}
-					addRoomManagerItem(displayDanmakuManagedUser(admin.Username, admin.UserID), level+managementTimestamp(admin.AppointedAt), "撤销", 0, func() {
-						openRoomManagerConfirm("撤销房管", "确定撤销 "+displayDanmakuManagedUser(admin.Username, admin.UserID)+" 的房管权限吗？", func(actionCtx context.Context) error {
-							return client.DismissRoomAdmin(actionCtx, admin.UserID, sessdata, biliJCT)
-						})
-					})
-				}
+				showRoomManagerTableView()
+				roomManagerTable.Clear()
+				clear(roomManagerTableActions)
+				clear(roomManagerAdminLevels)
+				roomManagerTable.SetCell(0, 0, roomManagerTableHeaderCell("用户", 32, 2))
+				roomManagerTable.SetCell(0, 1, roomManagerTableHeaderCell("身份", 10, 0))
+				roomManagerTable.SetCell(0, 2, roomManagerTableHeaderCell("任命时间", 20, 1))
+				roomManagerTable.SetCell(0, 3, roomManagerTableHeaderCell("操作", 8, 0).SetAlign(tview.AlignCenter))
 				roomAdminTotalPages = result.TotalPages
 				if roomAdminTotalPages < 1 {
 					roomAdminTotalPages = 1
 				}
-				if roomAdminPage > 1 {
-					addRoomManagerItem("上一页", "", "", 0, func() {
-						roomAdminPage--
-						loadRoomAdmins()
-					})
+				adminCount := fmt.Sprintf("本页 %d 人", len(result.Items))
+				if result.MaxCount > 0 {
+					adminCount += fmt.Sprintf(" · 容量上限 %d 人", result.MaxCount)
 				}
-				if result.TotalPages > roomAdminPage {
-					addRoomManagerItem("下一页", "", "", 0, func() {
-						roomAdminPage++
-						loadRoomAdmins()
-					})
+				adminCount += fmt.Sprintf(" · 第 %d/%d 页", roomAdminPage, roomAdminTotalPages)
+				roomManagerSection.SetText(fmt.Sprintf("[%s]%s[-]", mutedColor.String(), adminCount))
+				roomManagerCanPrevPage = roomAdminPage > 1
+				roomManagerCanNextPage = roomAdminPage < roomAdminTotalPages
+				updateRoomManagerActionBar(roomManagerBaseActionMode)
+				if len(result.Items) == 0 && roomAdminPage == 1 {
+					showRoomManagerEmptyView("暂无房管")
+					restoreRoomManagerFocusAfterLoad()
+					return
 				}
-				roomManagerList.SetCurrentItem(0)
+				for index, admin := range result.Items {
+					admin := admin
+					row := index + 1
+					roomManagerAdminLevels[admin.UserID] = admin.Level
+					action := func() {
+						showRoomManagerAdminChoices(api.RoomUserSearchResult{UserID: admin.UserID, Username: admin.Username, AdminLevel: admin.Level}, false)
+					}
+					level := "普通房管"
+					if admin.Level == 2 {
+						level = "高级房管"
+					}
+					roomManagerTableActions[row] = action
+					roomManagerTable.SetCell(row, 0, roomManagerTableTextCell(formatRoomManagerTableUser(admin.Username, admin.UserID), 32, 2))
+					roomManagerTable.SetCell(row, 1, roomManagerTableTextCell(level, 10, 0))
+					roomManagerTable.SetCell(row, 2, roomManagerTableMutedCell(fallbackDanmakuManagementText(admin.AppointedAt, "时间未知"), 20, 1))
+					roomManagerTable.SetCell(row, 3, roomManagerTableActionCell("管理", accentActiveColor, action))
+				}
+				if len(result.Items) == 0 {
+					showRoomManagerEmptyView("本页没有记录")
+					restoreRoomManagerFocusAfterLoad()
+					return
+				}
+				roomManagerTable.Select(1, 0).ScrollToBeginning()
+				restoreRoomManagerFocusAfterLoad()
 			})
 		}()
 	}
@@ -810,7 +1332,7 @@ func RunDanmaku(ctx context.Context, session *LiveDanmakuSession, client *api.Cl
 		go func() {
 			requestCtx, cancelRequest := context.WithTimeout(streamCtx, 10*time.Second)
 			defer cancelRequest()
-			items, err := client.GetMutedRoomUsers(requestCtx, roomID, mutedUserPage, sessdata, biliJCT)
+			result, err := client.GetMutedRoomUsers(requestCtx, roomID, mutedUserPage, sessdata, biliJCT)
 			queueUI(func() {
 				if err != nil {
 					showRoomManagerError(generation, "禁言名单", err, loadMutedUsers)
@@ -819,43 +1341,65 @@ func RunDanmaku(ctx context.Context, session *LiveDanmakuSession, client *api.Cl
 				if !roomManagerVisible || generation != roomManagerGeneration {
 					return
 				}
-				showRoomManagerListView()
-				roomManagerList.Clear()
-				roomManagerSection.SetText(fmt.Sprintf("[%s]禁言名单 · 第 %d 页[-]", mutedColor.String(), mutedUserPage))
-				if len(items) == 0 && mutedUserPage == 1 {
+				showRoomManagerTableView()
+				roomManagerTable.Clear()
+				clear(roomManagerTableActions)
+				roomManagerTable.SetCell(0, 0, roomManagerTableHeaderCell("用户", 30, 2))
+				roomManagerTable.SetCell(0, 1, roomManagerTableHeaderCell("到期时间", 20, 1))
+				roomManagerTable.SetCell(0, 2, roomManagerTableHeaderCell("操作者", 14, 1))
+				roomManagerTable.SetCell(0, 3, roomManagerTableHeaderCell("操作", 8, 0).SetAlign(tview.AlignCenter))
+				mutedTotalPages = result.TotalPages
+				if mutedTotalPages < 1 {
+					mutedTotalPages = 1
+				}
+				sectionText := fmt.Sprintf("第 %d/%d 页", mutedUserPage, mutedTotalPages)
+				if result.Total > 0 {
+					sectionText = fmt.Sprintf("共 %d 人 · %s", result.Total, sectionText)
+				}
+				roomManagerSection.SetText(fmt.Sprintf("[%s]%s[-]", mutedColor.String(), sectionText))
+				roomManagerCanPrevPage = mutedUserPage > 1
+				roomManagerCanNextPage = mutedUserPage < mutedTotalPages
+				updateRoomManagerActionBar(roomManagerBaseActionMode)
+				if len(result.Items) == 0 && mutedUserPage == 1 {
 					showRoomManagerEmptyView("暂无被禁言用户")
+					restoreRoomManagerFocusAfterLoad()
 					return
 				}
-				for _, item := range items {
+				for index, item := range result.Items {
 					item := item
-					detail := "到期 " + fallbackDanmakuManagementText(item.ExpiresAt, "未知")
-					if item.OperatorName != "" {
-						detail += " · 操作者 " + item.OperatorName
-					}
-					if managementCapabilities.CanMute(item.AdminLevel) {
-						addRoomManagerItem(displayDanmakuManagedUser(item.Username, item.UserID), detail, "解除", 0, func() {
+					row := index + 1
+					canMute := managementCapabilities.CanMute(item.AdminLevel)
+					var action func()
+					if canMute {
+						action = func() {
 							openRoomManagerConfirm("解除禁言", "确定解除 "+displayDanmakuManagedUser(item.Username, item.UserID)+" 的禁言吗？", func(actionCtx context.Context) error {
 								return client.UnmuteRoomUser(actionCtx, roomID, item.UserID, sessdata, biliJCT)
 							})
-						})
+						}
+						roomManagerTableActions[row] = action
+					}
+					operator := "执行人未知"
+					if item.OperatorIsAnchor {
+						operator = "主播"
+					} else if strings.TrimSpace(item.OperatorName) != "" {
+						operator = item.OperatorName
+					}
+					roomManagerTable.SetCell(row, 0, roomManagerTableTextCell(formatRoomManagerTableUser(item.Username, item.UserID), 30, 2))
+					roomManagerTable.SetCell(row, 1, roomManagerTableMutedCell(fallbackDanmakuManagementText(item.ExpiresAt, "永久或未知"), 20, 1))
+					roomManagerTable.SetCell(row, 2, roomManagerTableMutedCell(tview.Escape(operator), 14, 1))
+					if canMute {
+						roomManagerTable.SetCell(row, 3, roomManagerTableActionCell("解除", errorColor, action))
 					} else {
-						addRoomManagerItem(displayDanmakuManagedUser(item.Username, item.UserID), detail+" · 无权操作", "", 0, nil)
+						roomManagerTable.SetCell(row, 3, roomManagerTableMutedCell("不可操作", 8, 0).SetAlign(tview.AlignCenter))
 					}
 				}
-				mutedHasNextPage = len(items) > 0
-				if mutedUserPage > 1 {
-					addRoomManagerItem("上一页", "", "", 0, func() {
-						mutedUserPage--
-						loadMutedUsers()
-					})
+				if len(result.Items) == 0 {
+					showRoomManagerEmptyView("本页没有记录")
+					restoreRoomManagerFocusAfterLoad()
+					return
 				}
-				if len(items) > 0 {
-					addRoomManagerItem("下一页", "", "", 0, func() {
-						mutedUserPage++
-						loadMutedUsers()
-					})
-				}
-				roomManagerList.SetCurrentItem(0)
+				roomManagerTable.Select(1, 0).ScrollToBeginning()
+				restoreRoomManagerFocusAfterLoad()
 			})
 		}()
 	}
@@ -874,21 +1418,12 @@ func RunDanmaku(ctx context.Context, session *LiveDanmakuSession, client *api.Cl
 				if !roomManagerVisible || generation != roomManagerGeneration {
 					return
 				}
-				showRoomManagerListView()
-				roomManagerList.Clear()
-				roomManagerSection.SetText(fmt.Sprintf("[%s]直播间黑名单 · 第 %d 页[-]", mutedColor.String(), blacklistPage))
-				if len(result.Items) == 0 && blacklistPage == 1 {
-					showRoomManagerEmptyView("黑名单为空")
-					return
-				}
-				for _, item := range result.Items {
-					item := item
-					addRoomManagerItem(displayDanmakuManagedUser(item.Username, item.UserID), "加入 "+fallbackDanmakuManagementText(item.CreatedAt, "时间未知"), "移出", 0, func() {
-						openRoomManagerConfirm("移出黑名单", "确定将 "+displayDanmakuManagedUser(item.Username, item.UserID)+" 移出直播间黑名单吗？", func(actionCtx context.Context) error {
-							return client.UnblacklistRoomUser(actionCtx, managementCapabilities.AnchorID, item.UserID, sessdata, biliJCT)
-						})
-					})
-				}
+				showRoomManagerTableView()
+				roomManagerTable.Clear()
+				clear(roomManagerTableActions)
+				roomManagerTable.SetCell(0, 0, roomManagerTableHeaderCell("用户", 34, 2))
+				roomManagerTable.SetCell(0, 1, roomManagerTableHeaderCell("加入时间", 22, 1))
+				roomManagerTable.SetCell(0, 2, roomManagerTableHeaderCell("操作", 8, 0).SetAlign(tview.AlignCenter))
 				blacklistTotalPages = result.TotalPages
 				if blacklistTotalPages < 1 && result.Total > 0 {
 					blacklistTotalPages = (result.Total + 49) / 50
@@ -896,19 +1431,39 @@ func RunDanmaku(ctx context.Context, session *LiveDanmakuSession, client *api.Cl
 				if blacklistTotalPages < 1 {
 					blacklistTotalPages = 1
 				}
-				if blacklistPage > 1 {
-					addRoomManagerItem("上一页", "", "", 0, func() {
-						blacklistPage--
-						loadBlacklistedUsers()
-					})
+				sectionText := fmt.Sprintf("第 %d/%d 页", blacklistPage, blacklistTotalPages)
+				if result.Total > 0 {
+					sectionText = fmt.Sprintf("共 %d 人 · %s", result.Total, sectionText)
 				}
-				if len(result.Items) == 50 || result.Total > blacklistPage*50 || result.TotalPages > blacklistPage {
-					addRoomManagerItem("下一页", "", "", 0, func() {
-						blacklistPage++
-						loadBlacklistedUsers()
-					})
+				roomManagerSection.SetText(fmt.Sprintf("[%s]%s[-]", mutedColor.String(), sectionText))
+				roomManagerCanPrevPage = blacklistPage > 1
+				roomManagerCanNextPage = len(result.Items) == 50 || result.Total > blacklistPage*50 || result.TotalPages > blacklistPage
+				updateRoomManagerActionBar(roomManagerBaseActionMode)
+				if len(result.Items) == 0 && blacklistPage == 1 {
+					showRoomManagerEmptyView("黑名单为空")
+					restoreRoomManagerFocusAfterLoad()
+					return
 				}
-				roomManagerList.SetCurrentItem(0)
+				for index, item := range result.Items {
+					item := item
+					row := index + 1
+					action := func() {
+						openRoomManagerConfirm("移出黑名单", "确定将 "+displayDanmakuManagedUser(item.Username, item.UserID)+" 移出直播间黑名单吗？", func(actionCtx context.Context) error {
+							return client.UnblacklistRoomUser(actionCtx, managementCapabilities.AnchorID, item.UserID, sessdata, biliJCT)
+						})
+					}
+					roomManagerTableActions[row] = action
+					roomManagerTable.SetCell(row, 0, roomManagerTableTextCell(formatRoomManagerTableUser(item.Username, item.UserID), 34, 2))
+					roomManagerTable.SetCell(row, 1, roomManagerTableMutedCell(fallbackDanmakuManagementText(item.CreatedAt, "时间未知"), 22, 1))
+					roomManagerTable.SetCell(row, 2, roomManagerTableActionCell("移出", errorColor, action))
+				}
+				if len(result.Items) == 0 {
+					showRoomManagerEmptyView("本页没有记录")
+					restoreRoomManagerFocusAfterLoad()
+					return
+				}
+				roomManagerTable.Select(1, 0).ScrollToBeginning()
+				restoreRoomManagerFocusAfterLoad()
 			})
 		}()
 	}
@@ -927,16 +1482,20 @@ func RunDanmaku(ctx context.Context, session *LiveDanmakuSession, client *api.Cl
 				if !roomManagerVisible || generation != roomManagerGeneration {
 					return
 				}
-				showRoomManagerListView()
-				roomManagerList.Clear()
+				showRoomManagerTableView()
+				roomManagerTable.Clear()
+				clear(roomManagerTableActions)
+				roomManagerTable.SetCell(0, 0, roomManagerTableHeaderCell("屏蔽词", 48, 1))
+				roomManagerTable.SetCell(0, 1, roomManagerTableHeaderCell("操作", 8, 0).SetAlign(tview.AlignCenter))
 				count := fmt.Sprintf("%d", len(state.Keywords))
 				if state.MaxCount > 0 {
 					count = fmt.Sprintf("%d/%d", len(state.Keywords), state.MaxCount)
 				}
-				roomManagerSection.SetText("[" + mutedColor.String() + "]已使用 " + count + "[-]")
-				if state.MaxCount <= 0 || len(state.Keywords) < state.MaxCount {
-					addRoomManagerItem("添加屏蔽词", "最多 15 个字", "添加", 'a', func() {
-						openRoomManagerInput("添加屏蔽词", "屏蔽词 ", "", 15, func(keyword string) error {
+				canAddKeyword := state.MaxCount <= 0 || len(state.Keywords) < state.MaxCount
+				if canAddKeyword {
+					roomManagerSection.SetText(fmt.Sprintf("[%s]已使用 %s[-]", mutedColor.String(), count))
+					triggerAddShieldKeyword = func() {
+						openRoomManagerInput("添加屏蔽词", "屏蔽词 ", "", 15, "保存", func(keyword string) error {
 							if strings.TrimSpace(keyword) == "" {
 								return fmt.Errorf("屏蔽词不能为空。")
 							}
@@ -951,21 +1510,39 @@ func RunDanmaku(ctx context.Context, session *LiveDanmakuSession, client *api.Cl
 							}
 							runRoomManagerAction()
 						})
-					})
+					}
+					roomManagerBaseActionMode = "keyword"
+				} else {
+					roomManagerSection.SetText(fmt.Sprintf("[%s]已使用 %s · 已达上限[-]", mutedColor.String(), count))
+					triggerAddShieldKeyword = nil
+					roomManagerBaseActionMode = "default"
 				}
-				for _, keyword := range state.Keywords {
+				updateRoomManagerActionBar(roomManagerBaseActionMode)
+				if len(state.Keywords) == 0 {
+					showRoomManagerEmptyView("暂无屏蔽词")
+					restoreRoomManagerFocusAfterLoad()
+					return
+				}
+				for index, keyword := range state.Keywords {
 					keyword := keyword
-					addRoomManagerItem(keyword, "", "删除", 0, func() {
+					row := index + 1
+					action := func() {
 						openRoomManagerConfirm("删除屏蔽词", "确定删除屏蔽词“"+keyword+"”吗？", func(actionCtx context.Context) error {
 							return client.DeleteRoomShieldKeyword(actionCtx, roomID, keyword, sessdata, biliJCT)
 						})
-					})
+					}
+					roomManagerTableActions[row] = action
+					roomManagerTable.SetCell(row, 0, roomManagerTableTextCell(tview.Escape(keyword), 48, 1))
+					roomManagerTable.SetCell(row, 1, roomManagerTableActionCell("删除", errorColor, action))
 				}
-				roomManagerList.SetCurrentItem(0)
+				roomManagerTable.Select(1, 0).ScrollToBeginning()
+				restoreRoomManagerFocusAfterLoad()
 			})
 		}()
 	}
 	loadRoomSilent = func() {
+		triggerCloseRoomSilent = nil
+		roomManagerBaseActionMode = "default"
 		generation := showRoomManagerLoading("全局禁言")
 		roomManagerReload = loadRoomSilent
 		go func() {
@@ -980,28 +1557,43 @@ func RunDanmaku(ctx context.Context, session *LiveDanmakuSession, client *api.Cl
 				if !roomManagerVisible || generation != roomManagerGeneration {
 					return
 				}
-				showRoomManagerListView()
-				roomManagerList.Clear()
+				showRoomManagerTableView()
+				roomManagerTable.Clear()
+				clear(roomManagerTableActions)
+				roomManagerCanPrevPage = false
+				roomManagerCanNextPage = false
 				if state.Enabled {
-					roomManagerSection.SetText("[" + accentActiveColor.String() + "]当前已开启 · " + tview.Escape(formatRoomSilentState(state)) + "[-]")
-					addRoomManagerItem("关闭全局禁言", "恢复正常发言", "关闭", 0, func() {
+					roomManagerSection.SetText(fmt.Sprintf("[%s::b]已开启[-:-:-]", accentActiveColor.String()))
+					triggerCloseRoomSilent = func() {
 						openRoomManagerConfirm("关闭全局禁言", "确定关闭直播间全局禁言吗？", func(actionCtx context.Context) error {
 							return client.SetRoomSilentState(actionCtx, roomID, api.RoomSilentOff, 1, 0, sessdata, biliJCT)
 						})
-					})
+					}
+					roomManagerBaseActionMode = "silent-active"
+					showRoomManagerEmptyView(formatRoomSilentState(state))
+					updateRoomManagerActionBar(roomManagerBaseActionMode)
+					restoreRoomManagerFocusAfterLoad()
+					return
 				} else {
-					roomManagerSection.SetText("[" + mutedColor.String() + "]当前未开启 · 选择一种禁言范围[-]")
-					addSilentChoice := func(label, detail, audience string, level int) {
-						addRoomManagerItem(label, detail, "设置", 0, func() {
+					roomManagerSection.SetText(fmt.Sprintf("[%s]当前未开启[-]", mutedColor.String()))
+					roomManagerTable.SetCell(0, 0, roomManagerTableHeaderCell("规则", 22, 1))
+					roomManagerTable.SetCell(0, 1, roomManagerTableHeaderCell("影响范围", 46, 2))
+					roomManagerTable.SetCell(0, 2, roomManagerTableHeaderCell("操作", 8, 0).SetAlign(tview.AlignCenter))
+					addSilentChoice := func(row int, label, detail, actionLabel, audience string, level int) {
+						action := func() {
 							openRoomManagerConfirm("开启全局禁言", "确定开启“"+label+"”全局禁言吗？", func(actionCtx context.Context) error {
 								return client.SetRoomSilentState(actionCtx, roomID, audience, level, 0, sessdata, biliJCT)
 							})
-						})
+						}
+						roomManagerTableActions[row] = action
+						roomManagerTable.SetCell(row, 0, roomManagerTableTextCell(label, 22, 1))
+						roomManagerTable.SetCell(row, 1, roomManagerTableMutedCell(detail, 46, 2))
+						roomManagerTable.SetCell(row, 2, roomManagerTableActionCell(actionLabel, accentActiveColor, action))
 					}
-					addSilentChoice("全员", "除房管外均不可发言", api.RoomSilentAll, 1)
-					addSilentChoice("非本房粉丝", "未关注本直播间的用户不可发言", api.RoomSilentNonFans, 1)
-					addRoomManagerItem("荣耀等级", "设置低于该等级的用户不可发言", "设置", 0, func() {
-						openRoomManagerInput("荣耀等级禁言", "等级 1-80 ", "1", 2, func(value string) error {
+					addSilentChoice(1, "全员禁言", "除主播和房管外，所有观众均不可发言", "开启", api.RoomSilentAll, 1)
+					addSilentChoice(2, "仅粉丝发言", "未关注本直播间的观众不可发言", "开启", api.RoomSilentNonFans, 1)
+					wealthAction := func() {
+						openRoomManagerInput("荣耀等级禁言", "等级 1-80 ", "1", 2, "保存", func(value string) error {
 							_, err := parseDanmakuManagementLevel(value, 80)
 							return err
 						}, func(value string) {
@@ -1010,9 +1602,13 @@ func RunDanmaku(ctx context.Context, session *LiveDanmakuSession, client *api.Cl
 								return client.SetRoomSilentState(actionCtx, roomID, api.RoomSilentWealth, level, 0, sessdata, biliJCT)
 							})
 						})
-					})
-					addRoomManagerItem("粉丝勋章", "设置低于或没有该等级粉丝牌的用户不可发言", "设置", 0, func() {
-						openRoomManagerInput("粉丝勋章禁言", "等级 1-120 ", "1", 3, func(value string) error {
+					}
+					roomManagerTableActions[3] = wealthAction
+					roomManagerTable.SetCell(3, 0, roomManagerTableTextCell("荣耀等级限制", 22, 1))
+					roomManagerTable.SetCell(3, 1, roomManagerTableMutedCell("低于设定等级的用户不可发言（1-80 级）", 46, 2))
+					roomManagerTable.SetCell(3, 2, roomManagerTableActionCell("配置", accentActiveColor, wealthAction))
+					medalAction := func() {
+						openRoomManagerInput("粉丝勋章禁言", "等级 1-120 ", "1", 3, "保存", func(value string) error {
 							_, err := parseDanmakuManagementLevel(value, 120)
 							return err
 						}, func(value string) {
@@ -1021,10 +1617,17 @@ func RunDanmaku(ctx context.Context, session *LiveDanmakuSession, client *api.Cl
 								return client.SetRoomSilentState(actionCtx, roomID, api.RoomSilentMedal, level, 0, sessdata, biliJCT)
 							})
 						})
-					})
-					addSilentChoice("除房管以外的观众", "仅主播和房管可以发言", api.RoomSilentNonMember, 1)
+					}
+					roomManagerTableActions[4] = medalAction
+					roomManagerTable.SetCell(4, 0, roomManagerTableTextCell("粉丝勋章限制", 22, 1))
+					roomManagerTable.SetCell(4, 1, roomManagerTableMutedCell("无勋章或低于设定等级的用户不可发言（1-120 级）", 46, 2))
+					roomManagerTable.SetCell(4, 2, roomManagerTableActionCell("配置", accentActiveColor, medalAction))
+					addSilentChoice(5, "除房管以外的观众", "仅主播和房管可以发言", "开启", api.RoomSilentNonMember, 1)
 				}
-				roomManagerList.SetCurrentItem(0)
+				roomManagerBaseActionMode = "default"
+				updateRoomManagerActionBar(roomManagerBaseActionMode)
+				roomManagerTable.Select(1, 0).ScrollToBeginning()
+				restoreRoomManagerFocusAfterLoad()
 			})
 		}()
 	}
@@ -1043,9 +1646,10 @@ func RunDanmaku(ctx context.Context, session *LiveDanmakuSession, client *api.Cl
 		}
 		roomManagerVisible = true
 		showRoomManagerRoot()
-		pages.ShowPage("room-manager")
-		pages.SendToFront("room-manager")
-		app.SetFocus(roomManagerList)
+		// 使用互斥页面切换而非透明叠加。这样弹幕页不会参与本帧绘制，
+		// 全角字符的延伸单元格也不可能透进房间管理工作区。
+		pages.SwitchToPage("room-manager")
+		app.SetFocus(roomManagerNavigation)
 	}
 	openRoomManagerWhenReady = openRoomManager
 	mentionUser := func(message api.DanmakuMessage) {
@@ -1307,7 +1911,7 @@ func RunDanmaku(ctx context.Context, session *LiveDanmakuSession, client *api.Cl
 				pendingRoomManagerAction = nil
 				pages.HidePage("room-manager-confirm")
 				pages.SendToFront("room-manager")
-				app.SetFocus(roomManagerList)
+				focusRoomManagerContent()
 				return nil
 			case tcell.KeyCtrlC:
 				navigation = NavigationQuit
@@ -1341,29 +1945,85 @@ func RunDanmaku(ctx context.Context, session *LiveDanmakuSession, client *api.Cl
 				closeRoomManager()
 				return nil
 			case event.Key() == tcell.KeyLeft:
-				selectRoomManagerTab(roomManagerTabIndex - 1)
+				if isActionBarFocused() {
+					idx := focusedButtonIndex()
+					if idx > 0 {
+						app.SetFocus(roomManagerCurrentButtons[idx-1])
+						return nil
+					}
+				}
+				if !roomManagerNavigation.HasFocus() {
+					app.SetFocus(roomManagerNavigation)
+				}
 				return nil
 			case event.Key() == tcell.KeyRight:
-				selectRoomManagerTab(roomManagerTabIndex + 1)
-				return nil
-			case event.Key() == tcell.KeyTab || event.Key() == tcell.KeyBacktab:
-				if roomManagerBackButton.HasFocus() && !roomManagerEmptyVisible {
-					app.SetFocus(roomManagerList)
-				} else {
-					app.SetFocus(roomManagerBackButton)
-				}
-				return nil
-			case event.Key() == tcell.KeyRune && event.Rune() >= '1' && event.Rune() <= '5':
-				tabIdx := int(event.Rune() - '1')
-				if tabIdx < len(roomManagerTabsAvailable) {
-					selectRoomManagerTab(tabIdx)
+				if roomManagerNavigation.HasFocus() {
+					focusRoomManagerContent()
 					return nil
 				}
-			case event.Key() == tcell.KeyRune && (event.Rune() == 'r' || event.Rune() == 'R'):
-				if roomManagerReload != nil {
-					setRoomManagerNotice("正在刷新……", false)
-					roomManagerReload()
+				if isActionBarFocused() {
+					idx := focusedButtonIndex()
+					if idx >= 0 && idx < len(roomManagerCurrentButtons)-1 {
+						app.SetFocus(roomManagerCurrentButtons[idx+1])
+					}
+				}
+				return nil
+			case event.Key() == tcell.KeyUp, event.Key() == tcell.KeyDown:
+				if isActionBarFocused() {
+					focusRoomManagerContent()
 					return nil
+				}
+				return event
+			case event.Key() == tcell.KeyTab:
+				if roomManagerNavigation.HasFocus() {
+					focusRoomManagerContent()
+					return nil
+				}
+				if isActionBarFocused() {
+					idx := focusedButtonIndex()
+					if idx >= 0 && idx < len(roomManagerCurrentButtons)-1 {
+						app.SetFocus(roomManagerCurrentButtons[idx+1])
+					} else {
+						app.SetFocus(roomManagerNavigation)
+					}
+					return nil
+				}
+				// 内容列表之后进入操作栏；最后一个按钮再回到左侧栏目。
+				if len(roomManagerCurrentButtons) > 0 {
+					app.SetFocus(roomManagerCurrentButtons[0])
+					return nil
+				}
+				app.SetFocus(roomManagerNavigation)
+				return nil
+			case event.Key() == tcell.KeyBacktab:
+				if roomManagerNavigation.HasFocus() {
+					if len(roomManagerCurrentButtons) > 0 {
+						app.SetFocus(roomManagerCurrentButtons[len(roomManagerCurrentButtons)-1])
+					}
+					return nil
+				}
+				if isActionBarFocused() {
+					idx := focusedButtonIndex()
+					if idx > 0 {
+						app.SetFocus(roomManagerCurrentButtons[idx-1])
+					} else {
+						frontPage, _ := roomManagerContent.GetFrontPage()
+						if frontPage == "table" && roomManagerTable.GetRowCount() > 1 {
+							app.SetFocus(roomManagerTable)
+						} else {
+							app.SetFocus(roomManagerNavigation)
+						}
+					}
+					return nil
+				}
+				app.SetFocus(roomManagerNavigation)
+				return nil
+			case event.Key() == tcell.KeyRune && (event.Rune() == 'a' || event.Rune() == 'A'):
+				if len(roomManagerTabsAvailable) > 0 && roomManagerTabIndex < len(roomManagerTabsAvailable) && roomManagerTabsAvailable[roomManagerTabIndex].label == "屏蔽词" {
+					if triggerAddShieldKeyword != nil {
+						triggerAddShieldKeyword()
+						return nil
+					}
 				}
 			case event.Key() == tcell.KeyRune && event.Rune() == '[':
 				if roomManagerPrevPage != nil {
@@ -1589,29 +2249,6 @@ func newDanmakuManagementForm(title string) *tview.Form {
 	return form
 }
 
-func formatRoomManagerRow(title, detail, action string) string {
-	title = strings.TrimSpace(title)
-	detail = strings.TrimSpace(detail)
-	action = strings.TrimSpace(action)
-	const titleColumnWidth = 22
-	padding := 2
-	if width := tview.TaggedStringWidth(title); width < titleColumnWidth {
-		padding = titleColumnWidth - width
-	}
-	var row strings.Builder
-	row.WriteString(title)
-	if detail != "" {
-		row.WriteString(strings.Repeat(" ", padding))
-		row.WriteString(detail)
-	}
-	if action != "" {
-		row.WriteString("  「")
-		row.WriteString(action)
-		row.WriteString("」")
-	}
-	return row.String()
-}
-
 func compactDanmakuManagementError(err error) string {
 	if err == nil {
 		return "未知错误"
@@ -1621,6 +2258,59 @@ func compactDanmakuManagementError(err error) string {
 		detail = append(detail[:70], '…')
 	}
 	return tview.Escape(string(detail))
+}
+
+func formatRoomManagerTableUser(username, userID string) string {
+	username = strings.TrimSpace(username)
+	userID = strings.TrimSpace(userID)
+	switch {
+	case username != "" && userID != "":
+		return tview.Escape(username) + " · UID " + tview.Escape(userID)
+	case username != "":
+		return tview.Escape(username)
+	case userID != "":
+		return "UID " + tview.Escape(userID)
+	default:
+		return "未知用户"
+	}
+}
+
+func roomManagerTableHeaderCell(text string, maxWidth, expansion int) *tview.TableCell {
+	return tview.NewTableCell(text).
+		SetTextColor(tview.Styles.SecondaryTextColor).
+		SetAttributes(tcell.AttrBold).
+		SetMaxWidth(maxWidth).
+		SetExpansion(expansion).
+		SetSelectable(false)
+}
+
+func roomManagerTableTextCell(text string, maxWidth, expansion int) *tview.TableCell {
+	return tview.NewTableCell(text).
+		SetTextColor(tview.Styles.PrimaryTextColor).
+		SetMaxWidth(maxWidth).
+		SetExpansion(expansion)
+}
+
+func roomManagerTableMutedCell(text string, maxWidth, expansion int) *tview.TableCell {
+	return tview.NewTableCell(text).
+		SetTextColor(mutedColor).
+		SetMaxWidth(maxWidth).
+		SetExpansion(expansion)
+}
+
+func roomManagerTableActionCell(label string, color tcell.Color, action func()) *tview.TableCell {
+	cell := tview.NewTableCell(label).
+		SetTextColor(color).
+		SetAttributes(tcell.AttrBold).
+		SetAlign(tview.AlignCenter).
+		SetMaxWidth(8)
+	cell.SetClickedFunc(func() bool {
+		if action != nil {
+			action()
+		}
+		return true
+	})
+	return cell
 }
 
 func displayDanmakuManagedUser(username, userID string) string {

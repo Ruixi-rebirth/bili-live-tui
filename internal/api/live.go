@@ -355,11 +355,7 @@ func (c *Client) GetRoomAdminSeniorStatus(ctx context.Context, anchorID, sessdat
 	if raw.Code != 0 {
 		return 0, fmt.Errorf("获取高级房管状态失败（错误码 %d）：%s", raw.Code, responseMessage(raw.Message, raw.Msg))
 	}
-	status := int(raw.Data.Status)
-	if status <= 0 {
-		status = 1
-	}
-	return status, nil
+	return int(raw.Data.Status), nil
 }
 
 func (c *Client) GetRoomAdmins(ctx context.Context, page int, sessdata, biliJCT string) (RoomAdminPage, error) {
@@ -418,8 +414,9 @@ func (c *Client) DismissRoomAdmin(ctx context.Context, userID, sessdata, biliJCT
 }
 
 type RoomUserSearchResult struct {
-	UserID   string
-	Username string
+	UserID     string
+	Username   string
+	AdminLevel int
 }
 
 func (c *Client) SearchRoomUsers(ctx context.Context, keyword, sessdata, biliJCT string) ([]RoomUserSearchResult, error) {
@@ -428,15 +425,10 @@ func (c *Client) SearchRoomUsers(ctx context.Context, keyword, sessdata, biliJCT
 		return nil, fmt.Errorf("搜索用户需要 UID 或用户名")
 	}
 	var raw struct {
-		Code    int    `json:"code"`
-		Message string `json:"message"`
-		Msg     string `json:"msg"`
-		Data    struct {
-			Items []struct {
-				UID      flexibleID `json:"uid"`
-				Username string     `json:"uname"`
-			} `json:"items"`
-		} `json:"data"`
+		Code    int             `json:"code"`
+		Message string          `json:"message"`
+		Msg     string          `json:"msg"`
+		Data    json.RawMessage `json:"data"`
 	}
 	if err := c.getLiveEndpointJSON(ctx, "SearchRoomUser", sessdata, biliJCT, url.Values{"search": {keyword}}, &raw); err != nil {
 		return nil, fmt.Errorf("搜索直播用户失败: %w", err)
@@ -444,9 +436,63 @@ func (c *Client) SearchRoomUsers(ctx context.Context, keyword, sessdata, biliJCT
 	if raw.Code != 0 {
 		return nil, fmt.Errorf("搜索直播用户失败（错误码 %d）：%s", raw.Code, responseMessage(raw.Message, raw.Msg))
 	}
-	result := make([]RoomUserSearchResult, 0, len(raw.Data.Items))
-	for _, item := range raw.Data.Items {
-		result = append(result, RoomUserSearchResult{UserID: string(item.UID), Username: strings.TrimSpace(item.Username)})
+	type searchItem struct {
+		UID        flexibleID    `json:"uid"`
+		TargetUID  flexibleID    `json:"tuid"`
+		Username   string        `json:"uname"`
+		TargetName string        `json:"tname"`
+		Name       string        `json:"name"`
+		AdminLevel flexibleInt64 `json:"admin_level"`
+	}
+	var items []searchItem
+	if len(raw.Data) > 0 && string(raw.Data) != "null" {
+		if err := json.Unmarshal(raw.Data, &items); err != nil {
+			var container struct {
+				Items  []searchItem `json:"items"`
+				Data   []searchItem `json:"data"`
+				Result []searchItem `json:"result"`
+				List   []searchItem `json:"list"`
+			}
+			if containerErr := json.Unmarshal(raw.Data, &container); containerErr != nil {
+				return nil, fmt.Errorf("解析搜索直播用户结果失败: %w", err)
+			}
+			switch {
+			case len(container.Items) > 0:
+				items = container.Items
+			case len(container.Data) > 0:
+				items = container.Data
+			case len(container.Result) > 0:
+				items = container.Result
+			default:
+				items = container.List
+			}
+		}
+	}
+	result := make([]RoomUserSearchResult, 0, len(items))
+	seen := make(map[string]struct{}, len(items))
+	for _, item := range items {
+		userID := strings.TrimSpace(string(item.UID))
+		if userID == "" {
+			userID = strings.TrimSpace(string(item.TargetUID))
+		}
+		if userID == "" {
+			continue
+		}
+		if err := validateLiveUserID("用户 UID", userID); err != nil {
+			continue
+		}
+		if _, exists := seen[userID]; exists {
+			continue
+		}
+		seen[userID] = struct{}{}
+		username := strings.TrimSpace(item.Username)
+		if username == "" {
+			username = strings.TrimSpace(item.TargetName)
+		}
+		if username == "" {
+			username = strings.TrimSpace(item.Name)
+		}
+		result = append(result, RoomUserSearchResult{UserID: userID, Username: username, AdminLevel: int(item.AdminLevel)})
 	}
 	return result, nil
 }
@@ -460,9 +506,16 @@ type RoomMutedUser struct {
 	OperatorIsAnchor bool
 }
 
-func (c *Client) GetMutedRoomUsers(ctx context.Context, roomID string, page int, sessdata, biliJCT string) ([]RoomMutedUser, error) {
+type RoomMutedUserPage struct {
+	Items      []RoomMutedUser
+	Page       int
+	Total      int
+	TotalPages int
+}
+
+func (c *Client) GetMutedRoomUsers(ctx context.Context, roomID string, page int, sessdata, biliJCT string) (RoomMutedUserPage, error) {
 	if err := validateLiveUserID("房间号", roomID); err != nil {
-		return nil, err
+		return RoomMutedUserPage{}, err
 	}
 	if page <= 0 {
 		page = 1
@@ -480,18 +533,25 @@ func (c *Client) GetMutedRoomUsers(ctx context.Context, roomID string, page int,
 				AdminLevel       flexibleInt64 `json:"admin_level"`
 				OperatorIsAnchor flexibleBool  `json:"is_anchor"`
 			} `json:"data"`
+			Total      flexibleInt64 `json:"total"`
+			TotalPages flexibleInt64 `json:"total_page"`
 		} `json:"data"`
 	}
 	params := url.Values{"room_id": {roomID}, "ps": {strconv.Itoa(page)}}
 	if err := c.postRoomManagementJSON(ctx, "GetMutedUsers", sessdata, biliJCT, params, &raw); err != nil {
-		return nil, fmt.Errorf("获取禁言名单失败: %w", err)
+		return RoomMutedUserPage{}, fmt.Errorf("获取禁言名单失败: %w", err)
 	}
 	if raw.Code != 0 {
-		return nil, fmt.Errorf("获取禁言名单失败（错误码 %d）：%s", raw.Code, responseMessage(raw.Message, raw.Msg))
+		return RoomMutedUserPage{}, fmt.Errorf("获取禁言名单失败（错误码 %d）：%s", raw.Code, responseMessage(raw.Message, raw.Msg))
 	}
-	result := make([]RoomMutedUser, 0, len(raw.Data.Items))
+	result := RoomMutedUserPage{
+		Page:       page,
+		Total:      int(raw.Data.Total),
+		TotalPages: int(raw.Data.TotalPages),
+		Items:      make([]RoomMutedUser, 0, len(raw.Data.Items)),
+	}
 	for _, item := range raw.Data.Items {
-		result = append(result, RoomMutedUser{UserID: string(item.UID), Username: strings.TrimSpace(item.Username), OperatorName: strings.TrimSpace(item.OperatorName), ExpiresAt: strings.TrimSpace(item.ExpiresAt), AdminLevel: int(item.AdminLevel), OperatorIsAnchor: bool(item.OperatorIsAnchor)})
+		result.Items = append(result.Items, RoomMutedUser{UserID: string(item.UID), Username: strings.TrimSpace(item.Username), OperatorName: strings.TrimSpace(item.OperatorName), ExpiresAt: strings.TrimSpace(item.ExpiresAt), AdminLevel: int(item.AdminLevel), OperatorIsAnchor: bool(item.OperatorIsAnchor)})
 	}
 	return result, nil
 }
@@ -639,7 +699,7 @@ func (c *Client) BlacklistRoomUser(ctx context.Context, anchorID, userID, sessda
 	if err := validateLiveUserID("用户 UID", userID); err != nil {
 		return err
 	}
-	return c.roomManagementAction(ctx, "BlacklistRoomUser", "将用户加入直播间黑名单", sessdata, biliJCT, url.Values{
+	return c.roomManagementAction(ctx, "BlacklistRoomUser", "将用户添加到直播间黑名单", sessdata, biliJCT, url.Values{
 		"anchor_id": {anchorID},
 		"tuid":      {userID},
 		"spmid":     {"444.8.0.0"},
@@ -768,7 +828,7 @@ func (c *Client) GetRoomSilentState(ctx context.Context, roomID, sessdata, biliJ
 	}
 	audience := strings.TrimSpace(raw.Data.Type)
 	return RoomSilentState{
-		Enabled:          audience != "" && audience != RoomSilentOff && int(raw.Data.Second) != 0,
+		Enabled:          audience != "" && audience != RoomSilentOff,
 		Audience:         audience,
 		Level:            int(raw.Data.Level),
 		DurationMinutes:  int(raw.Data.Minute),

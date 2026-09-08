@@ -386,6 +386,22 @@ func TestSendDanmakuReportsMsgFallback(t *testing.T) {
 	}
 }
 
+func TestSendDanmakuRejectsSoftBlockedMessage(t *testing.T) {
+	transport := roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(strings.NewReader(`{"code":0,"message":"f","msg":"f","data":[]}`)),
+			Header:     make(http.Header),
+		}, nil
+	})
+	client := NewClient(&http.Client{Transport: transport})
+	client.BaseURL = "http://test.invalid"
+	err := client.SendDanmaku(context.Background(), "123", "sess", "csrf", "违禁词弹幕")
+	if err == nil || !strings.Contains(err.Error(), "拦截") || !strings.Contains(err.Error(), "违禁词") {
+		t.Fatalf("SendDanmaku() error = %v, want soft-block error", err)
+	}
+}
+
 func makeDanmakuPacket(operation uint32, version uint16, body []byte) []byte {
 	packet := make([]byte, danmakuHeaderLength+len(body))
 	binary.BigEndian.PutUint32(packet[0:4], uint32(len(packet)))

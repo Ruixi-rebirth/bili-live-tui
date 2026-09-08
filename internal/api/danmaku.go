@@ -1329,5 +1329,10 @@ func (c *Client) SendDanmakuWithLimit(ctx context.Context, roomID, sessdata, bil
 		}
 		return fmt.Errorf("B 站拒绝发送（错误码 %d）：%s", result.Code, message)
 	}
+	// 直播弹幕接口会把部分违禁词拦截伪装成 code=0，但同时将
+	// message/msg 置为 "f"。这种弹幕不会广播，不能按发送成功处理。
+	if strings.EqualFold(strings.TrimSpace(result.Message), "f") || strings.EqualFold(strings.TrimSpace(result.Msg), "f") {
+		return fmt.Errorf("B 站已拦截该弹幕，内容可能包含违禁词")
+	}
 	return nil
 }
