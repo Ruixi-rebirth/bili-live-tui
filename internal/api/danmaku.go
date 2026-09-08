@@ -1290,6 +1290,10 @@ func (c *Client) SendDanmakuWithLimit(ctx context.Context, roomID, sessdata, bil
 	if strings.TrimSpace(sessdata) == "" || strings.TrimSpace(biliJCT) == "" {
 		return fmt.Errorf("发送弹幕需要有效的 SESSDATA 和 bili_jct")
 	}
+	identity, err := c.resolveDanmakuIdentity(ctx, sessdata, biliJCT)
+	if err != nil {
+		return fmt.Errorf("准备发送弹幕失败: %w", err)
+	}
 	params := url.Values{}
 	params.Set("bubble", "0")
 	params.Set("msg", message)
@@ -1310,9 +1314,8 @@ func (c *Client) SendDanmakuWithLimit(ctx context.Context, roomID, sessdata, bil
 	if err != nil {
 		return err
 	}
-	headers := http.Header{
-		"Cookie": []string{"SESSDATA=" + sessdata + "; bili_jct=" + biliJCT},
-	}
+	headers := make(http.Header)
+	headers.Set("Cookie", danmakuBrowserCookie(sessdata, biliJCT, identity))
 	headers.Set("Referer", "https://live.bilibili.com/"+strings.TrimSpace(roomID))
 	headers.Set("Origin", "https://live.bilibili.com")
 	headers.Set("User-Agent", biliBrowserUserAgent)

@@ -164,7 +164,7 @@ func TestGetRoomManagementCapabilitiesUsesBadgePermissionsAndAnchorIdentity(t *t
 	if capabilities.UserID != "99" || capabilities.AnchorID != "99" || !capabilities.IsAnchor || !capabilities.IsAdmin || capabilities.AdminLevel != 2 || !capabilities.HasPermission(RoomPermissionBlacklist) {
 		t.Fatalf("capabilities = %#v", capabilities)
 	}
-	if !capabilities.CanMute(2) || !capabilities.CanBlacklist(99) {
+	if !capabilities.CanMute(2) || !capabilities.CanBlacklist(99) || !capabilities.CanMuteUser(0, false) {
 		t.Fatalf("anchor capabilities should override target admin level: %#v", capabilities)
 	}
 }
@@ -173,6 +173,9 @@ func TestRoomManagementPermissionHierarchy(t *testing.T) {
 	capabilities := RoomManagementCapabilities{IsAdmin: true, AdminLevel: 2, Permissions: []int{RoomPermissionMute}}
 	if !capabilities.CanMute(1) || capabilities.CanMute(2) || capabilities.CanBlacklist(0) {
 		t.Fatalf("permission hierarchy mismatch: %#v", capabilities)
+	}
+	if capabilities.CanMuteUser(0, false) {
+		t.Fatalf("unknown target level was accepted: %#v", capabilities)
 	}
 }
 
@@ -205,10 +208,26 @@ func TestSearchRoomUsersSupportsArrayAndObjectPayloads(t *testing.T) {
 			if err != nil {
 				t.Fatalf("SearchRoomUsers() error = %v", err)
 			}
-			if len(results) != 1 || results[0].UserID == "" || results[0].Username == "" || results[0].AdminLevel == 0 {
+			if len(results) != 1 || results[0].UserID == "" || results[0].Username == "" || results[0].AdminLevel == 0 || !results[0].AdminLevelKnown {
 				t.Fatalf("search results = %#v", results)
 			}
 		})
+	}
+}
+
+func TestSearchRoomUsersKeepsMissingAdminLevelUnknown(t *testing.T) {
+	transport := roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"code":0,"data":[{"uid":42,"uname":"用户甲"},{"uid":43,"uname":"用户乙","admin_level":0}]}`)), Header: make(http.Header)}, nil
+	})
+	client := NewClient(&http.Client{Transport: transport})
+	client.BaseURL = "http://test.invalid"
+
+	results, err := client.SearchRoomUsers(context.Background(), "用户", "sess", "jct")
+	if err != nil {
+		t.Fatalf("SearchRoomUsers() error = %v", err)
+	}
+	if len(results) != 2 || results[0].AdminLevelKnown || !results[1].AdminLevelKnown || results[1].AdminLevel != 0 {
+		t.Fatalf("search results = %#v", results)
 	}
 }
 
@@ -312,14 +331,20 @@ func TestRoomManagementInputValidation(t *testing.T) {
 	client := NewClient(&http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
 		return nil, fmt.Errorf("request should not be sent")
 	})})
-	if err := client.AddRoomShieldKeyword(context.Background(), "1", strings.Repeat("词", 16), "sess", "jct"); err == nil {
-		t.Fatal("overlong shield keyword was accepted")
+	if err := client.AddRoomShieldKeyword(context.Background(), "1", "   ", "sess", "jct"); err == nil {
+		t.Fatal("empty shield keyword was accepted")
 	}
-	if err := client.SetRoomSilentState(context.Background(), "1", RoomSilentWealth, 81, 0, "sess", "jct"); err == nil {
+	if err := client.SetRoomSilentState(context.Background(), "1", RoomSilentWealth, 0, 0, "sess", "jct"); err == nil {
 		t.Fatal("invalid wealth level was accepted")
 	}
 	if err := client.MuteRoomUser(context.Background(), "1", "0", "", RoomMutePermanent, "sess", "jct"); err == nil {
 		t.Fatal("invalid target UID was accepted")
+	}
+	if keyword, err := validateRoomShieldKeyword(strings.Repeat("词", 100)); err != nil || len([]rune(keyword)) != 100 {
+		t.Fatalf("keyword should be left to upstream validation: length=%d, err=%v", len([]rune(keyword)), err)
+	}
+	if err := validateRoomSilent(RoomSilentWealth, 81, 0); err != nil {
+		t.Fatalf("positive level should be left to upstream validation: %v", err)
 	}
 }
 
@@ -330,6 +355,14 @@ func TestRoomManagementListResponses(t *testing.T) {
 		case "/xlive/app-ucenter/v1/roomAdmin/get_by_anchor":
 			response = `{"code":0,"data":{"data":[{"uid":42,"uname":"房管甲","ctime":"2026-09-01","admin_level":2}],"page":{"page":1,"total_page":3},"max_room_anchors_number":10}}`
 		case "/xlive/web-ucenter/v1/banned/GetSilentUserList":
+			body, _ := io.ReadAll(r.Body)
+			values, err := url.ParseQuery(string(body))
+			if err != nil {
+				t.Errorf("parse muted-list form: %v", err)
+			}
+			if values.Get("room_id") != "1" || values.Get("pn") != "2" || values.Get("ps") != "20" {
+				t.Errorf("muted-list form = %v", values)
+			}
 			response = `{"code":0,"data":{"data":[{"tuid":43,"tname":"用户乙","name":"主播","block_end_time":"永久","admin_level":0,"is_anchor":1}],"total":21,"total_page":3}}`
 		case "/xlive/app-ucenter/v2/xbanned/banned/GetBlackList":
 			response = `{"code":0,"data":{"data":[{"uid":44,"name":"用户丙","mtime":"2026-09-02","operator_name":"主播"}]}}`
@@ -344,11 +377,11 @@ func TestRoomManagementListResponses(t *testing.T) {
 	client.BaseURL = "http://test.invalid"
 
 	admins, err := client.GetRoomAdmins(context.Background(), 1, "sess", "jct")
-	if err != nil || len(admins.Items) != 1 || admins.Items[0].Level != 2 || admins.TotalPages != 3 || admins.MaxCount != 10 {
+	if err != nil || len(admins.Items) != 1 || admins.Items[0].Level != 2 || !admins.Items[0].LevelKnown || admins.TotalPages != 3 || admins.MaxCount != 10 {
 		t.Fatalf("admins = %#v, err = %v", admins, err)
 	}
-	muted, err := client.GetMutedRoomUsers(context.Background(), "1", 1, "sess", "jct")
-	if err != nil || len(muted.Items) != 1 || muted.Items[0].UserID != "43" || !muted.Items[0].OperatorIsAnchor || muted.Page != 1 || muted.Total != 21 || muted.TotalPages != 3 {
+	muted, err := client.GetMutedRoomUsers(context.Background(), "1", 2, "sess", "jct")
+	if err != nil || len(muted.Items) != 1 || muted.Items[0].UserID != "43" || !muted.Items[0].OperatorIsAnchor || muted.Page != 2 || muted.Total != 21 || muted.TotalPages != 3 {
 		t.Fatalf("muted = %#v, err = %v", muted, err)
 	}
 	blacklist, err := client.GetRoomBlacklist(context.Background(), "99", 1, 10, "sess", "jct")

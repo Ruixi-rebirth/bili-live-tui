@@ -305,7 +305,7 @@ func TestSendDanmaku(t *testing.T) {
 		if r.Method != http.MethodPost {
 			t.Fatalf("method = %s, want POST", r.Method)
 		}
-		if !strings.Contains(r.Header.Get("Cookie"), "SESSDATA=sess") {
+		if r.Header.Get("Cookie") != "SESSDATA=sess; bili_jct=csrf; DedeUserID=12345; buvid3=device-id" {
 			t.Fatalf("cookie = %q", r.Header.Get("Cookie"))
 		}
 		_ = r.ParseForm()
@@ -319,6 +319,7 @@ func TestSendDanmaku(t *testing.T) {
 	})
 	client := NewClient(&http.Client{Transport: transport})
 	client.BaseURL = "http://test.invalid"
+	seedDanmakuSendIdentity(client, "sess")
 	if err := client.SendDanmaku(context.Background(), "123", "sess", "csrf", "测试弹幕"); err != nil {
 		t.Fatalf("SendDanmaku() error = %v", err)
 	}
@@ -364,6 +365,7 @@ func TestSendDanmakuUsesUpstreamLimit(t *testing.T) {
 	})
 	client := NewClient(&http.Client{Transport: transport})
 	client.BaseURL = "http://test.invalid"
+	seedDanmakuSendIdentity(client, "sess")
 	message := strings.Repeat("啊", DefaultDanmakuMaxLength+1)
 	if err := client.SendDanmakuWithLimit(context.Background(), "123", "sess", "csrf", message, 50); err != nil {
 		t.Fatalf("SendDanmakuWithLimit() error = %v", err)
@@ -380,6 +382,7 @@ func TestSendDanmakuReportsMsgFallback(t *testing.T) {
 	})
 	client := NewClient(&http.Client{Transport: transport})
 	client.BaseURL = "http://test.invalid"
+	seedDanmakuSendIdentity(client, "sess")
 	err := client.SendDanmaku(context.Background(), "123", "sess", "csrf", "测试弹幕")
 	if err == nil || !strings.Contains(err.Error(), "10031") || !strings.Contains(err.Error(), "发送频率过快") {
 		t.Fatalf("SendDanmaku() error = %v, want server code and msg", err)
@@ -396,10 +399,17 @@ func TestSendDanmakuRejectsSoftBlockedMessage(t *testing.T) {
 	})
 	client := NewClient(&http.Client{Transport: transport})
 	client.BaseURL = "http://test.invalid"
+	seedDanmakuSendIdentity(client, "sess")
 	err := client.SendDanmaku(context.Background(), "123", "sess", "csrf", "违禁词弹幕")
 	if err == nil || !strings.Contains(err.Error(), "拦截") || !strings.Contains(err.Error(), "违禁词") {
 		t.Fatalf("SendDanmaku() error = %v, want soft-block error", err)
 	}
+}
+
+func seedDanmakuSendIdentity(client *Client, sessdata string) {
+	client.danmakuIdentity = danmakuIdentity{UID: 12345, Buvid: "device-id"}
+	client.danmakuIdentityFor = sessdata
+	client.danmakuIdentityAt = time.Now()
 }
 
 func makeDanmakuPacket(operation uint32, version uint16, body []byte) []byte {

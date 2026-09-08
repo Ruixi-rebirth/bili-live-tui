@@ -80,9 +80,11 @@ func RunDanmaku(ctx context.Context, session *LiveDanmakuSession, client *api.Cl
 	managementCapabilities := api.RoomManagementCapabilities{}
 	managementCapabilitiesReady := false
 	managementCapabilitiesErr := error(nil)
+	managementCapabilitiesLoading := false
+	managementCapabilitiesWaiters := make([]func(error), 0, 2)
+	userAdminLevelOverrides := make(map[string]int)
 	var refreshManagementCapabilitiesUI func()
-	roomManagerOpenPending := false
-	var openRoomManagerWhenReady func()
+	var refreshManagementCapabilities func(func(error))
 	var reply *tview.InputField
 	reply = tview.NewInputField().
 		SetLabel("").
@@ -109,6 +111,15 @@ func RunDanmaku(ctx context.Context, session *LiveDanmakuSession, client *api.Cl
 
 	navigation := NavigationQuit
 	sentCount := 0
+	type pendingDanmakuSend struct {
+		id              uint64
+		message         string
+		startRevision   uint64
+		requestAccepted bool
+		streamConfirmed bool
+	}
+	var nextDanmakuSendID uint64
+	var pendingSend *pendingDanmakuSend
 	var uiOpen atomic.Bool
 	uiOpen.Store(true)
 	streamCtx, cancelStream := context.WithCancel(ctx)
@@ -164,29 +175,54 @@ func RunDanmaku(ctx context.Context, session *LiveDanmakuSession, client *api.Cl
 			}
 		}
 	}()
-	go func() {
-		requestCtx, cancelRequest := context.WithTimeout(streamCtx, 10*time.Second)
-		defer cancelRequest()
-		capabilities, err := client.GetRoomManagementCapabilities(requestCtx, roomID, sessdata, biliJCT)
-		queueUI(func() {
-			managementCapabilities = capabilities
-			managementCapabilitiesReady = true
-			managementCapabilitiesErr = err
-			if refreshManagementCapabilitiesUI != nil {
-				refreshManagementCapabilitiesUI()
-			}
-			if roomManagerOpenPending && openRoomManagerWhenReady != nil {
-				roomManagerOpenPending = false
-				openRoomManagerWhenReady()
-			}
-		})
-	}()
+	refreshManagementCapabilities = func(after func(error)) {
+		if after != nil {
+			managementCapabilitiesWaiters = append(managementCapabilitiesWaiters, after)
+		}
+		if managementCapabilitiesLoading {
+			return
+		}
+		managementCapabilitiesLoading = true
+		go func() {
+			requestCtx, cancelRequest := context.WithTimeout(streamCtx, 10*time.Second)
+			defer cancelRequest()
+			capabilities, err := client.GetRoomManagementCapabilities(requestCtx, roomID, sessdata, biliJCT)
+			queueUI(func() {
+				managementCapabilities = capabilities
+				managementCapabilitiesReady = true
+				managementCapabilitiesErr = err
+				managementCapabilitiesLoading = false
+				if refreshManagementCapabilitiesUI != nil {
+					refreshManagementCapabilitiesUI()
+				}
+				waiters := managementCapabilitiesWaiters
+				managementCapabilitiesWaiters = nil
+				for _, waiter := range waiters {
+					waiter(err)
+				}
+			})
+		}()
+	}
+	refreshManagementCapabilities(nil)
 	clearChat := func() {
 		session.ClearHistory()
 		sentCount = 0
 		sendStatus.SetText("已清空本地弹幕记录。")
 	}
 	sending := false
+	completePendingSend := func(send *pendingDanmakuSend) {
+		if send == nil || pendingSend == nil || pendingSend.id != send.id {
+			return
+		}
+		pendingSend = nil
+		sending = false
+		// 不要清除等待回显期间用户输入的新草稿。
+		if strings.TrimSpace(reply.GetText()) == send.message {
+			reply.SetText("")
+		}
+		sentCount++
+		sendStatus.SetText(fmt.Sprintf("第 %d 条弹幕已在直播间显示。", sentCount))
+	}
 	send := func() {
 		if !limitReady {
 			sendStatus.SetText("正在获取弹幕字数上限，请稍候……")
@@ -202,27 +238,58 @@ func RunDanmaku(ctx context.Context, session *LiveDanmakuSession, client *api.Cl
 			return
 		}
 		sending = true
+		nextDanmakuSendID++
+		submission := &pendingDanmakuSend{
+			id:            nextDanmakuSendID,
+			message:       message,
+			startRevision: session.snapshot().historyRevision,
+		}
+		pendingSend = submission
 		sendStatus.SetText("正在发送弹幕……")
-		go func() {
+		go func(send *pendingDanmakuSend) {
 			requestCtx, cancelRequest := context.WithTimeout(streamCtx, 12*time.Second)
 			defer cancelRequest()
-			err := client.SendDanmakuWithLimit(requestCtx, roomID, sessdata, biliJCT, message, int(danmakuMaxLength.Load()))
+			err := client.SendDanmakuWithLimit(requestCtx, roomID, sessdata, biliJCT, send.message, int(danmakuMaxLength.Load()))
 			queueUI(func() {
-				sending = false
+				if pendingSend == nil || pendingSend.id != send.id {
+					return
+				}
 				if err != nil {
+					pendingSend = nil
+					sending = false
 					sendStatus.SetText("发送失败，内容已保留：" + tview.Escape(err.Error()))
 					return
 				}
-				// 不要清除请求发送期间用户输入的新草稿，只清除 B 站实际接受的原文本。
-				if strings.TrimSpace(reply.GetText()) == message {
-					reply.SetText("")
+				send.requestAccepted = true
+				if send.streamConfirmed {
+					completePendingSend(send)
+					return
 				}
-				sentCount++
-				// 成功消息会通过 WebSocket 以账号真实用户名返回，不再追加本地“我”行，
-				// 否则每条弹幕都会显示两次。
-				sendStatus.SetText(fmt.Sprintf("第 %d 条弹幕发送成功。", sentCount))
+				sendStatus.SetText("弹幕已提交，正在等待直播间显示……")
+				go func(sendID uint64) {
+					timer := time.NewTimer(5 * time.Second)
+					defer timer.Stop()
+					select {
+					case <-streamCtx.Done():
+						return
+					case <-timer.C:
+						queueUI(func() {
+							if pendingSend == nil || pendingSend.id != sendID || pendingSend.streamConfirmed {
+								return
+							}
+							originalPreserved := strings.TrimSpace(reply.GetText()) == pendingSend.message
+							pendingSend = nil
+							sending = false
+							if originalPreserved {
+								sendStatus.SetText("弹幕未发送成功，内容已保留。")
+							} else {
+								sendStatus.SetText("弹幕未发送成功。")
+							}
+						})
+					}
+				}(send.id)
 			})
-		}()
+		}(submission)
 	}
 	pages := tview.NewPages()
 	previousFocus := tview.Primitive(reply)
@@ -281,21 +348,25 @@ func RunDanmaku(ctx context.Context, session *LiveDanmakuSession, client *api.Cl
 		app.SetFocus(managementMenu)
 	}
 	var pendingManagementAction func(context.Context) error
+	var pendingManagementSuccess func()
 	managementActionLabel := ""
 	closeManagementConfirm := func() {
 		managementConfirmVisible = false
 		pendingManagementAction = nil
+		pendingManagementSuccess = nil
 		pages.HidePage("management-confirm")
 		pages.SendToFront("user-management")
 		app.SetFocus(managementMenu)
 	}
 	runManagementAction := func() {
 		action := pendingManagementAction
+		onSuccess := pendingManagementSuccess
 		label := managementActionLabel
 		managementConfirmVisible = false
 		managementVisible = false
 		muteDurationVisible = false
 		pendingManagementAction = nil
+		pendingManagementSuccess = nil
 		pages.HidePage("management-confirm")
 		pages.HidePage("mute-duration")
 		pages.HidePage("user-management")
@@ -310,6 +381,9 @@ func RunDanmaku(ctx context.Context, session *LiveDanmakuSession, client *api.Cl
 					sendStatus.SetText(label + "失败：" + tview.Escape(err.Error()))
 					return
 				}
+				if onSuccess != nil {
+					onSuccess()
+				}
 				sendStatus.SetText(label + "成功。")
 			})
 		}()
@@ -321,9 +395,13 @@ func RunDanmaku(ctx context.Context, session *LiveDanmakuSession, client *api.Cl
 		}
 		closeManagementConfirm()
 	})
-	openManagementConfirm := func(label, warning string, action func(context.Context) error) {
+	openManagementConfirm := func(label, warning string, action func(context.Context) error, onSuccess ...func()) {
 		managementActionLabel = label
 		pendingManagementAction = action
+		pendingManagementSuccess = nil
+		if len(onSuccess) > 0 {
+			pendingManagementSuccess = onSuccess[0]
+		}
 		// “取消”始终排在第一位并获得默认焦点，处罚操作不会因一次回车误触。
 		managementConfirm.ClearButtons().SetText(warning).AddButtons([]string{"取消", "确认"})
 		managementConfirmVisible = true
@@ -334,7 +412,13 @@ func RunDanmaku(ctx context.Context, session *LiveDanmakuSession, client *api.Cl
 	var openUserManagement func(api.DanmakuMessage, *api.UserProfile)
 	openUserManagement = func(message api.DanmakuMessage, profile *api.UserProfile) {
 		managementMenu.Clear()
-		targetAdminLevel := danmakuTargetAdminLevel(message)
+		targetAdminLevel, targetAdminLevelKnown := danmakuTargetAdminStatus(message)
+		targetAdminLevelOverridden := false
+		if level, ok := userAdminLevelOverrides[strings.TrimSpace(message.UserID)]; ok {
+			targetAdminLevel = level
+			targetAdminLevelKnown = true
+			targetAdminLevelOverridden = true
+		}
 		username := strings.TrimSpace(message.Username)
 		if username == "" {
 			username = message.UserID
@@ -342,7 +426,7 @@ func RunDanmaku(ctx context.Context, session *LiveDanmakuSession, client *api.Cl
 		addAction := func(label, detail string, selected func()) {
 			managementMenu.AddItem(label, detail, 0, selected)
 		}
-		if managementCapabilities.CanMute(targetAdminLevel) {
+		if managementCapabilities.CanMuteUser(targetAdminLevel, targetAdminLevelKnown) {
 			addAction("禁言", "选择 2 小时至永久，或仅本场直播", func() {
 				muteDurationMenu.Clear()
 				durations := []struct {
@@ -374,25 +458,29 @@ func RunDanmaku(ctx context.Context, session *LiveDanmakuSession, client *api.Cl
 				app.SetFocus(muteDurationMenu)
 			})
 		}
-		if managementCapabilities.CanBlacklist(targetAdminLevel) && strings.TrimSpace(managementCapabilities.AnchorID) != "" {
-			addAction("添加至黑名单", "将无法观看、发言和送礼", func() {
-				openManagementConfirm("拉黑 "+username, "确定将 "+username+" 添加到直播间黑名单吗？\n\n对方会被移出直播间，无法观看和互动，当前排行及贡献会被清除。", func(requestCtx context.Context) error {
+		if managementCapabilities.CanBlacklistUser(targetAdminLevel, targetAdminLevelKnown) && strings.TrimSpace(managementCapabilities.AnchorID) != "" {
+			addAction("添加至黑名单", "添加到当前直播间黑名单", func() {
+				openManagementConfirm("拉黑 "+username, "确定将 "+username+" 添加到直播间黑名单吗？", func(requestCtx context.Context) error {
 					return client.BlacklistRoomUser(requestCtx, managementCapabilities.AnchorID, message.UserID, sessdata, biliJCT)
 				})
 			})
 		}
 		if managementCapabilities.IsAnchor {
-			if message.IsAdmin {
+			targetIsAdmin := message.IsAdmin
+			if targetAdminLevelOverridden {
+				targetIsAdmin = targetAdminLevel > 0
+			}
+			if targetIsAdmin {
 				addAction("撤销房管", "撤销该用户的直播间管理权限", func() {
 					openManagementConfirm("撤销房管 "+username, "确定撤销 "+username+" 的房管权限吗？", func(requestCtx context.Context) error {
 						return client.DismissRoomAdmin(requestCtx, message.UserID, sessdata, biliJCT)
-					})
+					}, func() { userAdminLevelOverrides[strings.TrimSpace(message.UserID)] = 0 })
 				})
 			} else {
-				addAction("设为房管", "可按权限禁言或拉黑普通用户", func() {
+				addAction("设为房管", "授予普通房管身份", func() {
 					openManagementConfirm("任命房管 "+username, "确定任命 "+username+" 为房管吗？", func(requestCtx context.Context) error {
 						return client.AppointRoomAdmin(requestCtx, message.UserID, 1, sessdata, biliJCT)
-					})
+					}, func() { userAdminLevelOverrides[strings.TrimSpace(message.UserID)] = 1 })
 				})
 			}
 		}
@@ -900,8 +988,10 @@ func RunDanmaku(ctx context.Context, session *LiveDanmakuSession, client *api.Cl
 		roomManagerTable.Clear()
 		clear(roomManagerTableActions)
 		currentLevel := target.AdminLevel
-		if knownLevel := roomManagerAdminLevels[target.UserID]; knownLevel > 0 {
+		currentLevelKnown := target.AdminLevelKnown
+		if knownLevel, ok := roomManagerAdminLevels[target.UserID]; ok {
 			currentLevel = knownLevel
+			currentLevelKnown = true
 		}
 		roomManagerSection.SetText(fmt.Sprintf("[%s::b]管理房管[-:-:-] [%s]· %s[-]", tview.Styles.PrimaryTextColor.String(), mutedColor.String(), displayDanmakuManagedUser(target.Username, target.UserID)))
 		setRoomManagerNotice("", false)
@@ -911,12 +1001,12 @@ func RunDanmaku(ctx context.Context, session *LiveDanmakuSession, client *api.Cl
 		addLevel := func(row, level int, label, detail string) {
 			roomManagerTable.SetCell(row, 0, roomManagerTableTextCell(label, 18, 1))
 			roomManagerTable.SetCell(row, 1, roomManagerTableMutedCell(detail, 42, 2))
-			if currentLevel == level {
+			if currentLevelKnown && currentLevel == level {
 				roomManagerTable.SetCell(row, 2, roomManagerTableMutedCell("当前", 8, 0).SetAlign(tview.AlignCenter))
 				return
 			}
 			actionLabel := "任命"
-			if currentLevel > 0 {
+			if currentLevelKnown && currentLevel > 0 {
 				actionLabel = "调整"
 			}
 			action := func() {
@@ -928,15 +1018,15 @@ func RunDanmaku(ctx context.Context, session *LiveDanmakuSession, client *api.Cl
 			roomManagerTable.SetCell(row, 2, roomManagerTableActionCell(actionLabel, accentActiveColor, action))
 		}
 		row := 1
-		addLevel(row, 1, "普通房管", "可按权限禁言或拉黑普通用户")
+		addLevel(row, 1, "普通房管", "授予普通房管身份")
 		row++
 		if roomManagerSeniorAdminEnabled || currentLevel == 2 {
-			addLevel(row, 2, "高级房管", "还可按权限禁言或拉黑普通房管")
+			addLevel(row, 2, "高级房管", "授予高级房管身份")
 			row++
 		} else if !roomManagerSeniorAdminKnown {
 			setRoomManagerNotice("未能确认高级房管功能，暂只提供普通房管。", false)
 		}
-		if currentLevel > 0 {
+		if (currentLevelKnown && currentLevel > 0) || !fromSearch {
 			revokeRow := row
 			action := func() {
 				openRoomManagerConfirm("撤销房管", "确定撤销 "+displayDanmakuManagedUser(target.Username, target.UserID)+" 的房管权限吗？", func(actionCtx context.Context) error {
@@ -1013,9 +1103,12 @@ func RunDanmaku(ctx context.Context, session *LiveDanmakuSession, client *api.Cl
 			result := result
 			row := index + 1
 			currentLevel := result.AdminLevel
-			if knownLevel := roomManagerAdminLevels[result.UserID]; knownLevel > 0 {
+			currentLevelKnown := result.AdminLevelKnown
+			if knownLevel, ok := roomManagerAdminLevels[result.UserID]; ok {
 				currentLevel = knownLevel
+				currentLevelKnown = true
 				result.AdminLevel = knownLevel
+				result.AdminLevelKnown = true
 			}
 			statusText := "可操作"
 			actionLabel := "选择"
@@ -1025,13 +1118,23 @@ func RunDanmaku(ctx context.Context, session *LiveDanmakuSession, client *api.Cl
 				statusText, canOperate = "当前账号", false
 			case result.UserID == strings.TrimSpace(managementCapabilities.AnchorID):
 				statusText, canOperate = "主播", false
-			case roomManagerSearchOperation == roomManagerUserMute && !managementCapabilities.CanMute(currentLevel):
-				statusText, canOperate = "无权禁言", false
-			case roomManagerSearchOperation == roomManagerUserBlacklist && !managementCapabilities.CanBlacklist(currentLevel):
-				statusText, canOperate = "无权拉黑", false
-			case roomManagerSearchOperation == roomManagerUserAddAdmin && currentLevel == 1:
+			case roomManagerSearchOperation == roomManagerUserMute && !managementCapabilities.CanMuteUser(currentLevel, currentLevelKnown):
+				if !currentLevelKnown && !managementCapabilities.IsAnchor {
+					statusText = "身份未知"
+				} else {
+					statusText = "无权禁言"
+				}
+				canOperate = false
+			case roomManagerSearchOperation == roomManagerUserBlacklist && !managementCapabilities.CanBlacklistUser(currentLevel, currentLevelKnown):
+				if !currentLevelKnown && !managementCapabilities.IsAnchor {
+					statusText = "身份未知"
+				} else {
+					statusText = "无权拉黑"
+				}
+				canOperate = false
+			case roomManagerSearchOperation == roomManagerUserAddAdmin && currentLevelKnown && currentLevel == 1:
 				statusText, actionLabel = "普通房管", "管理"
-			case roomManagerSearchOperation == roomManagerUserAddAdmin && currentLevel == 2:
+			case roomManagerSearchOperation == roomManagerUserAddAdmin && currentLevelKnown && currentLevel == 2:
 				statusText, actionLabel = "高级房管", "管理"
 			}
 			var action func()
@@ -1043,7 +1146,7 @@ func RunDanmaku(ctx context.Context, session *LiveDanmakuSession, client *api.Cl
 					case roomManagerUserMute:
 						showRoomManagerMuteChoices(result)
 					case roomManagerUserBlacklist:
-						openRoomManagerConfirm("添加黑名单用户", "确定将 "+displayDanmakuManagedUser(result.Username, result.UserID)+" 添加到直播间黑名单吗？\n\n对方将无法观看、发言和互动。", func(actionCtx context.Context) error {
+						openRoomManagerConfirm("添加黑名单用户", "确定将 "+displayDanmakuManagedUser(result.Username, result.UserID)+" 添加到直播间黑名单吗？", func(actionCtx context.Context) error {
 							return client.BlacklistRoomUser(actionCtx, managementCapabilities.AnchorID, result.UserID, sessdata, biliJCT)
 						})
 					}
@@ -1183,9 +1286,6 @@ func RunDanmaku(ctx context.Context, session *LiveDanmakuSession, client *api.Cl
 				loadBlacklistedUsers()
 			}})
 		}
-		if managementCapabilities.IsAnchor || managementCapabilities.IsAdmin {
-			roomManagerTabsAvailable = append(roomManagerTabsAvailable, roomManagerTab{label: "屏蔽词", load: loadShieldKeywords})
-		}
 		if managementCapabilities.IsAnchor {
 			roomManagerTabsAvailable = append(roomManagerTabsAvailable, roomManagerTab{label: "全局禁言", load: loadRoomSilent})
 		}
@@ -1302,12 +1402,16 @@ func RunDanmaku(ctx context.Context, session *LiveDanmakuSession, client *api.Cl
 				for index, admin := range result.Items {
 					admin := admin
 					row := index + 1
-					roomManagerAdminLevels[admin.UserID] = admin.Level
-					action := func() {
-						showRoomManagerAdminChoices(api.RoomUserSearchResult{UserID: admin.UserID, Username: admin.Username, AdminLevel: admin.Level}, false)
+					if admin.LevelKnown {
+						roomManagerAdminLevels[admin.UserID] = admin.Level
 					}
-					level := "普通房管"
-					if admin.Level == 2 {
+					action := func() {
+						showRoomManagerAdminChoices(api.RoomUserSearchResult{UserID: admin.UserID, Username: admin.Username, AdminLevel: admin.Level, AdminLevelKnown: admin.LevelKnown}, false)
+					}
+					level := "身份未知"
+					if admin.LevelKnown && admin.Level == 1 {
+						level = "普通房管"
+					} else if admin.LevelKnown && admin.Level == 2 {
 						level = "高级房管"
 					}
 					roomManagerTableActions[row] = action
@@ -1368,7 +1472,8 @@ func RunDanmaku(ctx context.Context, session *LiveDanmakuSession, client *api.Cl
 				for index, item := range result.Items {
 					item := item
 					row := index + 1
-					canMute := managementCapabilities.CanMute(item.AdminLevel)
+					targetLevel, targetLevelKnown := roomManagerAdminLevels[item.UserID]
+					canMute := managementCapabilities.CanMuteUser(targetLevel, targetLevelKnown)
 					var action func()
 					if canMute {
 						action = func() {
@@ -1495,12 +1600,9 @@ func RunDanmaku(ctx context.Context, session *LiveDanmakuSession, client *api.Cl
 				if canAddKeyword {
 					roomManagerSection.SetText(fmt.Sprintf("[%s]已使用 %s[-]", mutedColor.String(), count))
 					triggerAddShieldKeyword = func() {
-						openRoomManagerInput("添加屏蔽词", "屏蔽词 ", "", 15, "保存", func(keyword string) error {
+						openRoomManagerInput("添加屏蔽词", "屏蔽词 ", "", 0, "保存", func(keyword string) error {
 							if strings.TrimSpace(keyword) == "" {
 								return fmt.Errorf("屏蔽词不能为空。")
-							}
-							if utf8.RuneCountInString(strings.TrimSpace(keyword)) > 15 {
-								return fmt.Errorf("屏蔽词最多 15 个字。")
 							}
 							return nil
 						}, func(keyword string) {
@@ -1593,11 +1695,11 @@ func RunDanmaku(ctx context.Context, session *LiveDanmakuSession, client *api.Cl
 					addSilentChoice(1, "全员禁言", "除主播和房管外，所有观众均不可发言", "开启", api.RoomSilentAll, 1)
 					addSilentChoice(2, "仅粉丝发言", "未关注本直播间的观众不可发言", "开启", api.RoomSilentNonFans, 1)
 					wealthAction := func() {
-						openRoomManagerInput("荣耀等级禁言", "等级 1-80 ", "1", 2, "保存", func(value string) error {
-							_, err := parseDanmakuManagementLevel(value, 80)
+						openRoomManagerInput("荣耀等级禁言", "等级 ", "1", 0, "保存", func(value string) error {
+							_, err := parseDanmakuManagementLevel(value)
 							return err
 						}, func(value string) {
-							level, _ := parseDanmakuManagementLevel(value, 80)
+							level, _ := parseDanmakuManagementLevel(value)
 							openRoomManagerConfirm("开启全局禁言", fmt.Sprintf("确定禁止荣耀等级低于 %d 的用户发言吗？", level), func(actionCtx context.Context) error {
 								return client.SetRoomSilentState(actionCtx, roomID, api.RoomSilentWealth, level, 0, sessdata, biliJCT)
 							})
@@ -1605,14 +1707,14 @@ func RunDanmaku(ctx context.Context, session *LiveDanmakuSession, client *api.Cl
 					}
 					roomManagerTableActions[3] = wealthAction
 					roomManagerTable.SetCell(3, 0, roomManagerTableTextCell("荣耀等级限制", 22, 1))
-					roomManagerTable.SetCell(3, 1, roomManagerTableMutedCell("低于设定等级的用户不可发言（1-80 级）", 46, 2))
+					roomManagerTable.SetCell(3, 1, roomManagerTableMutedCell("低于所填荣耀等级的用户不可发言", 46, 2))
 					roomManagerTable.SetCell(3, 2, roomManagerTableActionCell("配置", accentActiveColor, wealthAction))
 					medalAction := func() {
-						openRoomManagerInput("粉丝勋章禁言", "等级 1-120 ", "1", 3, "保存", func(value string) error {
-							_, err := parseDanmakuManagementLevel(value, 120)
+						openRoomManagerInput("粉丝勋章禁言", "等级 ", "1", 0, "保存", func(value string) error {
+							_, err := parseDanmakuManagementLevel(value)
 							return err
 						}, func(value string) {
-							level, _ := parseDanmakuManagementLevel(value, 120)
+							level, _ := parseDanmakuManagementLevel(value)
 							openRoomManagerConfirm("开启全局禁言", fmt.Sprintf("确定禁止粉丝牌等级低于 %d 的用户发言吗？", level), func(actionCtx context.Context) error {
 								return client.SetRoomSilentState(actionCtx, roomID, api.RoomSilentMedal, level, 0, sessdata, biliJCT)
 							})
@@ -1620,7 +1722,7 @@ func RunDanmaku(ctx context.Context, session *LiveDanmakuSession, client *api.Cl
 					}
 					roomManagerTableActions[4] = medalAction
 					roomManagerTable.SetCell(4, 0, roomManagerTableTextCell("粉丝勋章限制", 22, 1))
-					roomManagerTable.SetCell(4, 1, roomManagerTableMutedCell("无勋章或低于设定等级的用户不可发言（1-120 级）", 46, 2))
+					roomManagerTable.SetCell(4, 1, roomManagerTableMutedCell("无勋章或低于所填等级的用户不可发言", 46, 2))
 					roomManagerTable.SetCell(4, 2, roomManagerTableActionCell("配置", accentActiveColor, medalAction))
 					addSilentChoice(5, "除房管以外的观众", "仅主播和房管可以发言", "开启", api.RoomSilentNonMember, 1)
 				}
@@ -1632,26 +1734,25 @@ func RunDanmaku(ctx context.Context, session *LiveDanmakuSession, client *api.Cl
 		}()
 	}
 	openRoomManager := func() {
-		switch {
-		case !managementCapabilitiesReady:
-			roomManagerOpenPending = true
-			sendStatus.SetText("正在获取房间管理权限，请稍候……")
-			return
-		case managementCapabilitiesErr != nil:
-			sendStatus.SetText("获取房间管理权限失败：" + tview.Escape(managementCapabilitiesErr.Error()))
-			return
-		case !managementCapabilities.IsAnchor && !managementCapabilities.IsAdmin:
-			sendStatus.SetText("当前账号不是本直播间的主播或房管。")
-			return
-		}
-		roomManagerVisible = true
-		showRoomManagerRoot()
-		// 使用互斥页面切换而非透明叠加。这样弹幕页不会参与本帧绘制，
-		// 全角字符的延伸单元格也不可能透进房间管理工作区。
-		pages.SwitchToPage("room-manager")
-		app.SetFocus(roomManagerNavigation)
+		sendStatus.SetText("正在获取房间管理权限，请稍候……")
+		refreshManagementCapabilities(func(err error) {
+			if err != nil {
+				sendStatus.SetText("获取房间管理权限失败：" + tview.Escape(err.Error()))
+				return
+			}
+			if !managementCapabilities.IsAnchor && !managementCapabilities.IsAdmin {
+				sendStatus.SetText("当前账号不是本直播间的主播或房管。")
+				return
+			}
+			sendStatus.SetText("")
+			roomManagerVisible = true
+			showRoomManagerRoot()
+			// 使用互斥页面切换而非透明叠加。这样弹幕页不会参与本帧绘制，
+			// 全角字符的延伸单元格也不可能透进房间管理工作区。
+			pages.SwitchToPage("room-manager")
+			app.SetFocus(roomManagerNavigation)
+		})
 	}
-	openRoomManagerWhenReady = openRoomManager
 	mentionUser := func(message api.DanmakuMessage) {
 		username := strings.TrimSpace(message.Username)
 		if username == "" {
@@ -1707,7 +1808,25 @@ func RunDanmaku(ctx context.Context, session *LiveDanmakuSession, client *api.Cl
 			userCardActions.AddButton("@TA", func() { mentionUser(message) })
 		}
 		if managementCapabilitiesReady && managementCapabilitiesErr == nil && canManageDanmakuUser(managementCapabilities, message, profile) {
-			userCardActions.AddButton("管理", func() { openUserManagement(message, profile) })
+			userCardActions.AddButton("管理", func() {
+				sendStatus.SetText("正在确认房间管理权限……")
+				refreshManagementCapabilities(func(err error) {
+					if err != nil {
+						sendStatus.SetText("确认房间管理权限失败：" + tview.Escape(err.Error()))
+						return
+					}
+					if !userCardVisible || selectedUserID != strings.TrimSpace(message.UserID) {
+						return
+					}
+					if !canManageDanmakuUser(managementCapabilities, message, profile) {
+						sendStatus.SetText("当前账号已无权管理该用户。")
+						configureUserCardActions(message, profile)
+						return
+					}
+					sendStatus.SetText("")
+					openUserManagement(message, profile)
+				})
+			})
 		}
 		userCardActions.AddButton("关闭", closeUserCard)
 		// 打开资料卡以及异步刷新按钮后，默认都停在最安全的“关闭”上。
@@ -1869,6 +1988,12 @@ func RunDanmaku(ctx context.Context, session *LiveDanmakuSession, client *api.Cl
 				queueUI(func() {
 					status.SetText(formatDanmakuSessionStatus(snapshot))
 					renderOnlineRank(onlineRank, snapshot, onlineRankUserRegions)
+					if pendingSend != nil && danmakuSnapshotConfirmsSend(snapshot, pendingSend.startRevision, pendingSend.message, managementCapabilities.UserID) {
+						pendingSend.streamConfirmed = true
+						if pendingSend.requestAccepted {
+							completePendingSend(pendingSend)
+						}
+					}
 					if snapshot.historyRevision != renderedHistoryRevision {
 						renderedHistoryRevision = updateDanmakuHistory(chat, snapshot, renderedHistoryRevision, userRegions)
 					} else if len(snapshot.history) == 0 && chat.GetText(true) != snapshot.placeholder {
@@ -2344,10 +2469,10 @@ func managementTimestamp(value string) string {
 	return " · 任命于 " + tview.Escape(value)
 }
 
-func parseDanmakuManagementLevel(value string, maximum int) (int, error) {
+func parseDanmakuManagementLevel(value string) (int, error) {
 	level, err := strconv.Atoi(strings.TrimSpace(value))
-	if err != nil || level < 1 || level > maximum {
-		return 0, fmt.Errorf("等级必须是 1 到 %d 之间的整数。", maximum)
+	if err != nil || level < 1 {
+		return 0, fmt.Errorf("等级必须是正整数。")
 	}
 	return level, nil
 }
@@ -2371,13 +2496,13 @@ func formatRoomSilentState(state api.RoomSilentState) string {
 	return label
 }
 
-func danmakuTargetAdminLevel(message api.DanmakuMessage) int {
+func danmakuTargetAdminStatus(message api.DanmakuMessage) (level int, known bool) {
 	if message.IsAdmin {
-		// 弹幕包只标识“是房管”，不总是包含普通/高级等级。按最高等级
-		// 处理，避免房管之间错误展示越权操作；主播不受此限制。
-		return 2
+		// 消息只表明“是房管”，没有给出普通或高级等级。数值 2 仅作为
+		// 保守上界，known=false 会阻止非主播据此开放越级操作。
+		return 2, false
 	}
-	return 0
+	return 0, true
 }
 
 func canManageDanmakuUser(capabilities api.RoomManagementCapabilities, message api.DanmakuMessage, profile *api.UserProfile) bool {
@@ -2385,9 +2510,9 @@ func canManageDanmakuUser(capabilities api.RoomManagementCapabilities, message a
 	if userID == "" || userID == strings.TrimSpace(capabilities.UserID) || message.IsMystery || profile != nil && profile.IsSelf {
 		return false
 	}
-	targetAdminLevel := danmakuTargetAdminLevel(message)
-	return capabilities.CanMute(targetAdminLevel) ||
-		capabilities.CanBlacklist(targetAdminLevel) ||
+	targetAdminLevel, targetAdminLevelKnown := danmakuTargetAdminStatus(message)
+	return capabilities.CanMuteUser(targetAdminLevel, targetAdminLevelKnown) ||
+		capabilities.CanBlacklistUser(targetAdminLevel, targetAdminLevelKnown) ||
 		capabilities.IsAnchor
 }
 
@@ -2812,6 +2937,31 @@ func updateDanmakuHistory(chat *tview.TextView, snapshot liveDanmakuSnapshot, re
 		hasPrevious = true
 	}
 	return snapshot.historyRevision
+}
+
+// danmakuSnapshotConfirmsSend 只检查提交之后新增的普通弹幕。已知当前账号
+// UID 时必须一致，旧格式消息没有 UID 时再以文本回显作为兼容确认。
+func danmakuSnapshotConfirmsSend(snapshot liveDanmakuSnapshot, afterRevision uint64, message, currentUserID string) bool {
+	message = strings.TrimSpace(message)
+	if message == "" || snapshot.historyRevision <= afterRevision || len(snapshot.history) == 0 {
+		return false
+	}
+	added := snapshot.historyRevision - afterRevision
+	if added > uint64(len(snapshot.history)) {
+		added = uint64(len(snapshot.history))
+	}
+	currentUserID = strings.TrimSpace(currentUserID)
+	for index := len(snapshot.history) - int(added); index < len(snapshot.history); index++ {
+		event := snapshot.history[index]
+		if event.Kind != api.DanmakuEventMessage || strings.TrimSpace(event.Message.Text) != message {
+			continue
+		}
+		eventUserID := strings.TrimSpace(event.Message.UserID)
+		if currentUserID == "" || eventUserID == "" || eventUserID == currentUserID {
+			return true
+		}
+	}
+	return false
 }
 
 // danmakuStreamConnection 和 danmakuStreamConnector 让重连循环独立于 WebSocket 实现。

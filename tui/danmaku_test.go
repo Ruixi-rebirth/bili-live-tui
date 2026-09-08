@@ -298,6 +298,33 @@ func TestUpdateDanmakuHistoryHandlesClearAndCoalescedAppend(t *testing.T) {
 	}
 }
 
+func TestDanmakuSnapshotConfirmsSendFromNewOwnMessage(t *testing.T) {
+	oldMatch := api.DanmakuEvent{Kind: api.DanmakuEventMessage, Message: api.DanmakuMessage{UserID: "42", Text: "测试弹幕"}}
+	otherUser := api.DanmakuEvent{Kind: api.DanmakuEventMessage, Message: api.DanmakuMessage{UserID: "43", Text: "测试弹幕"}}
+	ownMatch := api.DanmakuEvent{Kind: api.DanmakuEventMessage, Message: api.DanmakuMessage{UserID: "42", Text: "测试弹幕"}}
+
+	if danmakuSnapshotConfirmsSend(liveDanmakuSnapshot{history: []api.DanmakuEvent{oldMatch}, historyRevision: 1}, 1, "测试弹幕", "42") {
+		t.Fatal("message preceding the submission was accepted as confirmation")
+	}
+	if danmakuSnapshotConfirmsSend(liveDanmakuSnapshot{history: []api.DanmakuEvent{oldMatch, otherUser}, historyRevision: 2}, 1, "测试弹幕", "42") {
+		t.Fatal("another user's message was accepted as confirmation")
+	}
+	if !danmakuSnapshotConfirmsSend(liveDanmakuSnapshot{history: []api.DanmakuEvent{oldMatch, otherUser, ownMatch}, historyRevision: 3}, 1, " 测试弹幕 ", "42") {
+		t.Fatal("new own message did not confirm the submission")
+	}
+}
+
+func TestDanmakuSnapshotConfirmationSupportsLegacyMessageWithoutUID(t *testing.T) {
+	legacy := api.DanmakuEvent{Kind: api.DanmakuEventMessage, Message: api.DanmakuMessage{Text: "测试弹幕"}}
+	snapshot := liveDanmakuSnapshot{history: []api.DanmakuEvent{legacy}, historyRevision: 8}
+	if !danmakuSnapshotConfirmsSend(snapshot, 7, "测试弹幕", "42") {
+		t.Fatal("legacy message without UID did not confirm the submission")
+	}
+	if danmakuSnapshotConfirmsSend(snapshot, 7, "另一条弹幕", "42") {
+		t.Fatal("different legacy message confirmed the submission")
+	}
+}
+
 func TestDanmakuInputCaptureHandlesBackspaceWithoutNavigating(t *testing.T) {
 	reply := tview.NewInputField()
 	reply.SetText("测试文本")
@@ -403,11 +430,11 @@ func TestCanManageDanmakuUserRespectsIdentityAndHierarchy(t *testing.T) {
 }
 
 func TestParseDanmakuManagementLevel(t *testing.T) {
-	if level, err := parseDanmakuManagementLevel(" 80 ", 80); err != nil || level != 80 {
+	if level, err := parseDanmakuManagementLevel(" 121 "); err != nil || level != 121 {
 		t.Fatalf("level = %d, err = %v", level, err)
 	}
-	for _, value := range []string{"", "0", "81", "一点五"} {
-		if _, err := parseDanmakuManagementLevel(value, 80); err == nil {
+	for _, value := range []string{"", "0", "-1", "一点五"} {
+		if _, err := parseDanmakuManagementLevel(value); err == nil {
 			t.Fatalf("invalid level %q was accepted", value)
 		}
 	}

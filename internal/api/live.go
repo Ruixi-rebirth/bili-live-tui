@@ -224,13 +224,24 @@ func (capabilities RoomManagementCapabilities) HasPermission(permission int) boo
 }
 
 func (capabilities RoomManagementCapabilities) CanMute(targetAdminLevel int) bool {
-	return capabilities.IsAnchor || capabilities.IsAdmin &&
+	return capabilities.CanMuteUser(targetAdminLevel, true)
+}
+
+// CanMuteUser 判断是否可对特定用户执行禁言。普通房管必须已从上游获知
+// 对方的房管等级，主播不受这项层级判断限制。
+func (capabilities RoomManagementCapabilities) CanMuteUser(targetAdminLevel int, targetAdminLevelKnown bool) bool {
+	return capabilities.IsAnchor || targetAdminLevelKnown && capabilities.IsAdmin &&
 		capabilities.HasPermission(RoomPermissionMute) &&
 		capabilities.AdminLevel > targetAdminLevel
 }
 
 func (capabilities RoomManagementCapabilities) CanBlacklist(targetAdminLevel int) bool {
-	return capabilities.IsAnchor || capabilities.IsAdmin &&
+	return capabilities.CanBlacklistUser(targetAdminLevel, true)
+}
+
+// CanBlacklistUser 判断是否可将特定用户加入黑名单。
+func (capabilities RoomManagementCapabilities) CanBlacklistUser(targetAdminLevel int, targetAdminLevelKnown bool) bool {
+	return capabilities.IsAnchor || targetAdminLevelKnown && capabilities.IsAdmin &&
 		capabilities.HasPermission(RoomPermissionBlacklist) &&
 		capabilities.AdminLevel > targetAdminLevel
 }
@@ -328,6 +339,7 @@ type RoomAdmin struct {
 	Username    string
 	AppointedAt string
 	Level       int
+	LevelKnown  bool
 }
 
 type RoomAdminPage struct {
@@ -368,10 +380,10 @@ func (c *Client) GetRoomAdmins(ctx context.Context, page int, sessdata, biliJCT 
 		Msg     string `json:"msg"`
 		Data    struct {
 			Items []struct {
-				UID        flexibleID    `json:"uid"`
-				Username   string        `json:"uname"`
-				CreatedAt  string        `json:"ctime"`
-				AdminLevel flexibleInt64 `json:"admin_level"`
+				UID        flexibleID     `json:"uid"`
+				Username   string         `json:"uname"`
+				CreatedAt  string         `json:"ctime"`
+				AdminLevel *flexibleInt64 `json:"admin_level"`
 			} `json:"data"`
 			Page struct {
 				Number     flexibleInt64 `json:"page"`
@@ -391,7 +403,12 @@ func (c *Client) GetRoomAdmins(ctx context.Context, page int, sessdata, biliJCT 
 		result.Page = page
 	}
 	for _, item := range raw.Data.Items {
-		result.Items = append(result.Items, RoomAdmin{UserID: string(item.UID), Username: strings.TrimSpace(item.Username), AppointedAt: strings.TrimSpace(item.CreatedAt), Level: int(item.AdminLevel)})
+		admin := RoomAdmin{UserID: string(item.UID), Username: strings.TrimSpace(item.Username), AppointedAt: strings.TrimSpace(item.CreatedAt)}
+		if item.AdminLevel != nil {
+			admin.Level = int(*item.AdminLevel)
+			admin.LevelKnown = true
+		}
+		result.Items = append(result.Items, admin)
 	}
 	return result, nil
 }
@@ -414,9 +431,10 @@ func (c *Client) DismissRoomAdmin(ctx context.Context, userID, sessdata, biliJCT
 }
 
 type RoomUserSearchResult struct {
-	UserID     string
-	Username   string
-	AdminLevel int
+	UserID          string
+	Username        string
+	AdminLevel      int
+	AdminLevelKnown bool
 }
 
 func (c *Client) SearchRoomUsers(ctx context.Context, keyword, sessdata, biliJCT string) ([]RoomUserSearchResult, error) {
@@ -437,12 +455,12 @@ func (c *Client) SearchRoomUsers(ctx context.Context, keyword, sessdata, biliJCT
 		return nil, fmt.Errorf("搜索直播用户失败（错误码 %d）：%s", raw.Code, responseMessage(raw.Message, raw.Msg))
 	}
 	type searchItem struct {
-		UID        flexibleID    `json:"uid"`
-		TargetUID  flexibleID    `json:"tuid"`
-		Username   string        `json:"uname"`
-		TargetName string        `json:"tname"`
-		Name       string        `json:"name"`
-		AdminLevel flexibleInt64 `json:"admin_level"`
+		UID        flexibleID     `json:"uid"`
+		TargetUID  flexibleID     `json:"tuid"`
+		Username   string         `json:"uname"`
+		TargetName string         `json:"tname"`
+		Name       string         `json:"name"`
+		AdminLevel *flexibleInt64 `json:"admin_level"`
 	}
 	var items []searchItem
 	if len(raw.Data) > 0 && string(raw.Data) != "null" {
@@ -492,7 +510,12 @@ func (c *Client) SearchRoomUsers(ctx context.Context, keyword, sessdata, biliJCT
 		if username == "" {
 			username = strings.TrimSpace(item.Name)
 		}
-		result = append(result, RoomUserSearchResult{UserID: userID, Username: username, AdminLevel: int(item.AdminLevel)})
+		entry := RoomUserSearchResult{UserID: userID, Username: username}
+		if item.AdminLevel != nil {
+			entry.AdminLevel = int(*item.AdminLevel)
+			entry.AdminLevelKnown = true
+		}
+		result = append(result, entry)
 	}
 	return result, nil
 }
@@ -502,7 +525,6 @@ type RoomMutedUser struct {
 	Username         string
 	OperatorName     string
 	ExpiresAt        string
-	AdminLevel       int
 	OperatorIsAnchor bool
 }
 
@@ -526,18 +548,19 @@ func (c *Client) GetMutedRoomUsers(ctx context.Context, roomID string, page int,
 		Msg     string `json:"msg"`
 		Data    struct {
 			Items []struct {
-				UID              flexibleID    `json:"tuid"`
-				Username         string        `json:"tname"`
-				OperatorName     string        `json:"name"`
-				ExpiresAt        string        `json:"block_end_time"`
-				AdminLevel       flexibleInt64 `json:"admin_level"`
-				OperatorIsAnchor flexibleBool  `json:"is_anchor"`
+				UID              flexibleID   `json:"tuid"`
+				Username         string       `json:"tname"`
+				OperatorName     string       `json:"name"`
+				ExpiresAt        string       `json:"block_end_time"`
+				OperatorIsAnchor flexibleBool `json:"is_anchor"`
 			} `json:"data"`
 			Total      flexibleInt64 `json:"total"`
 			TotalPages flexibleInt64 `json:"total_page"`
 		} `json:"data"`
 	}
-	params := url.Values{"room_id": {roomID}, "ps": {strconv.Itoa(page)}}
+	// Web 接口用 pn 表示页码、ps 表示每页数量。把页码写进 ps 会导致每次
+	// 请求的都是数量不同的第一页。
+	params := url.Values{"room_id": {roomID}, "pn": {strconv.Itoa(page)}, "ps": {"20"}}
 	if err := c.postRoomManagementJSON(ctx, "GetMutedUsers", sessdata, biliJCT, params, &raw); err != nil {
 		return RoomMutedUserPage{}, fmt.Errorf("获取禁言名单失败: %w", err)
 	}
@@ -551,7 +574,7 @@ func (c *Client) GetMutedRoomUsers(ctx context.Context, roomID string, page int,
 		Items:      make([]RoomMutedUser, 0, len(raw.Data.Items)),
 	}
 	for _, item := range raw.Data.Items {
-		result.Items = append(result.Items, RoomMutedUser{UserID: string(item.UID), Username: strings.TrimSpace(item.Username), OperatorName: strings.TrimSpace(item.OperatorName), ExpiresAt: strings.TrimSpace(item.ExpiresAt), AdminLevel: int(item.AdminLevel), OperatorIsAnchor: bool(item.OperatorIsAnchor)})
+		result.Items = append(result.Items, RoomMutedUser{UserID: string(item.UID), Username: strings.TrimSpace(item.Username), OperatorName: strings.TrimSpace(item.OperatorName), ExpiresAt: strings.TrimSpace(item.ExpiresAt), OperatorIsAnchor: bool(item.OperatorIsAnchor)})
 	}
 	return result, nil
 }
@@ -741,10 +764,10 @@ func (c *Client) GetRoomShieldKeywords(ctx context.Context, roomID, sessdata, bi
 		} `json:"data"`
 	}
 	if err := c.postRoomManagementJSON(ctx, "GetShieldKeywords", sessdata, biliJCT, url.Values{"room_id": {roomID}}, &raw); err != nil {
-		return RoomShieldKeywordState{}, fmt.Errorf("获取直播间屏蔽词失败: %w", err)
+		return RoomShieldKeywordState{}, fmt.Errorf("获取弹幕观看屏蔽词失败: %w", err)
 	}
 	if raw.Code != 0 {
-		return RoomShieldKeywordState{}, fmt.Errorf("获取直播间屏蔽词失败（错误码 %d）：%s", raw.Code, responseMessage(raw.Message, raw.Msg))
+		return RoomShieldKeywordState{}, fmt.Errorf("获取弹幕观看屏蔽词失败（错误码 %d）：%s", raw.Code, responseMessage(raw.Message, raw.Msg))
 	}
 	result := RoomShieldKeywordState{MaxCount: int(raw.Data.MaxCount)}
 	for _, item := range raw.Data.KeywordList {
@@ -760,9 +783,6 @@ func validateRoomShieldKeyword(keyword string) (string, error) {
 	if keyword == "" {
 		return "", fmt.Errorf("屏蔽词不能为空")
 	}
-	if len([]rune(keyword)) > 15 {
-		return "", fmt.Errorf("屏蔽词最多 15 个字")
-	}
 	return keyword, nil
 }
 
@@ -774,7 +794,7 @@ func (c *Client) AddRoomShieldKeyword(ctx context.Context, roomID, keyword, sess
 	if err != nil {
 		return err
 	}
-	return c.roomManagementAction(ctx, "AddShieldKeyword", "添加直播间屏蔽词", sessdata, biliJCT, url.Values{"room_id": {roomID}, "keyword": {keyword}})
+	return c.roomManagementAction(ctx, "AddShieldKeyword", "添加弹幕观看屏蔽词", sessdata, biliJCT, url.Values{"room_id": {roomID}, "keyword": {keyword}})
 }
 
 func (c *Client) DeleteRoomShieldKeyword(ctx context.Context, roomID, keyword, sessdata, biliJCT string) error {
@@ -785,7 +805,7 @@ func (c *Client) DeleteRoomShieldKeyword(ctx context.Context, roomID, keyword, s
 	if err != nil {
 		return err
 	}
-	return c.roomManagementAction(ctx, "DeleteShieldKeyword", "删除直播间屏蔽词", sessdata, biliJCT, url.Values{"room_id": {roomID}, "keyword": {keyword}})
+	return c.roomManagementAction(ctx, "DeleteShieldKeyword", "删除弹幕观看屏蔽词", sessdata, biliJCT, url.Values{"room_id": {roomID}, "keyword": {keyword}})
 }
 
 type RoomSilentState struct {
@@ -843,12 +863,12 @@ func validateRoomSilent(audience string, level, minutes int) error {
 			return fmt.Errorf("该全局禁言类型不使用等级")
 		}
 	case RoomSilentWealth:
-		if level < 1 || level > 80 {
-			return fmt.Errorf("财富等级必须在 1 到 80 之间")
+		if level < 1 {
+			return fmt.Errorf("财富等级必须是正整数")
 		}
 	case RoomSilentMedal:
-		if level < 1 || level > 120 {
-			return fmt.Errorf("粉丝牌等级必须在 1 到 120 之间")
+		if level < 1 {
+			return fmt.Errorf("粉丝牌等级必须是正整数")
 		}
 	default:
 		return fmt.Errorf("无效的全局禁言类型：%s", audience)
