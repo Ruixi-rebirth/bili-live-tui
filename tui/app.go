@@ -20,6 +20,89 @@ var (
 // ErrLiveSettingsCancelled 用于区分用户主动放弃开播和设置/网络错误。
 var ErrLiveSettingsCancelled = errors.New("已取消设置开播信息")
 
+type AlreadyLiveAction int
+
+const (
+	AlreadyLiveActionStopLive AlreadyLiveAction = iota // 立即下播
+	AlreadyLiveActionDanmaku                           // 进入弹幕与房间管理
+	AlreadyLiveActionRestart                           // 强制重新开播
+	AlreadyLiveActionExit                              // 退出程序
+)
+
+// RunAlreadyLiveDialog 当启动时检测到直播间处于开播状态时弹出，提供一键下播、直接进弹幕、重开或退出等选项。
+func RunAlreadyLiveDialog(ctx context.Context, roomID, title string, onStopLive func() error) (AlreadyLiveAction, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	applyTheme()
+	app := tview.NewApplication().EnableMouse(true).SetTitle("bili-live-tui")
+
+	action := AlreadyLiveActionExit
+	modal := styleModal(tview.NewModal())
+	modal.SetBackgroundColor(panelColor)
+
+	msg := fmt.Sprintf("⚠️ 检测到您的直播间（%s）当前处于【开播中 🔴】状态！\n标题：%s\n\n可能是上次意外关闭终端未完成下播，或正在其他客户端推流。\n请选择您的操作：",
+		tview.Escape(roomID), tview.Escape(title))
+	modal.SetText(msg)
+	modal.AddButtons([]string{"⏹ 立即下播", "📺 进入弹幕与管理", "🔄 重新开播", "✕ 退出程序"})
+
+	var busy atomic.Bool
+	modal.SetDoneFunc(func(buttonIndex int, buttonLabel string) {
+		if busy.Load() {
+			return
+		}
+		switch buttonIndex {
+		case 0: // 立即下播
+			if onStopLive != nil {
+				busy.Store(true)
+				modal.SetText(fmt.Sprintf("%s\n\n[%s]正在请求下播，请稍候……[-]", msg, accentColor.String()))
+				go func() {
+					err := onStopLive()
+					app.QueueUpdateDraw(func() {
+						busy.Store(false)
+						if err != nil {
+							modal.SetText(fmt.Sprintf("%s\n\n[%s]下播失败：%s[-]", msg, errorColor.String(), tview.Escape(err.Error())))
+							return
+						}
+						action = AlreadyLiveActionStopLive
+						app.Stop()
+					})
+				}()
+				return
+			}
+			action = AlreadyLiveActionStopLive
+			app.Stop()
+		case 1: // 进入弹幕与管理
+			action = AlreadyLiveActionDanmaku
+			app.Stop()
+		case 2: // 重新开播
+			if onStopLive != nil {
+				busy.Store(true)
+				modal.SetText(fmt.Sprintf("%s\n\n[%s]正在清理旧直播状态，请稍候……[-]", msg, accentColor.String()))
+				go func() {
+					_ = onStopLive()
+					app.QueueUpdateDraw(func() {
+						busy.Store(false)
+						action = AlreadyLiveActionRestart
+						app.Stop()
+					})
+				}()
+				return
+			}
+			action = AlreadyLiveActionRestart
+			app.Stop()
+		default: // 退出程序
+			action = AlreadyLiveActionExit
+			app.Stop()
+		}
+	})
+
+	if err := app.SetRoot(modal, false).Run(); err != nil {
+		return AlreadyLiveActionExit, err
+	}
+	return action, nil
+}
+
 const executablePathPageName = "executable-path"
 
 func executableNotFound(err error) *utils.ExecutableNotFoundError {

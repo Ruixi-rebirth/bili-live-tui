@@ -192,6 +192,21 @@ type OnlineRankSnapshot struct {
 	Members []OnlineRankMember
 }
 
+// GuardMember 是直播间大航海（舰队）成员。
+type GuardMember struct {
+	UserID     string
+	Username   string
+	GuardLevel int
+	Rank       int
+	IsAlive    bool
+}
+
+// GuardSnapshot 是直播间大航海（舰队）快照。
+type GuardSnapshot struct {
+	Total   int64
+	Members []GuardMember
+}
+
 const (
 	// These values are the permission constants used by Bilibili's current
 	// live-room Web client (module 80972). Keep them numeric because the API
@@ -1017,14 +1032,130 @@ func (c *Client) getRoomSnapshotAt(ctx context.Context, path, roomID string) (Ro
 
 // GetOnlineGoldRankWithCookie 获取在线人数和高能榜。
 func (c *Client) GetOnlineGoldRankWithCookie(ctx context.Context, roomID, sessdata, biliJCT string) (OnlineRankSnapshot, error) {
-	identity, err := c.resolveDanmakuIdentity(ctx, sessdata, biliJCT)
+	anchorUID, err := c.resolveAnchorOrUserUID(ctx, roomID, sessdata, biliJCT)
 	if err != nil {
 		return OnlineRankSnapshot{}, fmt.Errorf("获取在线榜主播身份失败: %w", err)
 	}
-	if identity.UID <= 0 {
-		return OnlineRankSnapshot{}, fmt.Errorf("获取在线榜主播身份失败: UID 无效")
+	return c.getOnlineGoldRank(ctx, roomID, anchorUID, sessdata, biliJCT)
+}
+
+func (c *Client) resolveAnchorOrUserUID(ctx context.Context, roomID, sessdata, biliJCT string) (int64, error) {
+	if snapshot, err := c.GetRoomSnapshot(ctx, roomID); err == nil {
+		if uid, err := strconv.ParseInt(strings.TrimSpace(snapshot.AnchorID), 10, 64); err == nil && uid > 0 {
+			return uid, nil
+		}
 	}
-	return c.getOnlineGoldRank(ctx, roomID, identity.UID, sessdata, biliJCT)
+	if strings.TrimSpace(sessdata) != "" {
+		if identity, err := c.resolveDanmakuIdentity(ctx, sessdata, biliJCT); err == nil && identity.UID > 0 {
+			return identity.UID, nil
+		}
+	}
+	return 0, fmt.Errorf("无法获取主播 UID")
+}
+
+// GetGuardTopListWithCookie 自动解析主播 UID 并获取大航海列表快照。
+func (c *Client) GetGuardTopListWithCookie(ctx context.Context, roomID, sessdata, biliJCT string) (GuardSnapshot, error) {
+	anchorUID, err := c.resolveAnchorOrUserUID(ctx, roomID, sessdata, biliJCT)
+	if err != nil {
+		return GuardSnapshot{}, fmt.Errorf("获取大航海列表失败: %w", err)
+	}
+	return c.GetGuardTopList(ctx, roomID, anchorUID, 1)
+}
+
+// GetGuardTopList 获取指定房间的大航海（舰队）成员列表。
+func (c *Client) GetGuardTopList(ctx context.Context, roomID string, anchorUID int64, page int) (GuardSnapshot, error) {
+	roomID = strings.TrimSpace(roomID)
+	if roomID == "" || anchorUID <= 0 {
+		return GuardSnapshot{}, fmt.Errorf("获取大航海列表需要有效的房间号和主播 UID")
+	}
+	if page <= 0 {
+		page = 1
+	}
+	path, err := c.endpointByName("GetGuardTopList")
+	if err != nil {
+		return GuardSnapshot{}, err
+	}
+	parsed, err := url.Parse(path)
+	if err != nil {
+		return GuardSnapshot{}, fmt.Errorf("准备获取大航海列表失败: %w", err)
+	}
+	query := parsed.Query()
+	query.Set("roomid", roomID)
+	query.Set("ruid", strconv.FormatInt(anchorUID, 10))
+	query.Set("page", strconv.Itoa(page))
+	parsed.RawQuery = query.Encode()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, parsed.String(), nil)
+	if err != nil {
+		return GuardSnapshot{}, fmt.Errorf("准备获取大航海列表失败: %w", err)
+	}
+	setBilibiliBrowserHeaders(req)
+	req.Header.Set("Referer", "https://live.bilibili.com/"+roomID)
+	resp, err := c.HTTPClient.Do(req)
+	if err != nil {
+		return GuardSnapshot{}, fmt.Errorf("获取大航海列表失败: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return GuardSnapshot{}, fmt.Errorf("获取大航海列表失败：远程服务器返回 HTTP %d", resp.StatusCode)
+	}
+	var raw struct {
+		Code    int    `json:"code"`
+		Message string `json:"message"`
+		Data    *struct {
+			Info struct {
+				Num  flexibleInt64 `json:"num"`
+				Page flexibleInt64 `json:"page"`
+				Now  flexibleInt64 `json:"now"`
+			} `json:"info"`
+			Top3 []struct {
+				UID        flexibleID    `json:"uid"`
+				Username   string        `json:"username"`
+				Rank       int           `json:"rank"`
+				GuardLevel int           `json:"guard_level"`
+				IsAlive    flexibleInt64 `json:"is_alive"`
+			} `json:"top3"`
+			List []struct {
+				UID        flexibleID    `json:"uid"`
+				Username   string        `json:"username"`
+				Rank       int           `json:"rank"`
+				GuardLevel int           `json:"guard_level"`
+				IsAlive    flexibleInt64 `json:"is_alive"`
+			} `json:"list"`
+		} `json:"data"`
+	}
+	decoder := json.NewDecoder(io.LimitReader(resp.Body, maxAPIResponseBytes+1))
+	if err := decoder.Decode(&raw); err != nil {
+		return GuardSnapshot{}, fmt.Errorf("解析大航海列表失败: %w", err)
+	}
+	if raw.Code != 0 {
+		return GuardSnapshot{}, fmt.Errorf("获取大航海列表失败: %s", strings.TrimSpace(raw.Message))
+	}
+	if raw.Data == nil {
+		return GuardSnapshot{}, fmt.Errorf("大航海接口未返回数据")
+	}
+	snapshot := GuardSnapshot{Total: int64(raw.Data.Info.Num)}
+	appendMember := func(uid string, username string, rank, guardLevel int, isAlive bool) {
+		username = strings.TrimSpace(username)
+		if username == "" {
+			return
+		}
+		snapshot.Members = append(snapshot.Members, GuardMember{
+			UserID:     uid,
+			Username:   username,
+			Rank:       rank,
+			GuardLevel: guardLevel,
+			IsAlive:    isAlive,
+		})
+	}
+	if page == 1 {
+		for _, item := range raw.Data.Top3 {
+			appendMember(string(item.UID), item.Username, item.Rank, item.GuardLevel, item.IsAlive > 0)
+		}
+	}
+	for _, item := range raw.Data.List {
+		appendMember(string(item.UID), item.Username, item.Rank, item.GuardLevel, item.IsAlive > 0)
+	}
+	return snapshot, nil
 }
 
 func (c *Client) getOnlineGoldRank(ctx context.Context, roomID string, anchorUID int64, sessdata, biliJCT string) (OnlineRankSnapshot, error) {

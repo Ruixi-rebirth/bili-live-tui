@@ -114,3 +114,88 @@ func TestFormatStreamHealth(t *testing.T) {
 		t.Fatalf("confirming health text = %q", confirmingText)
 	}
 }
+
+func TestNewHomeWorkspace(t *testing.T) {
+	applyTheme()
+	app := tview.NewApplication()
+	pages := tview.NewPages()
+
+	returnedToDanmaku := false
+	stoppedLive := false
+
+	settings := &api.LiveSettings{
+		Title:  "测试直播间",
+		AreaID: "376",
+	}
+	opts := DanmakuOverviewOptions{
+		StartedAt: time.Now().Add(-10 * time.Minute),
+		RoomID:    "123456",
+		Settings:  settings,
+		Areas:     []api.LiveArea{{ID: "376", Name: "单机游戏"}},
+		Notice:    "欢迎来到直播间",
+		SaveEdit: func(edited api.LiveSettings) (api.LiveSettings, error) {
+			return edited, nil
+		},
+		PreviewLive: func() error {
+			return nil
+		},
+	}
+
+	ws := newHomeWorkspace(
+		nil,
+		app,
+		pages,
+		"main",
+		opts,
+		func() api.LiveSessionStats {
+			return api.LiveSessionStats{
+				Popularity:      99,
+				PopularityKnown: true,
+			}
+		},
+		func() {
+			returnedToDanmaku = true
+		},
+		func() {
+			stoppedLive = true
+		},
+	)
+	defer ws.stopRefresh()
+
+	if ws.root == nil {
+		t.Fatalf("ws.root is nil")
+	}
+	if len(ws.buttons) != 4 {
+		t.Fatalf("expected 4 buttons (返回弹幕, 预览直播, 修改资料, 下播退出), got %d", len(ws.buttons))
+	}
+
+	if label := ws.buttons[0].GetLabel(); label != "返回弹幕" {
+		t.Errorf("button 0 label = %q, want 返回弹幕", label)
+	}
+	if label := ws.buttons[1].GetLabel(); label != "预览直播" {
+		t.Errorf("button 1 label = %q, want 预览直播", label)
+	}
+	if label := ws.buttons[2].GetLabel(); label != "修改资料" {
+		t.Errorf("button 2 label = %q, want 修改资料", label)
+	}
+	if label := ws.buttons[3].GetLabel(); label != "下播退出" {
+		t.Errorf("button 3 label = %q, want 下播退出", label)
+	}
+
+	// Trigger "返回弹幕"
+	if handler := ws.buttons[0].InputHandler(); handler != nil {
+		handler(tcell.NewEventKey(tcell.KeyEnter, 0, tcell.ModNone), nil)
+		if !returnedToDanmaku {
+			t.Errorf("expected returnedToDanmaku to be true")
+		}
+	}
+
+	// Trigger "下播退出"
+	if handler := ws.buttons[3].InputHandler(); handler != nil {
+		handler(tcell.NewEventKey(tcell.KeyEnter, 0, tcell.ModNone), nil)
+		if !stoppedLive {
+			t.Errorf("expected stoppedLive to be true")
+		}
+	}
+}
+

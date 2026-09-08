@@ -51,7 +51,7 @@ func TestLiveSettingsValidate(t *testing.T) {
 }
 
 func TestEndpointCatalog(t *testing.T) {
-	for _, name := range []string{"GetMyRoomID", "GetRoomSnapshot", "GetOnlineGoldRank", "GetRoomPlaybackURL", "GetDanmakuInfo", "GetDanmakuInfoLegacy", "GetDanmakuUserInfo", "GetUserCard", "ModifyUserRelation", "GetRoomAdminSenior", "GetRoomAdmins", "AppointRoomAdmin", "DismissRoomAdmin", "SearchRoomUser", "GetMutedUsers", "MuteRoomUser", "UnmuteRoomUser", "GetRoomBlacklist", "BlacklistRoomUser", "UnblacklistRoomUser", "GetShieldKeywords", "AddShieldKeyword", "DeleteShieldKeyword", "GetRoomSilent", "SetRoomSilent", "SendDanmaku", "GetLiveAreas", "UploadRoomCover", "AddLiveTag", "DeleteLiveTag", "UpdateRoomNews", "UpdatePreLiveInfo", "UpdateLiveInfo", "StartLive", "StopLive", "GetTVQRCode", "CheckQRStatus"} {
+	for _, name := range []string{"GetMyRoomID", "GetRoomSnapshot", "GetOnlineGoldRank", "GetGuardTopList", "GetRoomPlaybackURL", "GetDanmakuInfo", "GetDanmakuInfoLegacy", "GetDanmakuUserInfo", "GetUserCard", "ModifyUserRelation", "GetRoomAdminSenior", "GetRoomAdmins", "AppointRoomAdmin", "DismissRoomAdmin", "SearchRoomUser", "GetMutedUsers", "MuteRoomUser", "UnmuteRoomUser", "GetRoomBlacklist", "BlacklistRoomUser", "UnblacklistRoomUser", "GetShieldKeywords", "AddShieldKeyword", "DeleteShieldKeyword", "GetRoomSilent", "SetRoomSilent", "SendDanmaku", "GetLiveAreas", "UploadRoomCover", "AddLiveTag", "DeleteLiveTag", "UpdateRoomNews", "UpdatePreLiveInfo", "UpdateLiveInfo", "StartLive", "StopLive", "GetTVQRCode", "CheckQRStatus"} {
 		endpoint, ok := EndpointByName(name)
 		if !ok || endpoint.Path == "" || endpoint.Method == "" {
 			t.Fatalf("endpoint %q missing from catalog", name)
@@ -93,6 +93,47 @@ func TestGetOnlineGoldRank(t *testing.T) {
 	}
 	if snapshot.Online != 23 || len(snapshot.Members) != 1 || snapshot.Members[0].Username != "高能用户" || snapshot.Members[0].Score != 11 || snapshot.Members[0].GuardLevel != 3 {
 		t.Fatalf("online rank snapshot = %#v", snapshot)
+	}
+}
+
+func TestGetGuardTopList(t *testing.T) {
+	transport := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		query := r.URL.Query()
+		if r.URL.Path != "/guard/topList" || query.Get("roomid") != "1" || query.Get("ruid") != "42" || query.Get("page") != "1" {
+			t.Errorf("guard top list request = %s", r.URL.String())
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body: io.NopCloser(strings.NewReader(`{
+				"code": 0,
+				"message": "OK",
+				"data": {
+					"info": {"num": 12, "page": 2, "now": 1},
+					"top3": [
+						{"uid": 101, "username": "提督甲", "rank": 1, "guard_level": 2, "is_alive": 1}
+					],
+					"list": [
+						{"uid": 102, "username": "舰长乙", "rank": 2, "guard_level": 3, "is_alive": 0}
+					]
+				}
+			}`)),
+			Header: make(http.Header),
+		}, nil
+	})
+	client := NewClient(&http.Client{Transport: transport})
+	client.BaseURL = "http://test.invalid"
+	snapshot, err := client.GetGuardTopList(context.Background(), "1", 42, 1)
+	if err != nil {
+		t.Fatalf("GetGuardTopList() error = %v", err)
+	}
+	if snapshot.Total != 12 || len(snapshot.Members) != 2 {
+		t.Fatalf("guard snapshot = %#v", snapshot)
+	}
+	if snapshot.Members[0].Username != "提督甲" || snapshot.Members[0].GuardLevel != 2 || !snapshot.Members[0].IsAlive {
+		t.Errorf("guard member[0] = %#v", snapshot.Members[0])
+	}
+	if snapshot.Members[1].Username != "舰长乙" || snapshot.Members[1].GuardLevel != 3 || snapshot.Members[1].IsAlive {
+		t.Errorf("guard member[1] = %#v", snapshot.Members[1])
 	}
 }
 

@@ -33,6 +33,11 @@ type LiveDanmakuSession struct {
 	viewerKnown     bool
 	onlineRank      []api.OnlineRankMember
 	onlineRankError string
+	guardTotal      int64
+	guardKnown      bool
+	guardMembers    []api.GuardMember
+	guardError      string
+	gifts           []api.DanmakuEvent
 	stats           api.LiveSessionStats
 	subscribers     map[chan struct{}]struct{}
 	closed          bool
@@ -50,6 +55,12 @@ type liveDanmakuSnapshot struct {
 	viewerKnown     bool
 	onlineRank      []api.OnlineRankMember
 	onlineRankError string
+	guardTotal      int64
+	guardKnown      bool
+	guardMembers    []api.GuardMember
+	guardError      string
+	gifts           []api.DanmakuEvent
+	stats           api.LiveSessionStats
 }
 
 // NewLiveDanmakuSession 启动一个会自动重连的认证弹幕流。
@@ -108,8 +119,9 @@ func (s *LiveDanmakuSession) handleEvent(event api.DanmakuEvent) {
 		return
 	}
 	s.mu.Lock()
-	if event.Kind == api.DanmakuEventGift {
+	if event.Kind == api.DanmakuEventGift || event.Kind == api.DanmakuEventSuperChat || event.Kind == api.DanmakuEventGuard {
 		s.stats.Observe(event)
+		s.gifts = append(s.gifts, event)
 	}
 	s.history = append(s.history, event)
 	if overflow := len(s.history) - danmakuHistoryLimit; overflow > 0 {
@@ -136,6 +148,12 @@ func (s *LiveDanmakuSession) snapshot() liveDanmakuSnapshot {
 		viewerKnown:     s.viewerKnown,
 		onlineRank:      append([]api.OnlineRankMember(nil), s.onlineRank...),
 		onlineRankError: s.onlineRankError,
+		guardTotal:      s.guardTotal,
+		guardKnown:      s.guardKnown,
+		guardMembers:    append([]api.GuardMember(nil), s.guardMembers...),
+		guardError:      s.guardError,
+		gifts:           append([]api.DanmakuEvent(nil), s.gifts...),
+		stats:           s.stats,
 	}
 }
 
@@ -145,24 +163,45 @@ func (s *LiveDanmakuSession) pollOnlineRank(client *api.Client, roomID, sessdata
 	}
 	refresh := func() {
 		requestCtx, cancel := context.WithTimeout(s.ctx, 8*time.Second)
-		rank, err := client.GetOnlineGoldRankWithCookie(requestCtx, roomID, sessdata, biliJCT)
-		cancel()
+		defer cancel()
+		rank, rankErr := client.GetOnlineGoldRankWithCookie(requestCtx, roomID, sessdata, biliJCT)
+		guard, guardErr := client.GetGuardTopListWithCookie(requestCtx, roomID, sessdata, biliJCT)
 		s.mu.Lock()
-		if err != nil {
-			message := err.Error()
-			if s.onlineRankError != message {
-				s.onlineRankError = message
-				s.notifyLocked()
+		defer s.mu.Unlock()
+		changed := false
+		if rankErr != nil {
+			if s.onlineRankError != rankErr.Error() {
+				s.onlineRankError = rankErr.Error()
+				changed = true
 			}
-			s.mu.Unlock()
-			return
+		} else {
+			s.viewerOnline = rank.Online
+			s.viewerKnown = true
+			s.onlineRank = append(s.onlineRank[:0], rank.Members...)
+			if s.onlineRankError != "" {
+				s.onlineRankError = ""
+				changed = true
+			}
+			changed = true
 		}
-		s.viewerOnline = rank.Online
-		s.viewerKnown = true
-		s.onlineRank = append(s.onlineRank[:0], rank.Members...)
-		s.onlineRankError = ""
-		s.notifyLocked()
-		s.mu.Unlock()
+		if guardErr != nil {
+			if s.guardError != guardErr.Error() {
+				s.guardError = guardErr.Error()
+				changed = true
+			}
+		} else {
+			s.guardTotal = guard.Total
+			s.guardKnown = true
+			s.guardMembers = append(s.guardMembers[:0], guard.Members...)
+			if s.guardError != "" {
+				s.guardError = ""
+				changed = true
+			}
+			changed = true
+		}
+		if changed {
+			s.notifyLocked()
+		}
 	}
 	refresh()
 	ticker := time.NewTicker(onlineRankRefreshInterval)

@@ -26,6 +26,8 @@ import (
 )
 
 func main() {
+	stopFlag := flag.Bool("stop", false, "一键下播：向 B 站发送下播请求并结束直播")
+	statusFlag := flag.Bool("status", false, "查看当前直播间开播状态")
 	noColor := flag.Bool("no-danmaku-color", false, "禁用弹幕页面颜色")
 	flag.Parse()
 	tui.SetDanmakuNoColor(*noColor || os.Getenv("NO_DANMAKU_COLOR") != "" || os.Getenv("NO_COLOR") != "")
@@ -69,6 +71,93 @@ func main() {
 		diagnosticLog.Printf("获取房间号失败: %v", err)
 		fmt.Fprintf(os.Stderr, "获取房间号失败: %v\n", err)
 		return
+	}
+
+	// 命令行快捷下播与状态查看
+	isStopAction := *stopFlag
+	isStatusAction := *statusFlag
+	for _, arg := range os.Args[1:] {
+		if arg == "stop" || arg == "--stop" {
+			isStopAction = true
+		} else if arg == "status" || arg == "--status" {
+			isStatusAction = true
+		}
+	}
+
+	if isStatusAction {
+		snapshot, err := client.GetRoomSnapshot(ctx, roomID)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "获取房间状态失败: %v\n", err)
+			return
+		}
+		statusText := "未开播"
+		if snapshot.LiveStatus == 1 {
+			statusText = "开播中 🔴"
+		}
+		fmt.Printf("直播间号: %s\n房间标题: %s\n直播分区: %s\n当前状态: %s\n", roomID, snapshot.Title, snapshot.AreaName, statusText)
+		return
+	}
+
+	if isStopAction {
+		fmt.Printf("正在向 B 站请求结束房间 %s 的直播……\n", roomID)
+		stopCtx, cancelStop := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancelStop()
+		if err := client.StopLive(stopCtx, roomID, auth.AccessToken); err != nil {
+			diagnosticLog.Printf("命令行下播失败: %v", err)
+			fmt.Fprintf(os.Stderr, "下播失败: %v\n", err)
+			return
+		}
+		diagnosticLog.Printf("命令行下播成功 room=%s", roomID)
+		fmt.Printf("✅ 直播间 %s 已成功下播！\n", roomID)
+		return
+	}
+
+	// 启动 TUI 前检测直播间是否已处于开播状态（如意外强退或在其他端开播）
+	initialSnapshot, snapshotErr := client.GetRoomSnapshot(ctx, roomID)
+	if snapshotErr == nil && initialSnapshot.LiveStatus == 1 {
+		stopFunc := func() error {
+			stopCtx, cancelStop := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancelStop()
+			return client.StopLive(stopCtx, roomID, auth.AccessToken)
+		}
+		action, dialogErr := tui.RunAlreadyLiveDialog(ctx, roomID, initialSnapshot.Title, stopFunc)
+		if dialogErr != nil || action == tui.AlreadyLiveActionExit {
+			return
+		}
+		if action == tui.AlreadyLiveActionDanmaku {
+			// 直接进入弹幕互动与管理模式（接管现有直播间）
+			danmakuSession := tui.NewLiveDanmakuSession(ctx, client, roomID, auth.SESSDATA, auth.BiliJCT)
+			defer danmakuSession.Close()
+			areas, _ := client.GetLiveAreas(ctx, auth.AccessToken)
+			previewer := &livePreviewer{}
+			previewLive := func() error {
+				return previewer.Start(ctx, client, roomID, auth.SESSDATA, auth.BiliJCT)
+			}
+			var currentSettings api.LiveSettings
+			currentSettings.Title = initialSnapshot.Title
+			currentSettings.Description = initialSnapshot.Description
+			currentSettings.Tags = initialSnapshot.Tags
+			currentSettings.CoverPath = initialSnapshot.Cover
+			loadRoomSnapshot := func() (api.RoomSnapshot, error) {
+				return client.GetRoomSnapshot(ctx, roomID)
+			}
+			overviewOpts := tui.DanmakuOverviewOptions{
+				StartedAt:        time.Now(),
+				RoomID:           roomID,
+				Settings:         &currentSettings,
+				Areas:            areas,
+				RoomSnapshot:     &initialSnapshot,
+				LoadRoomSnapshot: loadRoomSnapshot,
+				PreviewLive:      previewLive,
+			}
+			_, _ = tui.RunDanmaku(ctx, danmakuSession, client, roomID, auth.SESSDATA, auth.BiliJCT, nil, overviewOpts)
+			// 用户在弹幕页选择下播并退出后，执行下播
+			fmt.Printf("正在结束 B 站直播……\n")
+			_ = stopFunc()
+			fmt.Printf("✅ 直播已安全结束。\n")
+			return
+		}
+		// 若用户选择“立即下播”或“重新开播”，stopFunc 已在弹窗中执行成功，继续向下进入常规开播流程
 	}
 
 	areas, areaErr := client.GetLiveAreas(ctx, auth.AccessToken)
@@ -234,8 +323,32 @@ func main() {
 		}
 		return liveStream.Health()
 	}
+	saveEdit := func(edited api.LiveSettings) (api.LiveSettings, error) {
+		updated, saveErr := saveLiveSettings(ctx, client, roomID, auth, settings, edited)
+		if saveErr != nil {
+			return api.LiveSettings{}, saveErr
+		}
+		if saveErr := config.SaveLiveSettings(updated); saveErr != nil {
+			diagnosticLog.Printf("保存下次开播默认值失败: %v", saveErr)
+		}
+		return updated, nil
+	}
+	overviewOpts := tui.DanmakuOverviewOptions{
+		StartedAt:        liveStartedAt,
+		RoomID:           roomID,
+		Settings:         &settings,
+		Areas:            areas,
+		RoomSnapshot:     roomSnapshot,
+		LoadRoomSnapshot: loadRoomSnapshot,
+		OnSnapshot: func(fresh api.RoomSnapshot) {
+			roomSnapshot = &fresh
+		},
+		HealthLoader: streamHealth,
+		SaveEdit:     saveEdit,
+		PreviewLive:  previewLive,
+	}
 	for {
-		navigation, err := tui.RunDanmaku(ctx, danmakuSession, client, roomID, auth.SESSDATA, auth.BiliJCT, streamHealth)
+		navigation, err := tui.RunDanmaku(ctx, danmakuSession, client, roomID, auth.SESSDATA, auth.BiliJCT, streamHealth, overviewOpts)
 		if err != nil {
 			diagnosticLog.Printf("弹幕界面异常: %v", err)
 			fmt.Fprintf(os.Stderr, "弹幕界面异常: %v\n", err)
@@ -245,16 +358,6 @@ func main() {
 			break
 		}
 
-		saveEdit := func(edited api.LiveSettings) (api.LiveSettings, error) {
-			updated, saveErr := saveLiveSettings(ctx, client, roomID, auth, settings, edited)
-			if saveErr != nil {
-				return api.LiveSettings{}, saveErr
-			}
-			if saveErr := config.SaveLiveSettings(updated); saveErr != nil {
-				diagnosticLog.Printf("保存下次开播默认值失败: %v", saveErr)
-			}
-			return updated, nil
-		}
 		action, err := tui.RunHome(ctx, liveStartedAt, roomID, &settings, areas, roomSnapshot, danmakuSession.Stats(), homeNotice, loadRoomSnapshot, func(fresh api.RoomSnapshot) {
 			roomSnapshot = &fresh
 		}, streamHealth, saveEdit, previewLive, danmakuSession.Stats)
@@ -303,7 +406,7 @@ func main() {
 
 func ensureRoomCanStart(snapshot api.RoomSnapshot) error {
 	if snapshot.LiveStatus == 1 {
-		return fmt.Errorf("检测到直播间已经开播，请先结束现有推流后再开始")
+		return fmt.Errorf("检测到直播间已经开播，请先下播后再开始（可使用 bili-live-tui --stop 一键下播）")
 	}
 	return nil
 }

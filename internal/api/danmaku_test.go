@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -205,7 +206,7 @@ func TestLiveSessionStatsObserveGift(t *testing.T) {
 
 func TestParseLikeAndUnknownDanmakuCommands(t *testing.T) {
 	like := makeDanmakuPacket(danmakuOperationCommand, danmakuProtocolPlain, []byte(`{"cmd":"LIKE_INFO_V3_CLICK","data":{"uid":7,"uname":"点赞用户","click_count":3}}`))
-	unknown := makeDanmakuPacket(danmakuOperationCommand, danmakuProtocolPlain, []byte(`{"cmd":"ROOM_CHANGE","data":{"title":"新标题"}}`))
+	unknown := makeDanmakuPacket(danmakuOperationCommand, danmakuProtocolPlain, []byte(`{"cmd":"UNKNOWN_FUTURE_EVENT","data":{"foo":"bar"}}`))
 	events, err := parseDanmakuPackets(append(like, unknown...))
 	if err != nil {
 		t.Fatal(err)
@@ -215,8 +216,82 @@ func TestParseLikeAndUnknownDanmakuCommands(t *testing.T) {
 	}
 }
 
+func TestParseSuperChatAndGuardEvents(t *testing.T) {
+	sc := makeDanmakuPacket(danmakuOperationCommand, danmakuProtocolPlain, []byte(`{
+		"cmd": "SUPER_CHAT_MESSAGE",
+		"data": {
+			"id": 101,
+			"uid": "10001",
+			"price": 50,
+			"message": "主播今天状态真好",
+			"time": 120,
+			"user_info": {
+				"uname": "醒目粉丝",
+				"user_level": 25,
+				"guard_level": 3
+			},
+			"medal_info": {
+				"medal_name": "草莓",
+				"medal_level": 20
+			}
+		}
+	}`))
+	guard := makeDanmakuPacket(danmakuOperationCommand, danmakuProtocolPlain, []byte(`{
+		"cmd": "GUARD_BUY",
+		"data": {
+			"uid": 10002,
+			"username": "大航海老板",
+			"guard_level": 3,
+			"num": 1,
+			"price": 198000,
+			"gift_name": "舰长"
+		}
+	}`))
+	warning := makeDanmakuPacket(danmakuOperationCommand, danmakuProtocolPlain, []byte(`{
+		"cmd": "WARNING",
+		"msg": "请注意直播规范"
+	}`))
+	roomChange := makeDanmakuPacket(danmakuOperationCommand, danmakuProtocolPlain, []byte(`{
+		"cmd": "ROOM_CHANGE",
+		"data": {
+			"title": "新游戏实况",
+			"area_name": "单机游戏"
+		}
+	}`))
+	events, err := parseDanmakuPackets(append(append(append(sc, guard...), warning...), roomChange...))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 4 {
+		t.Fatalf("events count = %d, want 4", len(events))
+	}
+	// SC
+	if events[0].Kind != DanmakuEventSuperChat || events[0].Message.Username != "醒目粉丝" || events[0].Message.Price != 50 || events[0].Message.Text != "主播今天状态真好" {
+		t.Fatalf("super chat event = %#v", events[0])
+	}
+	// Guard
+	if events[1].Kind != DanmakuEventGuard || events[1].Message.Username != "大航海老板" || events[1].Message.Price != 198 || !strings.Contains(events[1].Message.Text, "舰长") {
+		t.Fatalf("guard event = %#v", events[1])
+	}
+	// Warning
+	if events[2].Kind != DanmakuEventWarning || events[2].Message.Text != "请注意直播规范" {
+		t.Fatalf("warning event = %#v", events[2])
+	}
+	// Room Change
+	if events[3].Kind != DanmakuEventSystem || !strings.Contains(events[3].Message.Text, "新游戏实况") {
+		t.Fatalf("room change event = %#v", events[3])
+	}
+
+	var stats LiveSessionStats
+	stats.Observe(events[0])
+	stats.Observe(events[1])
+	if stats.SuperChatCount != 1 || stats.SuperChatPrice != 50 || stats.GuardCount != 1 {
+		t.Fatalf("stats = %#v", stats)
+	}
+}
+
 func TestParseGiftAcceptsStringNumbers(t *testing.T) {
-	packet := makeDanmakuPacket(danmakuOperationCommand, danmakuProtocolPlain, []byte(`{"cmd":"SEND_GIFT","data":{"uid":"7","uname":"送礼用户","giftName":"小花花","num":"2","total_coin":"100","coin_type":"gold","combo_num":"2"}}`))
+	packet := makeDanmakuPacket(danmakuOperationCommand, danmakuProtocolPlain, []byte(`{"cmd":"SEND_GIFT","data":{"uid":"7","uname":"送礼用户","giftName":"小花花","num":"2","total_coin":"1000","coin_type":"gold","combo_num":"5"}}`))
 	events, err := parseDanmakuPackets(packet)
 	if err != nil {
 		t.Fatal(err)
@@ -225,8 +300,11 @@ func TestParseGiftAcceptsStringNumbers(t *testing.T) {
 		t.Fatalf("gift events = %#v", events)
 	}
 	message := events[0].Message
-	if message.GiftCount != 2 || message.UserID != "7" {
+	if message.GiftCount != 2 || message.UserID != "7" || message.GiftCoinType != "gold" || message.GiftCombo != 5 {
 		t.Fatalf("gift message = %#v", message)
+	}
+	if !strings.Contains(message.Text, "10电池") || !strings.Contains(message.Text, "连击x5") {
+		t.Fatalf("gift message text = %q, want battery and combo details", message.Text)
 	}
 }
 
@@ -401,8 +479,37 @@ func TestSendDanmakuRejectsSoftBlockedMessage(t *testing.T) {
 	client.BaseURL = "http://test.invalid"
 	seedDanmakuSendIdentity(client, "sess")
 	err := client.SendDanmaku(context.Background(), "123", "sess", "csrf", "违禁词弹幕")
-	if err == nil || !strings.Contains(err.Error(), "拦截") || !strings.Contains(err.Error(), "违禁词") {
-		t.Fatalf("SendDanmaku() error = %v, want soft-block error", err)
+	if err == nil || !errors.Is(err, ErrDanmakuProhibited) || !IsDanmakuProhibited(err) {
+		t.Fatalf("SendDanmaku() error = %v, want ErrDanmakuProhibited", err)
+	}
+}
+
+func TestSendDanmakuRejectsProhibitedCode(t *testing.T) {
+	testCases := []struct {
+		name string
+		json string
+	}{
+		{name: "code 10030", json: `{"code":10030,"message":"含有违规内容","msg":""}`},
+		{name: "code 10012", json: `{"code":10012,"message":"包含屏蔽词","msg":""}`},
+		{name: "blacklist keyword", json: `{"code":-400,"message":"msg in blacklist","msg":""}`},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			transport := roundTripFunc(func(*http.Request) (*http.Response, error) {
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Body:       io.NopCloser(strings.NewReader(tc.json)),
+					Header:     make(http.Header),
+				}, nil
+			})
+			client := NewClient(&http.Client{Transport: transport})
+			client.BaseURL = "http://test.invalid"
+			seedDanmakuSendIdentity(client, "sess")
+			err := client.SendDanmaku(context.Background(), "123", "sess", "csrf", "违禁词弹幕")
+			if err == nil || !errors.Is(err, ErrDanmakuProhibited) || !IsDanmakuProhibited(err) {
+				t.Fatalf("SendDanmaku() error = %v, want ErrDanmakuProhibited", err)
+			}
+		})
 	}
 }
 

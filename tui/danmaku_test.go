@@ -224,20 +224,29 @@ func TestDanmakuStatusPreservesConnectedNode(t *testing.T) {
 }
 
 func TestRenderOnlineRank(t *testing.T) {
+	applyTheme()
 	view := tview.NewTextView().SetDynamicColors(true).SetRegions(true)
 	registry := newDanmakuUserRegionRegistry()
-	renderOnlineRank(view, liveDanmakuSnapshot{
+	snapshot := liveDanmakuSnapshot{
 		viewerOnline: 23,
 		viewerKnown:  true,
 		onlineRank: []api.OnlineRankMember{
 			{UserID: "42", Username: "用户[甲]", Rank: 1, Score: 11, GuardLevel: 3},
 		},
-	}, registry)
-	if view.GetTitle() != " 在线 23 人 " {
+		guardTotal: 5,
+		guardKnown: true,
+		guardMembers: []api.GuardMember{
+			{UserID: "100", Username: "船员[乙]", Rank: 1, GuardLevel: 1, IsAlive: true},
+		},
+	}
+
+	// 1. Audience Tab
+	renderOnlineRank(view, snapshot, rankTabAudience, registry)
+	if view.GetTitle() != " 房间观众 · 在线 23 人 " {
 		t.Fatalf("online rank title = %q", view.GetTitle())
 	}
 	text := view.GetText(true)
-	if !strings.Contains(text, "高能榜") || !strings.Contains(text, "用户[甲]") || !strings.Contains(text, "舰长") || !strings.Contains(text, "11") {
+	if !strings.Contains(text, "观众") || !strings.Contains(text, "用户[甲]") || !strings.Contains(text, "舰长") || !strings.Contains(text, "11") {
 		t.Fatalf("online rank text = %q", text)
 	}
 	if len(registry.order) != 1 {
@@ -247,8 +256,19 @@ func TestRenderOnlineRank(t *testing.T) {
 	if !ok || message.UserID != "42" || message.Username != "用户[甲]" || message.GuardLevel != 3 {
 		t.Fatalf("online rank region lookup = (%#v, %v)", message, ok)
 	}
-	if raw := view.GetText(false); !strings.Contains(raw, "::b]") || !strings.Contains(raw, "[\"") {
-		t.Fatalf("online rank clickable username markup = %q", raw)
+
+	// 2. Guard Tab
+	renderOnlineRank(view, snapshot, rankTabGuard, registry)
+	if view.GetTitle() != " 大航海 · 共 5 人 " {
+		t.Fatalf("guard tab title = %q", view.GetTitle())
+	}
+	guardText := view.GetText(true)
+	if !strings.Contains(guardText, "大航海") || !strings.Contains(guardText, "船员[乙]") || !strings.Contains(guardText, "总督") || !strings.Contains(guardText, "在线") {
+		t.Fatalf("guard tab text = %q", guardText)
+	}
+	guardMsg, ok := registry.Lookup(registry.order[0])
+	if !ok || guardMsg.UserID != "100" || guardMsg.Username != "船员[乙]" || guardMsg.GuardLevel != 1 {
+		t.Fatalf("guard region lookup = (%#v, %v)", guardMsg, ok)
 	}
 }
 
@@ -567,6 +587,436 @@ func TestDanmakuUserCardButtonsTouchBottomBorder(t *testing.T) {
 	}
 }
 
+func TestAppendDanmakuEventSpecialKinds(t *testing.T) {
+	applyTheme()
+	chat := tview.NewTextView().SetDynamicColors(true).SetRegions(true)
+	registry := newDanmakuUserRegionRegistry()
+
+	// 1. SuperChat
+	scEvent := api.DanmakuEvent{
+		Kind: api.DanmakuEventSuperChat,
+		Message: api.DanmakuMessage{
+			Username: "醒目用户",
+			UserID:   "101",
+			Text:     "支持主播！",
+			Price:    30,
+		},
+	}
+	appendDanmakuEvent(chat, scEvent, false, registry)
+	scText := chat.GetText(true)
+	if !strings.Contains(scText, "醒目留言 ¥30") || !strings.Contains(scText, "醒目用户：支持主播！") {
+		t.Fatalf("super chat render error: %q", scText)
+	}
+
+	// 2. Guard
+	guardEvent := api.DanmakuEvent{
+		Kind: api.DanmakuEventGuard,
+		Message: api.DanmakuMessage{
+			Username: "舰长老板",
+			UserID:   "102",
+			Text:     "登船成为 舰长 ×1个月",
+			Price:    198,
+		},
+	}
+	appendDanmakuEvent(chat, guardEvent, true, registry)
+	guardText := chat.GetText(true)
+	if !strings.Contains(guardText, "[大航海]") || !strings.Contains(guardText, "登船成为 舰长") {
+		t.Fatalf("guard render error: %q", guardText)
+	}
+
+	// 3. Warning
+	warningEvent := api.DanmakuEvent{
+		Kind: api.DanmakuEventWarning,
+		Message: api.DanmakuMessage{
+			Username: "超管警告",
+			Text:     "涉嫌违规，请立即整改",
+		},
+	}
+	appendDanmakuEvent(chat, warningEvent, true, registry)
+	warningText := chat.GetText(true)
+	if !strings.Contains(warningText, "[超管警告]") || !strings.Contains(warningText, "涉嫌违规，请立即整改") {
+		t.Fatalf("warning render error: %q", warningText)
+	}
+
+	// 4. Gift with details
+	giftEvent := api.DanmakuEvent{
+		Kind: api.DanmakuEventGift,
+		Message: api.DanmakuMessage{
+			Username: "送礼大佬",
+			UserID:   "103",
+			Text:     "投喂 摩天大楼 ×1 (10000电池 · 连击x5)",
+		},
+	}
+	appendDanmakuEvent(chat, giftEvent, true, registry)
+	giftText := chat.GetText(true)
+	if !strings.Contains(giftText, "[礼物]") || !strings.Contains(giftText, "10000电池 · 连击x5") {
+		t.Fatalf("gift render error: %q", giftText)
+	}
+}
+
+func TestGiftPanelRenderAndAggregation(t *testing.T) {
+	applyTheme()
+	var selected api.DanmakuMessage
+	closed := false
+	panel := newGiftPanel(func(msg api.DanmakuMessage) {
+		selected = msg
+	}, func() {
+		closed = true
+	})
+
+	now := time.Now()
+	snapshot := liveDanmakuSnapshot{
+		stats: api.LiveSessionStats{
+			GiftGoldCoin:   25000, // 25 CNY
+			SuperChatPrice: 50,    // 50 CNY
+			GuardCount:     1,
+		},
+		gifts: []api.DanmakuEvent{
+			{
+				Kind: api.DanmakuEventGift,
+				Message: api.DanmakuMessage{
+					UserID:     "201",
+					Username:   "大哥A",
+					Text:       "投喂 摩天大楼 ×1 (25000电池)",
+					Price:      25,
+					GuardLevel: 0,
+					Timestamp:  now,
+				},
+			},
+			{
+				Kind: api.DanmakuEventSuperChat,
+				Message: api.DanmakuMessage{
+					UserID:     "202",
+					Username:   "醒目B",
+					Text:       "醒目留言 ¥50: 加油！",
+					Price:      50,
+					GuardLevel: 3,
+					Timestamp:  now,
+				},
+			},
+		},
+	}
+
+	panel.Update(snapshot)
+
+	// Summary check
+	summaryText := panel.summaryView.GetText(true)
+	if !strings.Contains(summaryText, "总收益折合") || !strings.Contains(summaryText, "¥75.00") {
+		t.Fatalf("gift panel summary = %q, want total ¥75.00", summaryText)
+	}
+
+	// Tab Log check (倒序：最新收到的醒目B在第一行)
+	if panel.table.GetRowCount() != 3 { // 1 header + 2 rows
+		t.Fatalf("gift table row count = %d, want 3", panel.table.GetRowCount())
+	}
+	nameCell := panel.table.GetCell(1, 1).Text
+	if !strings.Contains(nameCell, "醒目B") {
+		t.Fatalf("row 1 name cell = %q, want 醒目B", nameCell)
+	}
+
+	// Select row 1 in Tab Log
+	panel.table.Select(1, 0)
+	if handler := panel.table.InputHandler(); handler != nil {
+		handler(tcell.NewEventKey(tcell.KeyEnter, 0, tcell.ModNone), nil)
+		if selected.Username != "醒目B" || selected.UserID != "202" {
+			t.Fatalf("selected user = %#v", selected)
+		}
+	}
+
+	// Switch to Leaderboard Tab
+	panel.currentTab = giftTabRank
+	panel.render()
+	if panel.table.GetRowCount() != 3 {
+		t.Fatalf("rank table row count = %d, want 3", panel.table.GetRowCount())
+	}
+	firstRankUser := panel.table.GetCell(1, 1).Text
+	if !strings.Contains(firstRankUser, "醒目B") { // 50 CNY > 25 CNY
+		t.Fatalf("expected 醒目B to be rank 1, got %q", firstRankUser)
+	}
+
+	// Tab key cycling test
+	inputCap := panel.table.GetInputCapture()
+	if inputCap == nil {
+		t.Fatalf("expected table input capture handler")
+	}
+	// From Rank tab, Tab should switch to Log tab
+	inputCap(tcell.NewEventKey(tcell.KeyTab, 0, tcell.ModNone))
+	if panel.currentTab != giftTabLog {
+		t.Fatalf("expected currentTab to be giftTabLog after Tab, got %v", panel.currentTab)
+	}
+	// From Log tab, Tab should switch back to Rank tab
+	inputCap(tcell.NewEventKey(tcell.KeyTab, 0, tcell.ModNone))
+	if panel.currentTab != giftTabRank {
+		t.Fatalf("expected currentTab to be giftTabRank after second Tab, got %v", panel.currentTab)
+	}
+
+	// Close button test
+	closedByBtn := false
+	panel.onClose = func() { closedByBtn = true }
+	if handler := panel.closeBtn.InputHandler(); handler != nil {
+		handler(tcell.NewEventKey(tcell.KeyEnter, 0, tcell.ModNone), nil)
+		if !closedByBtn {
+			t.Fatalf("expected closeBtn to invoke onClose")
+		}
+	}
+
+	// 'q' key close test
+	closedByQ := false
+	panel.onClose = func() { closedByQ = true }
+	inputCap(tcell.NewEventKey(tcell.KeyRune, 'q', tcell.ModNone))
+	if !closedByQ {
+		t.Fatalf("expected 'q' to invoke onClose")
+	}
+
+	// Update no-op test: identical snapshot should not modify row count or rebuild table
+	panel.currentTab = giftTabLog
+	panel.render()
+	rowCountBefore := panel.table.GetRowCount()
+	panel.Update(snapshot)
+	if panel.table.GetRowCount() != rowCountBefore {
+		t.Fatalf("Update with identical snapshot altered row count: %d -> %d", rowCountBefore, panel.table.GetRowCount())
+	}
+
+	// Empty state test: 0 gifts
+	emptyPanel := newGiftPanel(nil, nil)
+	emptyPanel.Update(liveDanmakuSnapshot{})
+	if emptyPanel.table.GetRowCount() < 2 {
+		t.Fatalf("empty table should have at least 2 rows (header + empty placeholder), got %d", emptyPanel.table.GetRowCount())
+	}
+	placeholderText := emptyPanel.table.GetCell(1, 1).Text
+	if !strings.Contains(placeholderText, "暂未收到打赏记录") {
+		t.Fatalf("empty table placeholder = %q, want 暂未收到打赏记录", placeholderText)
+	}
+	emptyPanel.currentTab = giftTabRank
+	emptyPanel.render()
+	rankPlaceholder := emptyPanel.table.GetCell(1, 1).Text
+	if !strings.Contains(rankPlaceholder, "暂无送礼观众") {
+		t.Fatalf("empty rank table placeholder = %q, want 暂无送礼观众", rankPlaceholder)
+	}
+
+	// Esc test
+	closed = false
+	panel.onClose = func() { closed = true }
+	inputCap(tcell.NewEventKey(tcell.KeyEscape, 0, tcell.ModNone))
+	if !closed {
+		t.Fatalf("expected onClose to be called on Esc")
+	}
+}
+
+func TestDanmakuHelpPanel(t *testing.T) {
+	applyTheme()
+	closed := false
+	panel, content, closeBtn := newDanmakuHelpPanel(func() {
+		closed = true
+	})
+
+	if panel == nil || content == nil || closeBtn == nil {
+		t.Fatalf("newDanmakuHelpPanel returned nil components")
+	}
+
+	title := panel.GetTitle()
+	if !strings.Contains(title, "快捷键与操作指南") {
+		t.Fatalf("help panel title = %q, want 快捷键与操作指南", title)
+	}
+
+	text := content.GetText(true)
+	requiredPhrases := []string{
+		"【 弹幕互动 】",
+		"Enter",
+		"Ctrl+U",
+		"Ctrl+L",
+		"【 看板与工具 】",
+		"Ctrl+R / Alt+R",
+		"Ctrl+G / Alt+G",
+		"Ctrl+M / Alt+M",
+		"【 系统与退出 】",
+		"Ctrl+? / Alt+?",
+		"Esc",
+		"Ctrl+C",
+	}
+	for _, phrase := range requiredPhrases {
+		if !strings.Contains(text, phrase) {
+			t.Fatalf("help text missing required phrase %q, full text:\n%s", phrase, text)
+		}
+	}
+
+	// Test close button
+	if closeBtn.GetLabel() == "" {
+		t.Fatalf("close button has empty label")
+	}
+	// Simulate button select
+	if handler := closeBtn.InputHandler(); handler != nil {
+		handler(tcell.NewEventKey(tcell.KeyEnter, 0, tcell.ModNone), nil)
+		if !closed {
+			t.Fatalf("expected close button to invoke onClose callback")
+		}
+	}
+}
+
+func TestGiftPanelLeaderboardMultiUser(t *testing.T) {
+	applyTheme()
+	panel := newGiftPanel(nil, nil)
+
+	now := time.Now()
+	snapshot := liveDanmakuSnapshot{
+		stats: api.LiveSessionStats{
+			GiftGoldCoin:   10000, // 10 CNY
+			SuperChatPrice: 100,   // 100 CNY
+			SuperChatCount: 2,
+			GuardCount:     1,
+		},
+		gifts: []api.DanmakuEvent{
+			{
+				Kind: api.DanmakuEventGift,
+				Message: api.DanmakuMessage{
+					UserID:        "100",
+					Username:      "普通观众",
+					GiftName:      "辣条",
+					GiftCount:     10,
+					GiftCoinType:  "gold",
+					GiftTotalCoin: 10000,
+					GiftCombo:     2,
+					Timestamp:     now.Add(-3 * time.Minute),
+				},
+			},
+			{
+				Kind: api.DanmakuEventSuperChat,
+				Message: api.DanmakuMessage{
+					UserID:     "101",
+					Username:   "富哥",
+					Text:       "开播大吉！",
+					Price:      100,
+					GuardLevel: 0,
+					Timestamp:  now.Add(-2 * time.Minute),
+				},
+			},
+			{
+				Kind: api.DanmakuEventGuard,
+				Message: api.DanmakuMessage{
+					UserID:     "102",
+					Username:   "大哥船长",
+					GiftName:   "舰长",
+					GiftCount:  1,
+					Price:      198,
+					GuardLevel: 3,
+					Timestamp:  now.Add(-1 * time.Minute),
+				},
+			},
+		},
+	}
+
+	panel.Update(snapshot)
+
+	// Check summary: total = 10 (gift) + 100 (SC) + 198 (Guard) = 308.00
+	summary := panel.summaryView.GetText(true)
+	if !strings.Contains(summary, "¥308.00") {
+		t.Fatalf("expected total ¥308.00 in summary, got: %s", summary)
+	}
+
+	// Check rank: 大哥船长(198) > 富哥(100) > 普通观众(10)
+	panel.currentTab = giftTabRank
+	panel.render()
+
+	if panel.table.GetRowCount() != 4 { // 1 header + 3 users
+		t.Fatalf("rank row count = %d, want 4", panel.table.GetRowCount())
+	}
+	rank1Name := panel.table.GetCell(1, 1).Text
+	if !strings.Contains(rank1Name, "大哥船长") {
+		t.Errorf("rank 1 want 大哥船长, got %q", rank1Name)
+	}
+	rank1Val := panel.table.GetCell(1, 3).Text
+	if !strings.Contains(rank1Val, "¥198.00") {
+		t.Errorf("rank 1 value want ¥198.00, got %q", rank1Val)
+	}
+
+	rank2Name := panel.table.GetCell(2, 1).Text
+	if !strings.Contains(rank2Name, "富哥") {
+		t.Errorf("rank 2 want 富哥, got %q", rank2Name)
+	}
+	rank3Name := panel.table.GetCell(3, 1).Text
+	if !strings.Contains(rank3Name, "普通观众") {
+		t.Errorf("rank 3 want 普通观众, got %q", rank3Name)
+	}
+}
+
 type assertError string
 
 func (err assertError) Error() string { return string(err) }
+
+func TestMatchesHelpShortcut(t *testing.T) {
+	cases := []struct {
+		name     string
+		event    *tcell.EventKey
+		expected bool
+	}{
+		{
+			name:     "nil event",
+			event:    nil,
+			expected: false,
+		},
+		{
+			name:     "plain question mark without modifier (typing in input box)",
+			event:    tcell.NewEventKey(tcell.KeyRune, '?', tcell.ModNone),
+			expected: false,
+		},
+		{
+			name:     "plain slash without modifier",
+			event:    tcell.NewEventKey(tcell.KeyRune, '/', tcell.ModNone),
+			expected: false,
+		},
+		{
+			name:     "plain full-width question mark (Chinese)",
+			event:    tcell.NewEventKey(tcell.KeyRune, '？', tcell.ModNone),
+			expected: false,
+		},
+		{
+			name:     "Ctrl+?",
+			event:    tcell.NewEventKey(tcell.KeyRune, '?', tcell.ModCtrl),
+			expected: true,
+		},
+		{
+			name:     "Ctrl+/",
+			event:    tcell.NewEventKey(tcell.KeyRune, '/', tcell.ModCtrl),
+			expected: true,
+		},
+		{
+			name:     "Alt+?",
+			event:    tcell.NewEventKey(tcell.KeyRune, '?', tcell.ModAlt),
+			expected: true,
+		},
+		{
+			name:     "Alt+/",
+			event:    tcell.NewEventKey(tcell.KeyRune, '/', tcell.ModAlt),
+			expected: true,
+		},
+		{
+			name:     "KeyCtrlUnderscore (traditional terminal Ctrl+/)",
+			event:    tcell.NewEventKey(tcell.KeyCtrlUnderscore, 0, tcell.ModNone),
+			expected: true,
+		},
+		{
+			name:     "KeyF1",
+			event:    tcell.NewEventKey(tcell.KeyF1, 0, tcell.ModNone),
+			expected: true,
+		},
+		{
+			name:     "Unrelated plain rune",
+			event:    tcell.NewEventKey(tcell.KeyRune, 'r', tcell.ModNone),
+			expected: false,
+		},
+		{
+			name:     "Unrelated Ctrl key",
+			event:    tcell.NewEventKey(tcell.KeyCtrlR, 0, tcell.ModCtrl),
+			expected: false,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := matchesHelpShortcut(tc.event)
+			if got != tc.expected {
+				t.Fatalf("matchesHelpShortcut() = %v, want %v", got, tc.expected)
+			}
+		})
+	}
+}

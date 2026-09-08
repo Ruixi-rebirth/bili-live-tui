@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -460,10 +461,13 @@ func (c *Client) getDanmakuInfoAt(ctx context.Context, path, roomID, sessdata, b
 type DanmakuEventKind string
 
 const (
-	DanmakuEventMessage DanmakuEventKind = "message"
-	DanmakuEventGift    DanmakuEventKind = "gift"
-	DanmakuEventSystem  DanmakuEventKind = "system"
-	DanmakuEventOnline  DanmakuEventKind = "online"
+	DanmakuEventMessage   DanmakuEventKind = "message"
+	DanmakuEventGift      DanmakuEventKind = "gift"
+	DanmakuEventSuperChat DanmakuEventKind = "super_chat"
+	DanmakuEventGuard     DanmakuEventKind = "guard"
+	DanmakuEventWarning   DanmakuEventKind = "warning"
+	DanmakuEventSystem    DanmakuEventKind = "system"
+	DanmakuEventOnline    DanmakuEventKind = "online"
 	// DanmakuEventConnected 在服务器接受操作码 7 的认证后产生。
 	// TCP/WebSocket 连接成功本身不能证明直播间订阅已经可用。
 	DanmakuEventConnected DanmakuEventKind = "connected"
@@ -472,19 +476,25 @@ const (
 // DanmakuMessage 是与 B 站嵌套数组格式无关的标准化弹幕项。
 // Timestamp 在解析数据包时设置。
 type DanmakuMessage struct {
-	Username    string
-	UserID      string
-	Text        string
-	MedalName   string
-	MedalLevel  int
-	GuardLevel  int
-	UserLevel   int
-	WealthLevel int
-	IsAdmin     bool
-	IsMystery   bool
-	GiftName    string
-	GiftCount   int
-	Timestamp   time.Time
+	Username      string
+	UserID        string
+	Text          string
+	MedalName     string
+	MedalLevel    int
+	GuardLevel    int
+	UserLevel     int
+	WealthLevel   int
+	IsAdmin       bool
+	IsMystery     bool
+	GiftName      string
+	GiftCount     int
+	GiftAction    string
+	GiftCoinType  string // "gold"（付费电池/金瓜子）或 "silver"（免费银瓜子）
+	GiftTotalCoin int64  // 瓜子总价值（1000 金瓜子 = 10 电池 = 1 元）
+	GiftCombo     int    // 连击数
+	Price         int    // SC 醒目留言金额（元）或舰长折合人民币金额（元）
+	Duration      int    // SC 醒目留言悬挂保留时长（秒）
+	Timestamp     time.Time
 }
 
 // DanmakuEvent 由 DanmakuStream.Events 提供。
@@ -500,6 +510,10 @@ type DanmakuEvent struct {
 type LiveSessionStats struct {
 	GiftEvents      int64
 	GiftCount       int64
+	GiftGoldCoin    int64
+	SuperChatCount  int64
+	SuperChatPrice  int64
+	GuardCount      int64
 	Popularity      int64
 	PopularityKnown bool
 }
@@ -516,6 +530,18 @@ func (stats *LiveSessionStats) Observe(event DanmakuEvent) {
 			count = 1
 		}
 		stats.GiftCount += int64(count)
+		if event.Message.GiftCoinType == "gold" {
+			stats.GiftGoldCoin += event.Message.GiftTotalCoin
+		}
+	case DanmakuEventSuperChat:
+		stats.SuperChatCount++
+		stats.SuperChatPrice += int64(event.Message.Price)
+	case DanmakuEventGuard:
+		count := event.Message.GiftCount
+		if count <= 0 {
+			count = 1
+		}
+		stats.GuardCount += int64(count)
 	}
 }
 
@@ -1032,6 +1058,7 @@ func parseDanmakuCommand(body []byte) (DanmakuEvent, bool, error) {
 		Cmd  string          `json:"cmd"`
 		Info json.RawMessage `json:"info"`
 		Data json.RawMessage `json:"data"`
+		Msg  string          `json:"msg"`
 	}
 	if err := json.Unmarshal(body, &envelope); err != nil {
 		return DanmakuEvent{}, false, fmt.Errorf("解析弹幕消息失败: %w", err)
@@ -1042,6 +1069,22 @@ func parseDanmakuCommand(body []byte) (DanmakuEvent, bool, error) {
 		return parseDanmuMessage(envelope.Info, command)
 	case "SEND_GIFT":
 		return parseGift(envelope.Data, command)
+	case "SUPER_CHAT_MESSAGE", "SUPER_CHAT_MESSAGE_JPN":
+		return parseSuperChat(envelope.Data, command)
+	case "GUARD_BUY":
+		return parseGuardBuy(envelope.Data, command)
+	case "USER_TOAST_MSG":
+		return parseUserToastMsg(envelope.Data, command)
+	case "WARNING", "CUT_OFF":
+		return parseWarning(envelope.Data, envelope.Msg, command)
+	case "ROOM_CHANGE":
+		return parseRoomChange(envelope.Data, command)
+	case "ROOM_BLOCK_MSG":
+		return parseRoomBlockMsg(envelope.Data, command)
+	case "LIVE":
+		return parseLiveState(envelope.Data, true, command)
+	case "PREPARING":
+		return parseLiveState(envelope.Data, false, command)
 	case "WELCOME", "WELCOME_GUARD", "INTERACT_WORD":
 		return parseSystemInteraction(envelope.Data, command)
 	case "LIKE_INFO_V3_CLICK":
@@ -1095,6 +1138,10 @@ func parseGift(raw json.RawMessage, command string) (DanmakuEvent, bool, error) 
 		Uname       string        `json:"uname"`
 		GiftName    string        `json:"giftName"`
 		Num         flexibleInt64 `json:"num"`
+		Action      string        `json:"action"`
+		CoinType    string        `json:"coin_type"`
+		TotalCoin   flexibleInt64 `json:"total_coin"`
+		ComboNum    flexibleInt64 `json:"combo_num"`
 		WealthLevel flexibleInt64 `json:"wealth_level"`
 		MedalInfo   struct {
 			MedalName  string        `json:"medal_name"`
@@ -1112,19 +1159,293 @@ func parseGift(raw json.RawMessage, command string) (DanmakuEvent, bool, error) 
 	if count <= 0 {
 		count = 1
 	}
-	text := fmt.Sprintf("送出 %s ×%d", data.GiftName, count)
+	action := strings.TrimSpace(data.Action)
+	if action == "" {
+		action = "送出"
+	}
+	var details []string
+	if data.CoinType == "gold" && data.TotalCoin > 0 {
+		battery := int64(data.TotalCoin) / 100
+		if battery > 0 {
+			details = append(details, fmt.Sprintf("%d电池", battery))
+		}
+	}
+	combo := int(data.ComboNum)
+	if combo > 1 {
+		details = append(details, fmt.Sprintf("连击x%d", combo))
+	}
+	detailText := ""
+	if len(details) > 0 {
+		detailText = fmt.Sprintf(" (%s)", strings.Join(details, " · "))
+	}
+	text := fmt.Sprintf("%s %s ×%d%s", action, data.GiftName, count, detailText)
 	return DanmakuEvent{Kind: DanmakuEventGift, Command: command, Message: DanmakuMessage{
-		Username:    data.Uname,
-		UserID:      string(data.UID),
-		Text:        text,
-		GiftName:    data.GiftName,
-		GiftCount:   count,
-		MedalName:   strings.TrimSpace(data.MedalInfo.MedalName),
-		MedalLevel:  int(data.MedalInfo.MedalLevel),
-		GuardLevel:  int(data.MedalInfo.GuardLevel),
-		WealthLevel: int(data.WealthLevel),
-		Timestamp:   time.Now(),
+		Username:      data.Uname,
+		UserID:        string(data.UID),
+		Text:          text,
+		GiftName:      data.GiftName,
+		GiftCount:     count,
+		GiftAction:    action,
+		GiftCoinType:  data.CoinType,
+		GiftTotalCoin: int64(data.TotalCoin),
+		GiftCombo:     combo,
+		MedalName:     strings.TrimSpace(data.MedalInfo.MedalName),
+		MedalLevel:    int(data.MedalInfo.MedalLevel),
+		GuardLevel:    int(data.MedalInfo.GuardLevel),
+		WealthLevel:   int(data.WealthLevel),
+		Timestamp:     time.Now(),
 	}}, true, nil
+}
+
+func parseSuperChat(raw json.RawMessage, command string) (DanmakuEvent, bool, error) {
+	var data struct {
+		ID        flexibleInt64 `json:"id"`
+		UID       flexibleID    `json:"uid"`
+		Price     flexibleInt64 `json:"price"`
+		Message   string        `json:"message"`
+		Time      flexibleInt64 `json:"time"`
+		StartTime flexibleInt64 `json:"start_time"`
+		UserInfo  struct {
+			Uname      string        `json:"uname"`
+			Face       string        `json:"face"`
+			UserLevel  flexibleInt64 `json:"user_level"`
+			GuardLevel flexibleInt64 `json:"guard_level"`
+		} `json:"user_info"`
+		MedalInfo struct {
+			MedalName  string        `json:"medal_name"`
+			MedalLevel flexibleInt64 `json:"medal_level"`
+			GuardLevel flexibleInt64 `json:"guard_level"`
+		} `json:"medal_info"`
+	}
+	if err := json.Unmarshal(raw, &data); err != nil {
+		return DanmakuEvent{}, false, fmt.Errorf("解析醒目留言失败: %w", err)
+	}
+	uname := strings.TrimSpace(data.UserInfo.Uname)
+	if uname == "" {
+		uname = "匿名用户"
+	}
+	guardLevel := int(data.UserInfo.GuardLevel)
+	if guardLevel == 0 {
+		guardLevel = int(data.MedalInfo.GuardLevel)
+	}
+	return DanmakuEvent{
+		Kind:    DanmakuEventSuperChat,
+		Command: command,
+		Message: DanmakuMessage{
+			Username:   uname,
+			UserID:     string(data.UID),
+			Text:       strings.TrimSpace(data.Message),
+			Price:      int(data.Price),
+			Duration:   int(data.Time),
+			MedalName:  strings.TrimSpace(data.MedalInfo.MedalName),
+			MedalLevel: int(data.MedalInfo.MedalLevel),
+			GuardLevel: guardLevel,
+			UserLevel:  int(data.UserInfo.UserLevel),
+			Timestamp:  time.Now(),
+		},
+	}, true, nil
+}
+
+func guardLevelName(level int) string {
+	switch level {
+	case 1:
+		return "总督"
+	case 2:
+		return "提督"
+	case 3:
+		return "舰长"
+	default:
+		return "大航海"
+	}
+}
+
+func parseGuardBuy(raw json.RawMessage, command string) (DanmakuEvent, bool, error) {
+	var data struct {
+		UID        flexibleID    `json:"uid"`
+		Username   string        `json:"username"`
+		GuardLevel flexibleInt64 `json:"guard_level"`
+		Num        flexibleInt64 `json:"num"`
+		Price      flexibleInt64 `json:"price"`
+		GiftName   string        `json:"gift_name"`
+	}
+	if err := json.Unmarshal(raw, &data); err != nil {
+		return DanmakuEvent{}, false, fmt.Errorf("解析上舰消息失败: %w", err)
+	}
+	username := strings.TrimSpace(data.Username)
+	if username == "" {
+		username = "匿名用户"
+	}
+	guardName := guardLevelName(int(data.GuardLevel))
+	if data.GiftName != "" {
+		guardName = data.GiftName
+	}
+	count := int(data.Num)
+	if count <= 0 {
+		count = 1
+	}
+	text := fmt.Sprintf("登船成为 %s ×%d个月", guardName, count)
+	return DanmakuEvent{
+		Kind:    DanmakuEventGuard,
+		Command: command,
+		Message: DanmakuMessage{
+			Username:   username,
+			UserID:     string(data.UID),
+			Text:       text,
+			GuardLevel: int(data.GuardLevel),
+			GiftName:   guardName,
+			GiftCount:  count,
+			Price:      int(data.Price / 1000),
+			Timestamp:  time.Now(),
+		},
+	}, true, nil
+}
+
+func parseUserToastMsg(raw json.RawMessage, command string) (DanmakuEvent, bool, error) {
+	var data struct {
+		UID        flexibleID    `json:"uid"`
+		Username   string        `json:"username"`
+		GuardLevel flexibleInt64 `json:"guard_level"`
+		RoleName   string        `json:"role_name"`
+		Num        flexibleInt64 `json:"num"`
+		Unit       string        `json:"unit"`
+		Price      flexibleInt64 `json:"price"`
+		ToastMsg   string        `json:"toast_msg"`
+	}
+	if err := json.Unmarshal(raw, &data); err != nil {
+		return DanmakuEvent{}, false, fmt.Errorf("解析上舰广播失败: %w", err)
+	}
+	username := strings.TrimSpace(data.Username)
+	if username == "" {
+		username = "匿名用户"
+	}
+	guardName := guardLevelName(int(data.GuardLevel))
+	if data.RoleName != "" {
+		guardName = data.RoleName
+	}
+	count := int(data.Num)
+	if count <= 0 {
+		count = 1
+	}
+	unit := strings.TrimSpace(data.Unit)
+	if unit == "" {
+		unit = "月"
+	}
+	text := fmt.Sprintf("登船成为 %s ×%d%s", guardName, count, unit)
+	return DanmakuEvent{
+		Kind:    DanmakuEventGuard,
+		Command: command,
+		Message: DanmakuMessage{
+			Username:   username,
+			UserID:     string(data.UID),
+			Text:       text,
+			GuardLevel: int(data.GuardLevel),
+			GiftName:   guardName,
+			GiftCount:  count,
+			Price:      int(data.Price / 1000),
+			Timestamp:  time.Now(),
+		},
+	}, true, nil
+}
+
+func parseWarning(raw json.RawMessage, envelopeMsg, command string) (DanmakuEvent, bool, error) {
+	msg := strings.TrimSpace(envelopeMsg)
+	if len(raw) > 0 {
+		var data struct {
+			Msg string `json:"msg"`
+		}
+		if json.Unmarshal(raw, &data) == nil && strings.TrimSpace(data.Msg) != "" {
+			msg = strings.TrimSpace(data.Msg)
+		}
+	}
+	if msg == "" {
+		if command == "CUT_OFF" {
+			msg = "直播已被超管切断/关闭"
+		} else {
+			msg = "收到超管直播警告，请注意直播合规"
+		}
+	}
+	return DanmakuEvent{
+		Kind:    DanmakuEventWarning,
+		Command: command,
+		Message: DanmakuMessage{
+			Username:  "超管警告",
+			Text:      msg,
+			Timestamp: time.Now(),
+		},
+	}, true, nil
+}
+
+func parseRoomChange(raw json.RawMessage, command string) (DanmakuEvent, bool, error) {
+	var data struct {
+		Title    string `json:"title"`
+		AreaName string `json:"area_name"`
+	}
+	if err := json.Unmarshal(raw, &data); err != nil {
+		return DanmakuEvent{}, false, fmt.Errorf("解析房间变更消息失败: %w", err)
+	}
+	text := "房间信息已更新"
+	if data.Title != "" && data.AreaName != "" {
+		text = fmt.Sprintf("房间变更：【%s】 分区：%s", data.Title, data.AreaName)
+	} else if data.Title != "" {
+		text = fmt.Sprintf("房间标题更新：【%s】", data.Title)
+	} else if data.AreaName != "" {
+		text = fmt.Sprintf("房间分区更新：%s", data.AreaName)
+	}
+	return DanmakuEvent{
+		Kind:    DanmakuEventSystem,
+		Command: command,
+		Message: DanmakuMessage{
+			Username:  "系统通知",
+			Text:      text,
+			Timestamp: time.Now(),
+		},
+	}, true, nil
+}
+
+func parseRoomBlockMsg(raw json.RawMessage, command string) (DanmakuEvent, bool, error) {
+	var data struct {
+		UID      flexibleID    `json:"uid"`
+		Uname    string        `json:"uname"`
+		Operator flexibleInt64 `json:"operator"`
+	}
+	if err := json.Unmarshal(raw, &data); err != nil {
+		return DanmakuEvent{}, false, fmt.Errorf("解析禁言广播失败: %w", err)
+	}
+	uname := strings.TrimSpace(data.Uname)
+	if uname == "" {
+		uname = string(data.UID)
+	}
+	op := "管理员"
+	if data.Operator == 1 {
+		op = "主播"
+	}
+	text := fmt.Sprintf("%s 已被%s禁言", uname, op)
+	return DanmakuEvent{
+		Kind:    DanmakuEventSystem,
+		Command: command,
+		Message: DanmakuMessage{
+			Username:  "禁言通知",
+			Text:      text,
+			UserID:    string(data.UID),
+			Timestamp: time.Now(),
+		},
+	}, true, nil
+}
+
+func parseLiveState(raw json.RawMessage, isLive bool, command string) (DanmakuEvent, bool, error) {
+	text := "直播已开始"
+	if !isLive {
+		text = "直播已结束"
+	}
+	return DanmakuEvent{
+		Kind:    DanmakuEventSystem,
+		Command: command,
+		Message: DanmakuMessage{
+			Username:  "系统通知",
+			Text:      text,
+			Timestamp: time.Now(),
+		},
+	}, true, nil
 }
 
 func applyStructuredDanmakuUser(raw json.RawMessage, message *DanmakuMessage) {
@@ -1322,6 +1643,9 @@ func (c *Client) SendDanmakuWithLimit(ctx context.Context, roomID, sessdata, bil
 	if err := c.postFormWithHeaders(ctx, path, params, &result, headers); err != nil {
 		return err
 	}
+	if isProhibitedDanmakuResponse(result.Code, result.Message, result.Msg) {
+		return ErrDanmakuProhibited
+	}
 	if result.Code != 0 {
 		message := strings.TrimSpace(result.Message)
 		if message == "" {
@@ -1332,10 +1656,55 @@ func (c *Client) SendDanmakuWithLimit(ctx context.Context, roomID, sessdata, bil
 		}
 		return fmt.Errorf("B 站拒绝发送（错误码 %d）：%s", result.Code, message)
 	}
-	// 直播弹幕接口会把部分违禁词拦截伪装成 code=0，但同时将
-	// message/msg 置为 "f"。这种弹幕不会广播，不能按发送成功处理。
-	if strings.EqualFold(strings.TrimSpace(result.Message), "f") || strings.EqualFold(strings.TrimSpace(result.Msg), "f") {
-		return fmt.Errorf("B 站已拦截该弹幕，内容可能包含违禁词")
-	}
 	return nil
+}
+
+// ErrDanmakuShielded 表示弹幕被 B 站拦截，可能包含屏蔽词。
+var ErrDanmakuShielded = errors.New("弹幕未发送成功，可能包含屏蔽词。")
+
+// ErrDanmakuProhibited 为兼容旧调用的别名。
+var ErrDanmakuProhibited = ErrDanmakuShielded
+
+// IsDanmakuProhibited 判断错误是否由屏蔽词或敏感违规拦截引起。
+func IsDanmakuProhibited(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, ErrDanmakuShielded) || errors.Is(err, ErrDanmakuProhibited) {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "违禁词") ||
+		strings.Contains(msg, "敏感") ||
+		strings.Contains(msg, "违规") ||
+		strings.Contains(msg, "blacklist") ||
+		strings.Contains(msg, "10030") ||
+		strings.Contains(msg, "10012") ||
+		strings.Contains(msg, "屏蔽词")
+}
+
+func isProhibitedDanmakuResponse(code int, message, msg string) bool {
+	cleanMessage := strings.TrimSpace(message)
+	cleanMsg := strings.TrimSpace(msg)
+	if strings.EqualFold(cleanMessage, "f") || strings.EqualFold(cleanMsg, "f") {
+		return true
+	}
+	combined := strings.ToLower(cleanMessage + " " + cleanMsg)
+	for _, keyword := range []string{
+		"filter",
+		"blacklist",
+		"违禁",
+		"敏感",
+		"违规",
+		"屏蔽词",
+		"关键词",
+		"不合规",
+		"非法字符",
+		"包含限制内容",
+	} {
+		if strings.Contains(combined, keyword) {
+			return true
+		}
+	}
+	return code == 10030 || code == 10012
 }
