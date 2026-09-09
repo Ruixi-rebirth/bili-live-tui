@@ -218,6 +218,7 @@ type Runtime struct {
 	outputReconnectAt time.Time
 	lastBytes         float64
 	lastSample        time.Time
+	zeroBitrateSince  time.Time
 }
 
 type healthSample struct {
@@ -473,8 +474,19 @@ func (r *Runtime) reconnectControlClient(previous *goobs.Client) error {
 
 func (r *Runtime) applyHealthSample(sample healthSample, now time.Time) {
 	r.mu.Lock()
-	if elapsed := now.Sub(r.lastSample).Seconds(); elapsed > 0 && !r.lastSample.IsZero() && sample.bytes >= r.lastBytes {
-		r.health.BitrateKbps = (sample.bytes - r.lastBytes) * 8 / elapsed / 1000
+	elapsed := now.Sub(r.lastSample).Seconds()
+	if elapsed > 0 && !r.lastSample.IsZero() {
+		if sample.bytes > r.lastBytes {
+			r.health.BitrateKbps = (sample.bytes - r.lastBytes) * 8 / elapsed / 1000
+			r.zeroBitrateSince = time.Time{}
+		} else if sample.bytes == r.lastBytes {
+			r.health.BitrateKbps = 0
+			if sample.active && sample.duration > 3*time.Second {
+				if r.zeroBitrateSince.IsZero() {
+					r.zeroBitrateSince = now
+				}
+			}
+		}
 	}
 	r.lastBytes = sample.bytes
 	r.lastSample = now
@@ -492,7 +504,11 @@ func (r *Runtime) applyHealthSample(sample healthSample, now time.Time) {
 	timedOut := false
 	if sample.active {
 		r.outputReconnectAt = time.Time{}
-		r.health.LastError = ""
+		if !r.zeroBitrateSince.IsZero() && now.Sub(r.zeroBitrateSince) >= 4*time.Second {
+			r.health.LastError = "推流无上传数据，网络可能已中断"
+		} else {
+			r.health.LastError = ""
+		}
 	} else if sample.reconnecting {
 		// OBS 在 RTMP 被另一路推流抢占时可能进入自动重连：此时
 		// OutputActive=false，但输出任务并未结束。保留运行时，才能让

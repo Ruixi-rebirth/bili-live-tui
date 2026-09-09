@@ -144,6 +144,13 @@ func TestResolveDanmakuIdentityAndWebSocketHeaders(t *testing.T) {
 	if requests != 2 {
 		t.Fatalf("identity request count = %d, want 2 with cache hit", requests)
 	}
+	client.danmakuIdentityAt = time.Now().Add(-danmakuIdentityCacheTTL)
+	if _, err := client.resolveDanmakuIdentity(context.Background(), "sess", "jct"); err != nil {
+		t.Fatalf("refreshing expired identity error = %v", err)
+	}
+	if requests != 4 {
+		t.Fatalf("identity request count = %d, want expired cache refresh", requests)
+	}
 
 	headers := danmakuWebSocketHeaders("123", "sess", "jct", identity)
 	if got := headers.Get("Cookie"); got != "SESSDATA=sess; bili_jct=jct; DedeUserID=12345; buvid3=device-id" {
@@ -386,6 +393,12 @@ func TestSendDanmaku(t *testing.T) {
 		if r.Header.Get("Cookie") != "SESSDATA=sess; bili_jct=csrf; DedeUserID=12345; buvid3=device-id" {
 			t.Fatalf("cookie = %q", r.Header.Get("Cookie"))
 		}
+		if got := r.Header.Get("User-Agent"); got != biliBrowserUserAgent {
+			t.Fatalf("user-agent = %q", got)
+		}
+		if got := r.Header.Get("Accept"); got != "application/json" {
+			t.Fatalf("accept = %q", got)
+		}
 		_ = r.ParseForm()
 		if got := r.PostForm.Get("msg"); got != "测试弹幕" {
 			t.Fatalf("msg = %q", got)
@@ -519,6 +532,27 @@ func seedDanmakuSendIdentity(client *Client, sessdata string) {
 	client.danmakuIdentityAt = time.Now()
 }
 
+func TestSendDanmakuDoesNotRetryAmbiguousConnectionFailure(t *testing.T) {
+	attempts := 0
+	transport := roundTripFunc(func(*http.Request) (*http.Response, error) {
+		attempts++
+		return nil, errors.New("read: connection reset by peer")
+	})
+	client := NewClient(&http.Client{Transport: transport})
+	client.BaseURL = "http://test.invalid"
+	seedDanmakuSendIdentity(client, "sess")
+	err := client.SendDanmaku(context.Background(), "123", "sess", "csrf", "重连测试弹幕")
+	if err == nil {
+		t.Fatal("SendDanmaku should report an ambiguous connection failure")
+	}
+	if !IsDanmakuDeliveryUnknown(err) {
+		t.Fatalf("SendDanmaku error = %v, want unknown delivery result", err)
+	}
+	if attempts != 1 {
+		t.Fatalf("non-idempotent danmaku request was attempted %d times", attempts)
+	}
+}
+
 func makeDanmakuPacket(operation uint32, version uint16, body []byte) []byte {
 	packet := make([]byte, danmakuHeaderLength+len(body))
 	binary.BigEndian.PutUint32(packet[0:4], uint32(len(packet)))
@@ -567,6 +601,37 @@ func TestParseGiftIncludesUserDetails(t *testing.T) {
 	message := event.Message
 	if message.MedalName != "草莓" || message.MedalLevel != 9 || message.GuardLevel != 2 || message.WealthLevel != 7 {
 		t.Fatalf("gift user details = %#v", message)
+	}
+}
+
+func TestParseComboSend(t *testing.T) {
+	raw := json.RawMessage(`{
+		"uid": 10008,
+		"uname": "连击老板",
+		"gift_name": "小心心",
+		"gift_num": 1,
+		"batch_combo_num": 66,
+		"batch_combo_id": "batch_999",
+		"combo_total_coin": 6600,
+		"action": "投喂",
+		"medal_info": {"medal_name": "真爱", "medal_level": 12, "guard_level": 3}
+	}`)
+	event, ok, err := parseComboSend(raw, "COMBO_SEND")
+	if err != nil || !ok {
+		t.Fatalf("parseComboSend error = %v, ok = %v", err, ok)
+	}
+	if event.Kind != DanmakuEventGift {
+		t.Fatalf("event kind = %v, want DanmakuEventGift", event.Kind)
+	}
+	msg := event.Message
+	if msg.Username != "连击老板" || msg.UserID != "10008" || msg.GiftName != "小心心" {
+		t.Fatalf("combo message user info mismatch = %#v", msg)
+	}
+	if msg.GiftCombo != 66 || msg.BatchComboID != "batch_999" || msg.GiftTotalCoin != 6600 {
+		t.Fatalf("combo count or batch mismatch = %#v", msg)
+	}
+	if !strings.Contains(msg.Text, "连击x66") {
+		t.Fatalf("combo text = %q, want containing 连击x66", msg.Text)
 	}
 }
 

@@ -286,18 +286,25 @@ func enableClearTextAreaShortcut(field *tview.TextArea) {
 }
 
 func styleLabel(item tview.FormItem, focused bool) {
+	labelStyle := func(style tcell.Style) tcell.Style {
+		style = style.
+			Foreground(labelColorForFocus(focused)).
+			Bold(focused).
+			Reverse(noColor && focused)
+		return style
+	}
 	var style tcell.Style
 	switch field := item.(type) {
 	case *tview.InputField:
 		style = field.GetLabelStyle()
-		field.SetLabelStyle(style.Foreground(labelColorForFocus(focused)).Bold(focused))
+		field.SetLabelStyle(labelStyle(style))
 	case *tview.TextArea:
 		style = field.GetLabelStyle()
-		field.SetLabelStyle(style.Foreground(labelColorForFocus(focused)).Bold(focused))
+		field.SetLabelStyle(labelStyle(style))
 	case *tview.DropDown:
-		field.SetLabelStyle(tcell.StyleDefault.Foreground(labelColorForFocus(focused)).Bold(focused))
+		field.SetLabelStyle(labelStyle(tcell.StyleDefault))
 	case *autoOpenDropDown:
-		field.SetLabelStyle(tcell.StyleDefault.Foreground(labelColorForFocus(focused)).Bold(focused))
+		field.SetLabelStyle(labelStyle(tcell.StyleDefault))
 	}
 }
 
@@ -502,10 +509,7 @@ func newStyledDropDown(label string, options []string) *autoOpenDropDown {
 		SetOptions(options, nil).
 		SetCurrentOption(0).
 		SetFieldTextColor(autocompleteTextColor).
-		SetListStyles(
-			tcell.StyleDefault.Foreground(autocompleteTextColor).Background(autocompleteColor),
-			tcell.StyleDefault.Foreground(autocompleteSelectedTextColor).Background(autocompleteSelectedColor),
-		)
+		SetListStyles(choiceStyle(false), choiceStyle(true))
 	return &autoOpenDropDown{DropDown: dropDown}
 }
 
@@ -643,8 +647,8 @@ func newAreaField(areas []api.LiveArea) *areaField {
 		SetAcceptanceFunc(tview.InputFieldMaxLength(80)).
 		SetAutocompleteStyles(
 			autocompleteColor,
-			tcell.StyleDefault.Foreground(autocompleteTextColor).Background(autocompleteColor),
-			tcell.StyleDefault.Foreground(autocompleteSelectedTextColor).Background(autocompleteSelectedColor),
+			choiceStyle(false),
+			choiceStyle(true),
 		).
 		SetAutocompleteUseTags(false).
 		SetAutocompleteFunc(func(query string) []string {

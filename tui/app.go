@@ -259,9 +259,9 @@ func RunLiveSettings(ctx context.Context, areas []api.LiveArea, initial *api.Liv
 		}
 		startSubmit(settings)
 	}
-	startButton := newActionButton("▶ 开始直播", startLive).
-		SetStyle(tcell.StyleDefault.Background(accentColor).Foreground(buttonTextColor).Bold(true))
-	cancelButton := newActionButton("✕ 取消开播", cancelLive)
+	startButton := newActionButton("开始直播", startLive).
+		SetStyle(actionButtonStyle(false).Bold(true))
+	cancelButton := newActionButton("取消开播", cancelLive)
 	buttons := centeredActionBar([]*tview.Button{startButton, cancelButton})
 	buttons.SetBackgroundColor(tview.Styles.PrimitiveBackgroundColor)
 
@@ -378,6 +378,7 @@ func focusLastLiveFormItem(app *tview.Application, form *tview.Form, state *live
 type liveEditPage struct {
 	root      tview.Primitive
 	form      *tview.Form
+	buttons   []*tview.Button
 	setStatus func(string, bool)
 	cancel    func()
 }
@@ -395,7 +396,7 @@ func newLiveEditPage(app *tview.Application, initial api.LiveSettings, areas []a
 		}
 		status.SetText("[" + color.String() + "]" + tview.Escape(message) + "[-]")
 	}
-	form.AddButton("保存修改", func() {
+	save := func() {
 		settings := state.settings()
 		if err := settings.Validate(); err != nil {
 			setStatus(err.Error(), true)
@@ -408,34 +409,87 @@ func newLiveEditPage(app *tview.Application, initial api.LiveSettings, areas []a
 		if onSave != nil {
 			onSave(settings)
 		}
-	})
-	form.GetButton(form.GetButtonCount() - 1).SetLabel("  保存修改  ").
-		SetStyle(tcell.StyleDefault.Background(accentColor).Foreground(buttonTextColor).Bold(true)).
-		SetActivatedStyle(tcell.StyleDefault.Background(accentActiveColor).Foreground(buttonActiveTextColor).Bold(true))
-	form.AddButton("取消修改", func() {
+	}
+	cancel := func() {
 		if onCancel != nil {
 			onCancel()
 		}
-	})
-	equalizeButtonWidths(form)
-	form.SetCancelFunc(func() {
-		if onCancel != nil {
-			onCancel()
-		}
-	})
+	}
+	saveButton := newActionButton("保存修改", save).
+		SetStyle(actionButtonStyle(false).Bold(true))
+	cancelButton := newActionButton("取消修改", cancel)
+	buttons := centeredActionBar([]*tview.Button{saveButton, cancelButton})
+	buttons.SetBackgroundColor(tview.Styles.PrimitiveBackgroundColor)
+	form.SetCancelFunc(cancel)
 
 	body := tview.NewFlex()
 	body.SetDirection(tview.FlexRow)
 	body.SetBackgroundColor(tview.Styles.PrimitiveBackgroundColor)
 	body.AddItem(form, 0, 1, true)
+	body.AddItem(nil, 1, 0, false)
+	body.AddItem(buttons, 1, 0, true)
 	body.AddItem(status, 2, 0, false)
+	body.SetInputCapture(liveEditInputCapture(app, form, state, saveButton, cancelButton, cancel))
 	configureResponsiveLiveForm(app, form, state.description)
 	root := wideFormPage(
 		pageHeader("修改直播资料", "保存后会立即同步到直播间"),
 		body,
 		pageFooter("Tab 切换　Enter 确认　Ctrl+U 清空当前项　Esc/Ctrl+C 放弃修改　支持鼠标点击"),
 	)
-	return &liveEditPage{root: root, form: form, setStatus: setStatus, cancel: onCancel}
+	return &liveEditPage{
+		root:      root,
+		form:      form,
+		buttons:   []*tview.Button{saveButton, cancelButton},
+		setStatus: setStatus,
+		cancel:    onCancel,
+	}
+}
+
+func liveEditInputCapture(app *tview.Application, form *tview.Form, state *liveFormState, saveButton, cancelButton *tview.Button, cancel func()) func(*tcell.EventKey) *tcell.EventKey {
+	focusForm := func(index int) {
+		form.SetFocus(index)
+		app.SetFocus(form)
+	}
+	return func(event *tcell.EventKey) *tcell.EventKey {
+		if event.Key() == tcell.KeyEscape || event.Key() == tcell.KeyCtrlC {
+			if cancel != nil {
+				cancel()
+			}
+			return nil
+		}
+		if saveButton.HasFocus() {
+			switch event.Key() {
+			case tcell.KeyLeft, tcell.KeyRight, tcell.KeyTab:
+				app.SetFocus(cancelButton)
+				return nil
+			case tcell.KeyUp, tcell.KeyBacktab:
+				focusForm(form.GetFormItemCount() - 1)
+				return nil
+			}
+		}
+		if cancelButton.HasFocus() {
+			switch event.Key() {
+			case tcell.KeyLeft, tcell.KeyRight, tcell.KeyBacktab:
+				app.SetFocus(saveButton)
+				return nil
+			case tcell.KeyTab:
+				focusForm(0)
+				return nil
+			case tcell.KeyUp:
+				focusForm(form.GetFormItemCount() - 1)
+				return nil
+			}
+		}
+		if state.title.HasFocus() && event.Key() == tcell.KeyBacktab {
+			app.SetFocus(cancelButton)
+			return nil
+		}
+		if state.orientation.HasFocus() && event.Key() == tcell.KeyTab {
+			app.SetFocus(saveButton)
+			return nil
+		}
+		return event
+	}
 }
 
 // configureResponsiveLiveForm 在较矮终端中压缩简介和字段间距。

@@ -129,16 +129,102 @@ func applyTheme() {
 		InverseTextColor:            tcell.NewHexColor(0xfff9fb),
 		ContrastSecondaryTextColor:  tcell.NewHexColor(0x987585),
 	}
+	accentColor = tcell.NewHexColor(0xe98eaa)
+	accentActiveColor = tcell.NewHexColor(0xc6537d)
+	buttonTextColor = tcell.NewHexColor(0x5c3948)
+	buttonActiveTextColor = tcell.NewHexColor(0xfff9fb)
+	mutedColor = tcell.NewHexColor(0xa27f90)
+	errorColor = tcell.NewHexColor(0xd65e78)
+	panelColor = tcell.NewHexColor(0xfff7fa)
+	formFieldColor = tcell.NewHexColor(0xe9e4ea)
+	formFieldFocusColor = tcell.NewHexColor(0xd8cbd9)
+	formSelectColor = tcell.NewHexColor(0xf3eef3)
+	autocompleteColor = tcell.NewHexColor(0xffeef4)
+	autocompleteSelectedColor = tcell.NewHexColor(0xffc7d9)
+	autocompleteTextColor = tcell.NewHexColor(0x684c5a)
+	autocompleteSelectedTextColor = tcell.NewHexColor(0x4f3544)
 }
 
 var noColor bool
-var danmakuNoColor bool
 
-// SetDanmakuNoColor 设置弹幕页面是否关闭主题颜色。
-func SetDanmakuNoColor(disabled bool) { danmakuNoColor = disabled }
+// SetNoColor 设置整个界面是否使用终端默认颜色。
+func SetNoColor(disabled bool) { noColor = disabled }
 
-// SetNoColor 设置弹幕页面是否关闭主题颜色（保留旧名称兼容）。
-func SetNoColor(disabled bool) { SetDanmakuNoColor(disabled) }
+func actionButtonStyle(active bool) tcell.Style {
+	if noColor {
+		style := tcell.StyleDefault
+		if active {
+			style = style.Reverse(true).Bold(true)
+		}
+		return style
+	}
+	if active {
+		return tcell.StyleDefault.Background(accentActiveColor).Foreground(buttonActiveTextColor).Bold(true)
+	}
+	return tcell.StyleDefault.Background(accentColor).Foreground(buttonTextColor)
+}
+
+func selectedItemStyle() tcell.Style {
+	if noColor {
+		return tcell.StyleDefault.Reverse(true).Bold(true)
+	}
+	return tcell.StyleDefault.Background(accentActiveColor).Foreground(buttonActiveTextColor).Bold(true)
+}
+
+func inactiveSelectedItemStyle() tcell.Style {
+	if noColor {
+		return tcell.StyleDefault.
+			Foreground(tcell.ColorDefault).
+			Background(tcell.ColorDefault).
+			Dim(true)
+	}
+	return selectedItemStyle()
+}
+
+func choiceStyle(selected bool) tcell.Style {
+	if noColor {
+		if selected {
+			return tcell.StyleDefault.Reverse(true).Bold(true)
+		}
+		return tcell.StyleDefault
+	}
+	if selected {
+		return tcell.StyleDefault.Foreground(autocompleteSelectedTextColor).Background(autocompleteSelectedColor)
+	}
+	return tcell.StyleDefault.Foreground(autocompleteTextColor).Background(autocompleteColor)
+}
+
+func themeColor(color tcell.Color) tcell.Color {
+	if noColor {
+		return tcell.ColorDefault
+	}
+	return color
+}
+
+func setFocusBorder(box *tview.Box, focused bool) {
+	if !focused {
+		box.SetBorderColor(tview.Styles.BorderColor)
+		box.SetBorderAttributes(tcell.AttrNone)
+		return
+	}
+	if noColor {
+		box.SetBorderColor(tcell.ColorDefault)
+		box.SetBorderAttributes(tcell.AttrNone)
+		return
+	}
+	box.SetBorderColor(accentActiveColor)
+	box.SetBorderAttributes(tcell.AttrBold)
+}
+
+func configureTableFocusStyle(table *tview.Table) {
+	if !noColor {
+		table.SetSelectedStyle(selectedItemStyle())
+		return
+	}
+	table.SetSelectedStyle(inactiveSelectedItemStyle())
+	table.SetFocusFunc(func() { table.SetSelectedStyle(selectedItemStyle()) })
+	table.SetBlurFunc(func() { table.SetSelectedStyle(inactiveSelectedItemStyle()) })
+}
 
 var (
 	accentColor                   = tcell.NewHexColor(0xe98eaa)
@@ -239,13 +325,8 @@ func styleForm(form *tview.Form, title string) *tview.Form {
 	form.SetLabelColor(tview.Styles.SecondaryTextColor)
 	form.SetFieldBackgroundColor(formFieldColor)
 	form.SetFieldTextColor(tview.Styles.PrimaryTextColor)
-	form.SetButtonStyle(tcell.StyleDefault.
-		Background(accentColor).
-		Foreground(buttonTextColor))
-	form.SetButtonActivatedStyle(tcell.StyleDefault.
-		Background(accentActiveColor).
-		Foreground(buttonActiveTextColor).
-		Bold(true))
+	form.SetButtonStyle(actionButtonStyle(false))
+	form.SetButtonActivatedStyle(actionButtonStyle(true))
 	return form
 }
 
@@ -257,13 +338,8 @@ func styleModal(modal *tview.Modal) *tview.Modal {
 	return modal.
 		SetBackgroundColor(panelColor).
 		SetTextColor(tview.Styles.PrimaryTextColor).
-		SetButtonStyle(tcell.StyleDefault.
-			Background(accentColor).
-			Foreground(buttonTextColor)).
-		SetButtonActivatedStyle(tcell.StyleDefault.
-			Background(accentActiveColor).
-			Foreground(buttonActiveTextColor).
-			Bold(true))
+		SetButtonStyle(actionButtonStyle(false)).
+		SetButtonActivatedStyle(actionButtonStyle(true))
 }
 
 func equalizeButtonWidths(form *tview.Form) {

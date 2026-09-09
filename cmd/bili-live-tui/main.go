@@ -28,9 +28,10 @@ import (
 func main() {
 	stopFlag := flag.Bool("stop", false, "一键下播：向 B 站发送下播请求并结束直播")
 	statusFlag := flag.Bool("status", false, "查看当前直播间开播状态")
-	noColor := flag.Bool("no-danmaku-color", false, "禁用弹幕页面颜色")
+	noColor := flag.Bool("no-color", false, "禁用整个界面的自定义颜色")
 	flag.Parse()
-	tui.SetDanmakuNoColor(*noColor || os.Getenv("NO_DANMAKU_COLOR") != "" || os.Getenv("NO_COLOR") != "")
+	allNoColor := *noColor || os.Getenv("NO_COLOR") != ""
+	tui.SetNoColor(allNoColor)
 	diagnosticLog, _ := diagnostics.Open()
 	if diagnosticLog != nil {
 		defer diagnosticLog.Close()
@@ -383,8 +384,8 @@ func main() {
 		if detail == "" {
 			detail = "未返回详细原因"
 		}
-		diagnosticLog.Printf("本地推流意外停止，触发自动下播: %s", detail)
-		fmt.Fprintf(os.Stderr, "本地推流已意外停止（%s），正在自动结束 B 站直播\n", detail)
+		diagnosticLog.Printf("本地推流意外停止: %s", detail)
+		fmt.Fprintf(os.Stderr, "本地推流已意外断开（%s）。\nB 站直播间仍在断流保护期内，可重新运行本程序继续推流，若需正式下播请执行 bili-live-tui --stop\n", detail)
 	}
 
 	if liveStream != nil {
@@ -394,13 +395,15 @@ func main() {
 		}
 	}
 
-	stopCtx, cancelStop := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancelStop()
-	if err := client.StopLive(stopCtx, roomID, auth.AccessToken); err != nil {
-		diagnosticLog.Printf("调用下播接口失败: %v", err)
-		fmt.Fprintf(os.Stderr, "调用下播接口失败: %v\n", err)
-	} else {
-		diagnosticLog.Printf("直播已安全结束 room=%s", roomID)
+	if !outputEndedUnexpectedly.Load() {
+		stopCtx, cancelStop := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancelStop()
+		if err := client.StopLive(stopCtx, roomID, auth.AccessToken); err != nil {
+			diagnosticLog.Printf("调用下播接口失败: %v", err)
+			fmt.Fprintf(os.Stderr, "调用下播接口失败: %v\n", err)
+		} else {
+			diagnosticLog.Printf("直播已安全结束 room=%s", roomID)
+		}
 	}
 }
 

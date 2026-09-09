@@ -85,3 +85,41 @@ func TestFloatingOverlayOpaqueBackgroundCoversUnderlyingText(t *testing.T) {
 		}
 	}
 }
+
+func TestNoColorFocusStylesRemainVisible(t *testing.T) {
+	previousNoColor := noColor
+	defer func() {
+		noColor = previousNoColor
+		applyTheme()
+	}()
+
+	noColor = true
+	applyTheme()
+
+	foreground, background, attributes := actionButtonStyle(true).Decompose()
+	if foreground != tcell.ColorDefault || background != tcell.ColorDefault {
+		t.Fatalf("active no-color button uses custom colors: foreground=%v background=%v", foreground, background)
+	}
+	if attributes&tcell.AttrReverse == 0 || attributes&tcell.AttrBold == 0 {
+		t.Fatalf("active no-color button attributes = %v, want reverse and bold", attributes)
+	}
+	_, _, choiceAttributes := choiceStyle(true).Decompose()
+	if choiceAttributes&tcell.AttrReverse == 0 {
+		t.Fatalf("selected no-color choice attributes = %v, want reverse", choiceAttributes)
+	}
+	_, _, inactiveAttributes := inactiveSelectedItemStyle().Decompose()
+	if inactiveAttributes&tcell.AttrReverse != 0 || inactiveAttributes&tcell.AttrDim == 0 {
+		t.Fatalf("inactive no-color table selection attributes = %v, want dim without reverse", inactiveAttributes)
+	}
+
+	box := tview.NewBox().SetBorder(true)
+	setFocusBorder(box, true)
+	borderAttributes := box.GetBorderAttributes()
+	if borderAttributes != tcell.AttrNone {
+		t.Fatalf("focused no-color border attributes = %v, want a normal border", borderAttributes)
+	}
+	setFocusBorder(box, false)
+	if borderAttributes = box.GetBorderAttributes(); borderAttributes != tcell.AttrNone {
+		t.Fatalf("blurred no-color border attributes = %v, want none", borderAttributes)
+	}
+}

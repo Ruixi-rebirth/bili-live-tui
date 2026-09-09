@@ -229,9 +229,28 @@ func TestLiveEditPageSavesWithoutStartingAnotherApplication(t *testing.T) {
 		saved = settings
 	}, nil)
 
-	page.form.GetButton(0).InputHandler()(tcell.NewEventKey(tcell.KeyEnter, 0, tcell.ModNone), func(tview.Primitive) {})
+	if page.form.GetButtonCount() != 0 {
+		t.Fatal("live edit action buttons must be outside the form border")
+	}
+	page.buttons[0].InputHandler()(tcell.NewEventKey(tcell.KeyEnter, 0, tcell.ModNone), func(tview.Primitive) {})
 	if saved != initial {
 		t.Fatalf("saved settings = %#v, want %#v", saved, initial)
+	}
+}
+
+func TestLiveEditButtonsSupportArrowNavigation(t *testing.T) {
+	app := tview.NewApplication()
+	form, state := newLiveFormWithSettings(nil, &api.LiveSettings{}, "修改直播资料")
+	saveButton := newActionButton("保存修改", nil)
+	cancelButton := newActionButton("取消修改", nil)
+	handler := liveEditInputCapture(app, form, state, saveButton, cancelButton, nil)
+
+	app.SetFocus(saveButton)
+	if event := handler(tcell.NewEventKey(tcell.KeyRight, 0, tcell.ModNone)); event != nil || app.GetFocus() != cancelButton {
+		t.Fatalf("right arrow did not focus cancel button: event=%v focus=%v", event, app.GetFocus())
+	}
+	if event := handler(tcell.NewEventKey(tcell.KeyLeft, 0, tcell.ModNone)); event != nil || app.GetFocus() != saveButton {
+		t.Fatalf("left arrow did not focus save button: event=%v focus=%v", event, app.GetFocus())
 	}
 }
 
@@ -447,6 +466,35 @@ func TestFocusedLabelStyle(t *testing.T) {
 	focusedColor, _, focusedAttrs = field.GetLabelStyle().Decompose()
 	if focusedColor != accentActiveColor || focusedAttrs&tcell.AttrBold == 0 {
 		t.Fatalf("focused label style = (%v, %v), want accent color with bold", focusedColor, focusedAttrs)
+	}
+}
+
+func TestNoColorFocusedLabelUsesReverseStyle(t *testing.T) {
+	previousNoColor := noColor
+	defer func() {
+		noColor = previousNoColor
+		applyTheme()
+	}()
+	noColor = true
+	applyTheme()
+
+	field := tview.NewInputField().SetLabel("直播标题")
+	item := focusedLabelInput(field)
+	field.Focus(func(tview.Primitive) {})
+	item.SetFormAttributes(8, tcell.ColorDefault, tcell.ColorDefault, tcell.ColorDefault, tcell.ColorDefault)
+	foreground, background, attributes := field.GetLabelStyle().Decompose()
+	if foreground != tcell.ColorDefault || background != tcell.ColorDefault {
+		t.Fatalf("focused no-color label uses custom colors: foreground=%v background=%v", foreground, background)
+	}
+	if attributes&tcell.AttrReverse == 0 || attributes&tcell.AttrBold == 0 {
+		t.Fatalf("focused no-color label attributes = %v, want reverse and bold", attributes)
+	}
+
+	field.Blur()
+	item.SetFormAttributes(8, tcell.ColorDefault, tcell.ColorDefault, tcell.ColorDefault, tcell.ColorDefault)
+	_, _, attributes = field.GetLabelStyle().Decompose()
+	if attributes&tcell.AttrReverse != 0 || attributes&tcell.AttrBold != 0 {
+		t.Fatalf("blurred no-color label attributes = %v, want no reverse or bold", attributes)
 	}
 }
 

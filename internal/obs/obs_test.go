@@ -284,3 +284,48 @@ func TestOBSOutputRunningIncludesAutomaticReconnect(t *testing.T) {
 type assertError string
 
 func (err assertError) Error() string { return string(err) }
+
+func TestApplyHealthSampleDetectsStalledUpload(t *testing.T) {
+	runtime := NewRuntime("", "", "")
+	start := time.Unix(100, 0)
+	runtime.lastBytes = 1000
+	runtime.lastSample = start
+
+	// 首个有效样本建立推流活动
+	runtime.applyHealthSample(healthSample{
+		active:   true,
+		duration: 5 * time.Second,
+		bytes:    2000,
+	}, start.Add(2*time.Second))
+
+	if runtime.Health().BitrateKbps <= 0 || runtime.Health().LastError != "" {
+		t.Fatalf("initial sample should be normal: %#v", runtime.Health())
+	}
+
+	// 模拟断网：数据量停止增长超过 4 秒
+	runtime.applyHealthSample(healthSample{
+		active:   true,
+		duration: 7 * time.Second,
+		bytes:    2000,
+	}, start.Add(4*time.Second))
+
+	runtime.applyHealthSample(healthSample{
+		active:   true,
+		duration: 9 * time.Second,
+		bytes:    2000,
+	}, start.Add(6*time.Second))
+
+	runtime.applyHealthSample(healthSample{
+		active:   true,
+		duration: 11 * time.Second,
+		bytes:    2000,
+	}, start.Add(8*time.Second))
+
+	health := runtime.Health()
+	if health.BitrateKbps != 0 {
+		t.Fatalf("stalled bitrate = %v, want 0", health.BitrateKbps)
+	}
+	if !strings.Contains(health.LastError, "网络可能已中断") {
+		t.Fatalf("stalled last error = %q, want network interrupt message", health.LastError)
+	}
+}

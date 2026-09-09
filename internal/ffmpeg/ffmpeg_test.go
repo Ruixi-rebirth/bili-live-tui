@@ -73,3 +73,25 @@ func TestTestSourceArgsFollowOrientation(t *testing.T) {
 		t.Fatalf("portrait source = %q", portrait)
 	}
 }
+
+func TestTestRuntimeHealthDetectsProgressStall(t *testing.T) {
+	runtime := NewTestRuntime()
+	runtime.health.Active = true
+	runtime.health.BitrateKbps = 3000
+	runtime.health.FPS = 30
+	runtime.lastProgressAt = time.Now().Add(-5 * time.Second)
+
+	health := runtime.Health()
+	if health.Active {
+		t.Fatal("health should not be active when progress stalled")
+	}
+	if !health.Reconnecting {
+		t.Fatal("health should be reconnecting when progress stalled")
+	}
+	if health.BitrateKbps != 0 || health.FPS != 0 {
+		t.Fatalf("stalled bitrate/fps should be 0: %#v", health)
+	}
+	if !strings.Contains(health.LastError, "推流数据中断") {
+		t.Fatalf("stalled last error = %q", health.LastError)
+	}
+}

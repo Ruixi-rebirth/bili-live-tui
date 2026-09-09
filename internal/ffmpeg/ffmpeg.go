@@ -34,18 +34,19 @@ func testSourceArgs(orientation string) []string {
 // TestRuntime 管理用于完整测试 RTMP 链路的 FFmpeg 合成源，不依赖 OBS。
 // 正式推流默认使用 OBS，因此该运行时只在设置表单中明确选择后启用。
 type TestRuntime struct {
-	mu          sync.RWMutex
-	cmd         *exec.Cmd
-	rtmpAddr    string
-	streamKey   string
-	orientation string
-	health      streamruntime.Health
-	done        chan struct{}
-	doneOnce    sync.Once
-	stopOnce    sync.Once
-	stopCh      chan struct{}
-	stopping    bool
-	lastLog     string
+	mu             sync.RWMutex
+	cmd            *exec.Cmd
+	rtmpAddr       string
+	streamKey      string
+	orientation    string
+	health         streamruntime.Health
+	done           chan struct{}
+	doneOnce       sync.Once
+	stopOnce       sync.Once
+	stopCh         chan struct{}
+	stopping       bool
+	lastLog        string
+	lastProgressAt time.Time
 }
 
 var ffmpegStreamURLPattern = regexp.MustCompile(`(?i)rtmps?://\S+`)
@@ -123,6 +124,7 @@ func newFFmpegProcess(rtmpAddr, streamKey, orientation string) (*exec.Cmd, io.Re
 	args = append(args, testSourceArgs(orientation)...)
 	args = append(args,
 		"-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+		"-rw_timeout", "5000000",
 		"-c:a", "aac", "-b:a", "128k", "-f", "flv", rtmpAddr+streamKey,
 	)
 	cmd := exec.Command(ffmpegPath, args...)
@@ -149,7 +151,7 @@ func (r *TestRuntime) run(cmd *exec.Cmd, progress io.ReadCloser) {
 		}
 
 		detail := r.ffmpegExitDetail(err)
-		// 一次产生有效帧且稳定运行过的恢复应开始新的重连窗口；否则短暂
+		// 一次产生有效帧且稳定运行过的恢复应开始新的重连窗口，否则短暂
 		// 拉起又退出会持续消耗原窗口，不能无限重置 60 秒倒计时。
 		if recoveryStarted.IsZero() || stable {
 			recoveryStarted = time.Now()
@@ -291,7 +293,7 @@ func (r *TestRuntime) ffmpegExitDetail(err error) string {
 	r.mu.RUnlock()
 	if err != nil {
 		if detail != "" {
-			return "FFmpeg 测试源已退出：" + err.Error() + "；" + detail
+			return "FFmpeg 测试源已退出：" + err.Error() + "，" + detail
 		}
 		return "FFmpeg 测试源已退出：" + err.Error()
 	}
@@ -313,7 +315,7 @@ func (r *TestRuntime) setReconnectWaiting(detail string, attempt int, delay time
 	r.mu.Lock()
 	r.health.Active = false
 	r.health.Reconnecting = true
-	r.health.LastError = fmt.Sprintf("%s；%s后进行第 %d 次重连", detail, formatReconnectDelay(delay), attempt)
+	r.health.LastError = fmt.Sprintf("%s，%s后进行第 %d 次重连", detail, formatReconnectDelay(delay), attempt)
 	r.mu.Unlock()
 }
 
@@ -398,6 +400,7 @@ func (r *TestRuntime) readProgressWithReady(progress io.Reader, outputReady chan
 		line := strings.TrimSpace(scanner.Text())
 		key, value, ok := strings.Cut(line, "=")
 		r.mu.Lock()
+		r.lastProgressAt = time.Now()
 		recognized := ok
 		if ok {
 			switch key {
@@ -424,7 +427,7 @@ func (r *TestRuntime) readProgressWithReady(progress io.Reader, outputReady chan
 		}
 		if !recognized && line != "" {
 			message := sanitizeFFmpegLogLine(line)
-			// FFmpeg 结束时通常最后一行是“Conversion failed!”；保留更早的
+			// FFmpeg 结束时通常最后一行是“Conversion failed!”，保留更早的
 			// Error/Server/Connection 行，才能在 TUI 和诊断日志中看到根因。
 			if r.lastLog == "" || (!isFFmpegDiagnosticLine(r.lastLog) && isFFmpegDiagnosticLine(message)) {
 				r.lastLog = message
@@ -462,7 +465,21 @@ func sanitizeFFmpegLogLine(line string) string {
 func (r *TestRuntime) Health() streamruntime.Health {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	return r.health
+	health := r.health
+	if health.Active && !r.lastProgressAt.IsZero() {
+		elapsed := time.Since(r.lastProgressAt)
+		if elapsed >= 4*time.Second {
+			health.BitrateKbps = 0
+			health.FPS = 0
+			health.Active = false
+			health.Reconnecting = true
+			health.LastError = "推流数据中断，正在等待推流响应"
+		} else if elapsed >= 2500*time.Millisecond {
+			health.BitrateKbps = 0
+			health.FPS = 0
+		}
+	}
+	return health
 }
 
 func (r *TestRuntime) Done() <-chan struct{} { return r.done }

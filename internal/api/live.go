@@ -3,6 +3,7 @@ package api
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -32,11 +33,26 @@ import (
 
 const DefaultBaseURL = "https://api.live.bilibili.com"
 
-var defaultAPITransport = func() *http.Transport {
-	transport := http.DefaultTransport.(*http.Transport).Clone()
-	transport.Proxy = systemProxyFunc()
-	return transport
-}()
+func newAPITransport() *http.Transport {
+	dialer := &net.Dialer{
+		Timeout:   6 * time.Second,
+		KeepAlive: 5 * time.Second,
+	}
+	return &http.Transport{
+		Proxy:                 systemProxyFunc(),
+		DialContext:           dialer.DialContext,
+		ForceAttemptHTTP2:     false,
+		TLSNextProto:          make(map[string]func(string, *tls.Conn) http.RoundTripper),
+		MaxIdleConns:          100,
+		MaxIdleConnsPerHost:   10,
+		IdleConnTimeout:       15 * time.Second,
+		TLSHandshakeTimeout:   5 * time.Second,
+		ResponseHeaderTimeout: 8 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	}
+}
+
+var defaultAPITransport = newAPITransport()
 
 // systemProxyFunc keeps Go's environment-variable behavior and additionally
 // reads the current user's WinINET proxy settings on Windows. This includes
@@ -87,7 +103,7 @@ type LiveSettings struct {
 	Announcement string
 	Tags         string
 	AreaID       string
-	// CoverPath 可以是本地图片路径或远程图片地址；提交房间资料前都会上传到 B 站。
+	// CoverPath 可以是本地图片路径或远程图片地址，提交房间资料前都会上传到 B 站。
 	CoverPath string
 	// StreamMode、OBSHost、OBSPort 和 OBSPassword 是本地启动选项，API 不会把它们写入 B 站房间资料。
 	StreamMode  string
@@ -933,7 +949,7 @@ func (c *Client) GetRoomSnapshot(ctx context.Context, roomID string) (RoomSnapsh
 	if primaryErr == nil {
 		return snapshot, nil
 	}
-	// B 站有时会对新版 Web 接口返回 -352 风控错误；旧房间接口提供相同的基础字段，
+	// B 站有时会对新版 Web 接口返回 -352 风控错误，旧房间接口提供相同的基础字段，
 	// 可作为直播主页的安全备用接口。
 	if !shouldFallbackRoomSnapshot(primaryErr) {
 		return RoomSnapshot{}, primaryErr
@@ -1525,7 +1541,7 @@ func normalizeCoverForUpload(ctx context.Context, file *os.File) ([]byte, string
 
 	// B 站当前 Web 封面编辑器以画面中心裁出 4:3，再导出为
 	// 720×540、质量 95 的 JPEG。APP 使用完整 4:3 封面，Web 展示时
-	// 再从中间取 16:9；这里复现同一份上传素材。
+	// 再从中间取 16:9，这里复现同一份上传素材。
 	crop := centeredCropRect(src.Bounds(), webRoomCoverWidth, webRoomCoverHeight)
 	dst := image.NewRGBA(image.Rect(0, 0, webRoomCoverWidth, webRoomCoverHeight))
 	xdraw.Draw(dst, dst.Bounds(), image.NewUniform(color.White), image.Point{}, xdraw.Src)
@@ -1797,9 +1813,28 @@ type Client struct {
 
 func NewClient(httpClient *http.Client) *Client {
 	if httpClient == nil {
-		httpClient = &http.Client{Transport: defaultAPITransport, Timeout: 10 * time.Second}
+		httpClient = &http.Client{Transport: newAPITransport(), Timeout: 10 * time.Second}
 	}
 	return &Client{BaseURL: DefaultBaseURL, HTTPClient: httpClient}
+}
+
+// CloseIdleConnections 关闭底层连接池中的所有空闲连接，避免网络切换或断网后复用半关连接。
+func (c *Client) CloseIdleConnections() {
+	if c != nil && c.HTTPClient != nil && c.HTTPClient.Transport != nil {
+		tr, ok := c.HTTPClient.Transport.(interface{ CloseIdleConnections() })
+		if ok {
+			tr.CloseIdleConnections()
+		}
+	}
+}
+
+func (c *Client) do(req *http.Request) (*http.Response, error) {
+	resp, err := c.HTTPClient.Do(req)
+	if err != nil {
+		c.CloseIdleConnections()
+		return nil, err
+	}
+	return resp, nil
 }
 
 func (c *Client) endpoint(path string) string {
@@ -1832,7 +1867,7 @@ func (c *Client) postFormWithHeaders(ctx context.Context, path string, params ur
 			req.Header.Add(key, value)
 		}
 	}
-	resp, err := c.HTTPClient.Do(req)
+	resp, err := c.do(req)
 	if err != nil {
 		return err
 	}
@@ -1986,7 +2021,7 @@ func (c *Client) AddLiveTag(ctx context.Context, roomID, sessdata, biliJCT, cont
 		tagID = strings.TrimSpace(string(result.Data.ID))
 	}
 	if tagID == "" {
-		// 部分版本的接口成功时不返回编号；标签已经写入，后续删除时无法用本地映射定位。
+		// 部分版本的接口成功时不返回编号，标签已经写入，后续删除时无法用本地映射定位。
 		return "", nil
 	}
 	return tagID, nil
@@ -2244,7 +2279,7 @@ func (c *Client) updateLiveInfo(ctx context.Context, roomID, accessToken, sessda
 			message = strings.TrimSpace(result.Msg)
 		}
 		if result.Code == 1 && strings.Contains(message, "分区") {
-			return fmt.Errorf("设置开播信息失败: %s；请确认分区 ID 是当前有效的子分区，并检查登录凭证是否仍有效", responseMessage(message, ""))
+			return fmt.Errorf("设置开播信息失败: %s，请确认分区 ID 是当前有效的子分区，并检查登录凭证是否仍有效", responseMessage(message, ""))
 		}
 		return fmt.Errorf("设置开播信息失败: %s", responseMessage(message, ""))
 	}

@@ -8,7 +8,6 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
-	"unicode"
 	"unicode/utf8"
 
 	"bili-live-tui/internal/api"
@@ -28,9 +27,6 @@ func RunDanmaku(
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	previousNoColor := noColor
-	noColor = danmakuNoColor
-	defer func() { noColor = previousNoColor }()
 	applyTheme()
 	app := tview.NewApplication().EnableMouse(true).EnablePaste(true).SetTitle("bili-live-tui")
 
@@ -40,15 +36,15 @@ func RunDanmaku(
 	chat.SetDynamicColors(true)
 	chat.SetRegions(true)
 	chat.SetWordWrap(true)
-	chat.SetBackgroundColor(panelColor)
+	setDanmakuChatColors(chat)
 	chat.SetBorder(true)
 	chat.SetBorderColor(tview.Styles.BorderColor)
-	// 工作区标题已经命名页面；清空弹幕框标题，避免“弹幕互动”重复显示，同时保留边框。
+	// 工作区标题已经命名页面，清空弹幕框标题，避免“弹幕互动”重复显示，同时保留边框。
 	chat.SetTitle("")
 	chat.SetTitleColor(tview.Styles.TitleColor)
 	initialSessionSnapshot := session.snapshot()
 	userRegions := newDanmakuUserRegionRegistry()
-	renderDanmakuHistory(chat, initialSessionSnapshot.history, initialSessionSnapshot.placeholder, userRegions)
+	renderDanmakuHistory(chat, initialSessionSnapshot.history, userRegions)
 
 	status := tview.NewTextView()
 	status.SetDynamicColors(true)
@@ -94,7 +90,8 @@ func RunDanmaku(
 	var reply *tview.InputField
 	reply = tview.NewInputField().
 		SetLabel("").
-		SetPlaceholder("").
+		SetPlaceholder("输入弹幕… (Enter 发送 · Ctrl+U 清空 · Ctrl+L 清屏 · Esc 下播)").
+		SetPlaceholderTextColor(mutedColor).
 		SetFieldWidth(0).
 		SetLabelColor(tview.Styles.SecondaryTextColor).
 		SetFieldStyle(tcell.StyleDefault.
@@ -119,6 +116,7 @@ func RunDanmaku(
 	sentCount := 0
 	type pendingDanmakuSend struct {
 		id              uint64
+		count           int
 		message         string
 		startRevision   uint64
 		requestAccepted bool
@@ -153,7 +151,9 @@ func RunDanmaku(
 			if err != nil {
 				limitFallback = true
 				danmakuMaxLength.Store(api.DefaultDanmakuMaxLength)
-				sendStatus.SetText(fmt.Sprintf("未能获取弹幕字数上限，暂按 %d 字处理。", api.DefaultDanmakuMaxLength))
+				if strings.TrimSpace(sendStatus.GetText(true)) == "" {
+					sendStatus.SetText(fmt.Sprintf("未能获取弹幕字数上限，暂按 %d 字处理。", api.DefaultDanmakuMaxLength))
+				}
 			} else {
 				limitFallback = false
 				danmakuMaxLength.Store(int64(limit))
@@ -215,12 +215,9 @@ func RunDanmaku(
 		sentCount = 0
 		sendStatus.SetText("已清空本地弹幕记录。")
 	}
+	danmakuSender := api.NewDanmakuSender(client, roomID, sessdata, biliJCT)
 	sending := false
 	send := func() {
-		if !limitReady {
-			sendStatus.SetText("正在获取弹幕字数上限，请稍候……")
-			return
-		}
 		if sending {
 			sendStatus.SetText("正在发送上一条弹幕，请稍候……")
 			return
@@ -230,8 +227,6 @@ func RunDanmaku(
 			sendStatus.SetText("内容不能为空。")
 			return
 		}
-		// 立即清空输入框，方便主播连续输入下一条弹幕
-		reply.SetText("")
 		sending = true
 		nextDanmakuSendID++
 		submission := &pendingDanmakuSend{
@@ -242,9 +237,9 @@ func RunDanmaku(
 		pendingSends[submission.id] = submission
 		sendStatus.SetText("正在发送弹幕……")
 		go func(send *pendingDanmakuSend) {
-			requestCtx, cancelRequest := context.WithTimeout(streamCtx, 12*time.Second)
+			requestCtx, cancelRequest := context.WithTimeout(streamCtx, 8*time.Second)
 			defer cancelRequest()
-			err := client.SendDanmakuWithLimit(requestCtx, roomID, sessdata, biliJCT, send.message, int(danmakuMaxLength.Load()))
+			err := danmakuSender.Send(requestCtx, send.message, int(danmakuMaxLength.Load()))
 			queueUI(func() {
 				sending = false
 				pending, exists := pendingSends[send.id]
@@ -252,28 +247,43 @@ func RunDanmaku(
 					return
 				}
 				if err != nil {
-					delete(pendingSends, send.id)
-					// 若用户尚未在输入框输入新内容，恢复失败的草稿以便修改重试
-					if strings.TrimSpace(reply.GetText()) == "" {
-						reply.SetText(send.message)
-					}
-					if api.IsDanmakuProhibited(err) {
-						sendStatus.SetText("弹幕未发送成功，可能包含屏蔽词。")
+					if pending.streamConfirmed {
+						if strings.TrimSpace(reply.GetText()) == send.message {
+							reply.SetText("")
+						}
+						sentCount++
+						delete(pendingSends, send.id)
+						sendStatus.SetText(formatDanmakuSendConfirmedStatus(sentCount))
 						return
 					}
-					sendStatus.SetText("发送失败，内容已保留：" + tview.Escape(err.Error()))
+					delete(pendingSends, send.id)
+					if api.IsDanmakuDeliveryUnknown(err) {
+						sendStatus.SetText("发送结果未确认，内容仍在输入框中；请先查看直播间，避免重复发送。")
+						return
+					}
+					if api.IsDanmakuProhibited(err) {
+						sendStatus.SetText("弹幕未发送成功，内容仍在输入框中，可能包含屏蔽词。")
+						return
+					}
+					sendStatus.SetText("发送失败，内容仍在输入框中：" + tview.Escape(err.Error()))
 					return
 				}
+				if strings.TrimSpace(reply.GetText()) == send.message {
+					reply.SetText("")
+				}
+				sentCount++
+				pending.count = sentCount
 				send.requestAccepted = true
 				if pending.streamConfirmed {
 					delete(pendingSends, send.id)
-					sentCount++
-					sendStatus.SetText(fmt.Sprintf("第 %d 条弹幕已在直播间显示。", sentCount))
+					sendStatus.SetText(formatDanmakuSendConfirmedStatus(pending.count))
 					return
 				}
-				sendStatus.SetText("弹幕已提交，正在等待直播间显示……")
+				snapshot := session.snapshot()
+				connected := snapshot.connection.connected()
+				sendStatus.SetText(formatDanmakuSendAcceptedStatus(pending.count, connected))
 				go func(sendID uint64) {
-					timer := time.NewTimer(2 * time.Second)
+					timer := time.NewTimer(10 * time.Second)
 					defer timer.Stop()
 					select {
 					case <-streamCtx.Done():
@@ -285,10 +295,11 @@ func RunDanmaku(
 								return
 							}
 							delete(pendingSends, sendID)
-							if strings.TrimSpace(reply.GetText()) == "" {
-								reply.SetText(p.message)
+							if sendID == nextDanmakuSendID {
+								snap := session.snapshot()
+								conn := snap.connection.connected()
+								sendStatus.SetText(formatDanmakuSendTimeoutStatus(p.count, conn))
 							}
-							sendStatus.SetText("弹幕未发送成功，可能包含屏蔽词。")
 						})
 					}
 				}(send.id)
@@ -334,37 +345,6 @@ func RunDanmaku(
 		}
 	}
 	userCardActions.SetCancelFunc(closeUserCard)
-
-	var closeHelp func()
-	helpPanel, _, helpCloseBtn := newDanmakuHelpPanel(func() {
-		if closeHelp != nil {
-			closeHelp()
-		}
-	})
-	const helpModalWidth = 68
-	const helpModalHeight = 22
-	helpOverlay := newFloatingOverlay(helpPanel, helpModalWidth, helpModalHeight).SetOpaqueBackground(panelColor)
-	helpVisible := false
-	closeHelp = func() {
-		helpVisible = false
-		pages.HidePage("help-shortcuts")
-		if previousFocus != nil {
-			app.SetFocus(previousFocus)
-		} else {
-			app.SetFocus(reply)
-		}
-	}
-	openHelp := func() {
-		if helpVisible {
-			closeHelp()
-			return
-		}
-		previousFocus = app.GetFocus()
-		helpVisible = true
-		pages.ShowPage("help-shortcuts")
-		pages.SendToFront("help-shortcuts")
-		app.SetFocus(helpCloseBtn)
-	}
 
 	managementMenu := newDanmakuManagementList(" 用户管理 ")
 	managementMenuOverlay := newFloatingOverlay(managementMenu, 46, 9).SetOpaqueBackground(panelColor)
@@ -535,7 +515,7 @@ func RunDanmaku(
 	roomManagerNavigation := newDanmakuManagementList(" 栏目 ")
 	roomManagerNavigation.ShowSecondaryText(false)
 	roomManagerNavigation.SetHighlightFullLine(true)
-	roomManagerNavigation.SetSelectedFocusOnly(false)
+	roomManagerNavigation.SetSelectedFocusOnly(noColor)
 	roomManagerNavigation.SetBorderPadding(1, 0, 1, 1)
 	roomManagerSection := tview.NewTextView().SetDynamicColors(true).SetTextAlign(tview.AlignCenter)
 	roomManagerSection.SetBackgroundColor(panelColor)
@@ -658,10 +638,7 @@ func RunDanmaku(
 	roomManagerTable.SetFixed(1, 0)
 	roomManagerTable.SetSelectable(true, false)
 	roomManagerTable.SetEvaluateAllRows(true)
-	roomManagerTable.SetSelectedStyle(tcell.StyleDefault.
-		Background(tview.Styles.MoreContrastBackgroundColor).
-		Foreground(tview.Styles.PrimaryTextColor).
-		Bold(true))
+	configureTableFocusStyle(roomManagerTable)
 	roomManagerTableActions := make(map[int]func())
 	roomManagerTable.SetSelectedFunc(func(row, _ int) {
 		if action := roomManagerTableActions[row]; action != nil {
@@ -1937,15 +1914,11 @@ func RunDanmaku(
 		onlineRank.Highlight()
 		switch region {
 		case "tab_audience":
-			if activeRankTab != rankTabAudience {
-				activeRankTab = rankTabAudience
-				renderOnlineRank(onlineRank, session.snapshot(), activeRankTab, onlineRankUserRegions)
-			}
+			activeRankTab = rankTabAudience
+			renderOnlineRank(onlineRank, session.snapshot(), activeRankTab, onlineRankUserRegions)
 		case "tab_guard":
-			if activeRankTab != rankTabGuard {
-				activeRankTab = rankTabGuard
-				renderOnlineRank(onlineRank, session.snapshot(), activeRankTab, onlineRankUserRegions)
-			}
+			activeRankTab = rankTabGuard
+			renderOnlineRank(onlineRank, session.snapshot(), activeRankTab, onlineRankUserRegions)
 		default:
 			if message, ok := onlineRankUserRegions.Lookup(region); ok {
 				openUserCard(message)
@@ -1974,35 +1947,59 @@ func RunDanmaku(
 		app.SetFocus(confirm)
 	}
 
-	var giftPanelVisible bool
-	var giftPanelComponent *giftPanel
-	closeGiftPanel := func() {
-		giftPanelVisible = false
-		pages.HidePage("gift-log")
-		if previousFocus != nil {
-			app.SetFocus(previousFocus)
-		} else {
-			app.SetFocus(reply)
-		}
+	var openOverview func()
+	toolButtons := []*tview.Button{
+		newActionButton("直播概览", func() {
+			if openOverview != nil {
+				openOverview()
+			}
+		}),
+		newActionButton("房间管理", openRoomManager),
 	}
-	openGiftPanel := func() {
-		if giftPanelVisible {
-			closeGiftPanel()
-			return
-		}
-		previousFocus = app.GetFocus()
-		giftPanelVisible = true
-		giftPanelComponent.Update(session.snapshot())
-		pages.ShowPage("gift-log")
-		pages.SendToFront("gift-log")
-		app.SetFocus(giftPanelComponent.table)
+	toolBar := centeredActionBar(toolButtons)
+	toolBar.SetBackgroundColor(panelColor)
+
+	mainFocusables := []tview.Primitive{chat, onlineRank, reply}
+	for _, button := range toolButtons {
+		mainFocusables = append(mainFocusables, button)
 	}
-	giftPanelComponent = newGiftPanel(func(message api.DanmakuMessage) {
-		openUserCard(message)
-	}, closeGiftPanel)
-	const giftModalWidth = 84
-	const giftModalHeight = 21
-	giftOverlay := newFloatingOverlay(giftPanelComponent.container, giftModalWidth, giftModalHeight).SetOpaqueBackground(panelColor)
+	cycleMainFocus := func(backward bool) {
+		current := app.GetFocus()
+		next := 0
+		if backward {
+			next = len(mainFocusables) - 1
+		}
+		for index, primitive := range mainFocusables {
+			if current != primitive {
+				continue
+			}
+			if backward {
+				next = (index - 1 + len(mainFocusables)) % len(mainFocusables)
+			} else {
+				next = (index + 1) % len(mainFocusables)
+			}
+			break
+		}
+		app.SetFocus(mainFocusables[next])
+	}
+	chat.SetFocusFunc(func() {
+		setFocusBorder(chat.Box, true)
+	})
+	chat.SetBlurFunc(func() {
+		setFocusBorder(chat.Box, false)
+	})
+	onlineRank.SetFocusFunc(func() {
+		setFocusBorder(onlineRank.Box, true)
+	})
+	onlineRank.SetBlurFunc(func() {
+		setFocusBorder(onlineRank.Box, false)
+	})
+	reply.SetFocusFunc(func() {
+		setFocusBorder(reply.Box, true)
+	})
+	reply.SetBlurFunc(func() {
+		setFocusBorder(reply.Box, false)
+	})
 
 	body := tview.NewFlex()
 	body.SetDirection(tview.FlexRow)
@@ -2018,20 +2015,12 @@ func RunDanmaku(
 	if healthLoader != nil {
 		body.AddItem(streamStatus, 1, 0, false)
 	}
-	// 弹幕工作区不显示操作按钮。Enter 在输入框中发送，Esc/Ctrl+H 仍是全局导航快捷键。
 	body.AddItem(reply, 3, 0, true)
-	footerText := pageFooter("[\"help\"][#38bdf8::b]Ctrl+? 快捷键指南[-:-:-][\"\"]　Enter 发送　Esc 下播")
-	footerText.SetRegions(true)
-	footerText.SetHighlightedFunc(func(added, removed, remaining []string) {
-		if len(added) > 0 && added[0] == "help" {
-			footerText.Highlight()
-			openHelp()
-		}
-	})
+	body.AddItem(toolBar, 1, 0, false)
 	root := workspacePage(
 		workspaceHeader("弹幕互动"),
 		body,
-		footerText,
+		nil,
 	)
 	pages.AddPage("main", root, true, true)
 	pages.AddPage("user-card", userCardOverlay, true, false)
@@ -2041,12 +2030,10 @@ func RunDanmaku(
 	pages.AddPage("room-manager", roomManagerPage, true, false)
 	pages.AddPage("room-manager-confirm", roomManagerConfirm, true, false)
 	pages.AddPage("confirm-stop", confirm, true, false)
-	pages.AddPage("gift-log", giftOverlay, true, false)
-	pages.AddPage("help-shortcuts", helpOverlay, true, false)
 
 	var homeWS *homeWorkspaceComponents
 	var overviewVisible bool
-	openOverview := func() {
+	openOverview = func() {
 		if homeWS == nil {
 			return
 		}
@@ -2125,23 +2112,19 @@ func RunDanmaku(
 				queueUI(func() {
 					status.SetText(formatDanmakuSessionStatus(snapshot))
 					renderOnlineRank(onlineRank, snapshot, activeRankTab, onlineRankUserRegions)
-					if giftPanelVisible {
-						giftPanelComponent.Update(snapshot)
-					}
 					for id, pending := range pendingSends {
 						if danmakuSnapshotConfirmsSend(snapshot, pending.startRevision, pending.message, managementCapabilities.UserID) {
 							pending.streamConfirmed = true
 							if pending.requestAccepted {
 								delete(pendingSends, id)
-								sentCount++
-								sendStatus.SetText(fmt.Sprintf("第 %d 条弹幕已在直播间显示。", sentCount))
+								sendStatus.SetText(formatDanmakuSendConfirmedStatus(pending.count))
 							}
 						}
 					}
 					if snapshot.historyRevision != renderedHistoryRevision {
 						renderedHistoryRevision = updateDanmakuHistory(chat, snapshot, renderedHistoryRevision, userRegions)
-					} else if len(snapshot.history) == 0 && chat.GetText(true) != snapshot.placeholder {
-						chat.SetText(snapshot.placeholder)
+					} else if len(snapshot.history) == 0 && chat.GetText(true) != "" {
+						chat.SetText("")
 					}
 				})
 			}
@@ -2190,34 +2173,10 @@ func RunDanmaku(
 			if pages.HasPage(executablePathPageName) && event.Key() != tcell.KeyCtrlC {
 				return event
 			}
-			switch event.Key() {
-			case tcell.KeyTab, tcell.KeyBacktab, tcell.KeyRight, tcell.KeyLeft:
-				if homeWS == nil || len(homeWS.buttons) == 0 {
-					return event
-				}
-				isPrev := event.Key() == tcell.KeyBacktab || event.Key() == tcell.KeyLeft
-				for index, button := range homeWS.buttons {
-					if app.GetFocus() != button {
-						continue
-					}
-					next := index + 1
-					if isPrev {
-						next = index - 1
-					}
-					if next < 0 {
-						next = len(homeWS.buttons) - 1
-					} else if next >= len(homeWS.buttons) {
-						next = 0
-					}
-					app.SetFocus(homeWS.buttons[next])
-					return nil
-				}
-				next := 0
-				if isPrev {
-					next = len(homeWS.buttons) - 1
-				}
-				app.SetFocus(homeWS.buttons[next])
+			if navigateHomeWorkspace(app, homeWS, event) {
 				return nil
+			}
+			switch event.Key() {
 			case tcell.KeyEscape:
 				closeOverview()
 				return nil
@@ -2225,28 +2184,6 @@ func RunDanmaku(
 				navigation = NavigationQuit
 				stopApplication()
 				return nil
-			}
-			if matchesControlShortcut(event, tcell.KeyCtrlH, 'h') || matchesModifiedRuneShortcut(event, tcell.ModAlt, 'h') {
-				closeOverview()
-				return nil
-			}
-			return event
-		}
-		if helpVisible {
-			if matchesHelpShortcut(event) || event.Key() == tcell.KeyEscape {
-				closeHelp()
-				return nil
-			}
-			switch event.Key() {
-			case tcell.KeyCtrlC:
-				navigation = NavigationQuit
-				stopApplication()
-				return nil
-			case tcell.KeyRune:
-				if event.Rune() == '?' {
-					closeHelp()
-					return nil
-				}
 			}
 			return event
 		}
@@ -2274,27 +2211,6 @@ func RunDanmaku(
 			default:
 				return event
 			}
-		}
-		if giftPanelVisible {
-			if matchesControlShortcut(event, tcell.KeyCtrlG, 'g') || matchesModifiedRuneShortcut(event, tcell.ModAlt, 'g') {
-				closeGiftPanel()
-				return nil
-			}
-			switch event.Key() {
-			case tcell.KeyEscape:
-				closeGiftPanel()
-				return nil
-			case tcell.KeyCtrlC:
-				navigation = NavigationQuit
-				stopApplication()
-				return nil
-			case tcell.KeyRune:
-				if event.Rune() == 'q' || event.Rune() == 'Q' {
-					closeGiftPanel()
-					return nil
-				}
-			}
-			return event
 		}
 		if roomManagerConfirmVisible {
 			switch event.Key() {
@@ -2380,7 +2296,7 @@ func RunDanmaku(
 					}
 					return nil
 				}
-				// 内容列表之后进入操作栏；最后一个按钮再回到左侧栏目。
+				// 内容列表之后进入操作栏，最后一个按钮再回到左侧栏目。
 				if len(roomManagerCurrentButtons) > 0 {
 					app.SetFocus(roomManagerCurrentButtons[0])
 					return nil
@@ -2502,45 +2418,40 @@ func RunDanmaku(
 				return event
 			}
 		}
-
-		switch {
-		case matchesControlShortcut(event, tcell.KeyCtrlH, 'h') || matchesModifiedRuneShortcut(event, tcell.ModAlt, 'h'):
-			// 在终端中，Backspace 通常与 Ctrl+H 等价（ASCII 8）。
-			// 当输入框获得焦点时，放行该按键用于退格删除，避免误跳回房间概览。
-			if reply.HasFocus() {
-				if event.Key() == tcell.KeyCtrlH || event.Key() == tcell.KeyBackspace {
-					return event
+		if event.Key() == tcell.KeyTab || event.Key() == tcell.KeyBacktab {
+			cycleMainFocus(event.Key() == tcell.KeyBacktab)
+			return nil
+		}
+		if event.Key() == tcell.KeyLeft || event.Key() == tcell.KeyRight {
+			for index, button := range toolButtons {
+				if !button.HasFocus() {
+					continue
 				}
-				if event.Key() == tcell.KeyRune && (event.Rune() == '\b' || event.Rune() == 8) {
-					return tcell.NewEventKey(tcell.KeyBackspace, 0, tcell.ModNone)
+				next := index + 1
+				if event.Key() == tcell.KeyLeft {
+					next = index - 1
 				}
-			}
-			if homeWS != nil {
-				openOverview()
+				next = (next + len(toolButtons)) % len(toolButtons)
+				app.SetFocus(toolButtons[next])
 				return nil
 			}
-			navigation = NavigationHome
-			stopApplication()
-			return nil
+		}
+		if onlineRank.HasFocus() {
+			switch event.Key() {
+			case tcell.KeyLeft:
+				activeRankTab = rankTabAudience
+				renderOnlineRank(onlineRank, session.snapshot(), activeRankTab, onlineRankUserRegions)
+				return nil
+			case tcell.KeyRight:
+				activeRankTab = rankTabGuard
+				renderOnlineRank(onlineRank, session.snapshot(), activeRankTab, onlineRankUserRegions)
+				return nil
+			}
+		}
+
+		switch {
 		case matchesControlShortcut(event, tcell.KeyCtrlL, 'l'):
 			clearChat()
-			return nil
-		case matchesControlShortcut(event, tcell.KeyCtrlR, 'r') || matchesModifiedRuneShortcut(event, tcell.ModAlt, 'r'):
-			if activeRankTab == rankTabAudience {
-				activeRankTab = rankTabGuard
-			} else {
-				activeRankTab = rankTabAudience
-			}
-			renderOnlineRank(onlineRank, session.snapshot(), activeRankTab, onlineRankUserRegions)
-			return nil
-		case matchesControlShortcut(event, tcell.KeyCtrlG, 'g') || matchesModifiedRuneShortcut(event, tcell.ModAlt, 'g'):
-			openGiftPanel()
-			return nil
-		case matchesHelpShortcut(event) || (!reply.HasFocus() && event.Key() == tcell.KeyRune && event.Rune() == '?'):
-			openHelp()
-			return nil
-		case matchesRoomManagementShortcut(event):
-			openRoomManager()
 			return nil
 		case matchesControlShortcut(event, tcell.KeyCtrlU, 'u'):
 			reply.SetText("")
@@ -2577,6 +2488,16 @@ func RunDanmaku(
 	return navigation, nil
 }
 
+func setDanmakuChatColors(chat *tview.TextView) {
+	if noColor {
+		chat.SetBackgroundColor(tcell.ColorDefault)
+		chat.SetTextColor(tcell.ColorDefault)
+		return
+	}
+	chat.SetBackgroundColor(panelColor)
+	chat.SetTextColor(tview.Styles.PrimaryTextColor)
+}
+
 func acceptsDanmakuInput(field *tview.InputField, proposed string, maxLength int) bool {
 	proposedLength := utf8.RuneCountInString(proposed)
 	if proposedLength <= maxLength {
@@ -2605,10 +2526,7 @@ func newDanmakuManagementList(title string) *tview.List {
 	list.SetBackgroundColor(panelColor)
 	list.SetMainTextColor(tview.Styles.PrimaryTextColor)
 	list.SetSecondaryTextColor(mutedColor)
-	list.SetSelectedStyle(tcell.StyleDefault.
-		Background(accentActiveColor).
-		Foreground(buttonActiveTextColor).
-		Bold(true))
+	list.SetSelectedStyle(selectedItemStyle())
 	list.SetBorder(true)
 	list.SetBorderColor(tview.Styles.BorderColor)
 	list.SetTitle(title)
@@ -2624,8 +2542,8 @@ func newDanmakuManagementForm(title string) *tview.Form {
 	form.SetFieldTextColor(tview.Styles.PrimaryTextColor)
 	form.SetLabelColor(tview.Styles.SecondaryTextColor)
 	form.SetButtonsAlign(tview.AlignCenter)
-	form.SetButtonStyle(tcell.StyleDefault.Background(accentColor).Foreground(buttonTextColor))
-	form.SetButtonActivatedStyle(tcell.StyleDefault.Background(accentActiveColor).Foreground(buttonActiveTextColor).Bold(true))
+	form.SetButtonStyle(actionButtonStyle(false))
+	form.SetButtonActivatedStyle(actionButtonStyle(true))
 	form.SetBorder(true)
 	form.SetBorderColor(tview.Styles.BorderColor)
 	form.SetTitle(title)
@@ -2794,48 +2712,92 @@ func matchesModifiedRuneShortcut(event *tcell.EventKey, modifier tcell.ModMask, 
 	return event != nil &&
 		event.Key() == tcell.KeyRune &&
 		event.Modifiers()&modifier != 0 &&
-		unicode.ToLower(event.Rune()) == unicode.ToLower(letter)
-}
-
-func matchesRoomManagementShortcut(event *tcell.EventKey) bool {
-	// Ctrl+M is only distinguishable from Enter when the terminal reports an
-	// extended KeyRune event with the Ctrl modifier. Never match KeyCtrlM here:
-	// tcell aliases it to KeyCR/KeyEnter on traditional terminals.
-	return matchesModifiedRuneShortcut(event, tcell.ModCtrl, 'm') ||
-		matchesModifiedRuneShortcut(event, tcell.ModAlt, 'm')
-}
-
-func matchesHelpShortcut(event *tcell.EventKey) bool {
-	if event == nil {
-		return false
-	}
-	if matchesModifiedRuneShortcut(event, tcell.ModAlt, '?') || matchesModifiedRuneShortcut(event, tcell.ModAlt, '/') {
-		return true
-	}
-	if matchesModifiedRuneShortcut(event, tcell.ModCtrl, '?') || matchesModifiedRuneShortcut(event, tcell.ModCtrl, '/') {
-		return true
-	}
-	if event.Key() == tcell.KeyCtrlUnderscore {
-		return true
-	}
-	if event.Key() == tcell.KeyF1 {
-		return true
-	}
-	return false
+		strings.EqualFold(string(event.Rune()), string(letter))
 }
 
 func formatDanmakuSessionStatus(snapshot liveDanmakuSnapshot) string {
-	if !snapshot.onlineKnown || !strings.HasPrefix(snapshot.status, "弹幕已连接") {
-		return snapshot.status
-	}
-	status := strings.TrimSuffix(snapshot.status, "，消息会实时显示。")
-	for _, marker := range []string{" · 当前人气 ", " · 人气 "} {
-		if index := strings.LastIndex(status, marker); index >= 0 {
-			status = status[:index]
-			break
+	state := snapshot.connection
+	endpoint := tview.Escape(formatDanmakuEndpoint(state.endpoint))
+	switch state.phase {
+	case danmakuConnectionConnecting:
+		if state.attempt <= 1 {
+			return "正在连接弹幕服务……"
 		}
+		return fmt.Sprintf("正在连接弹幕服务（第 %d 次）……", state.attempt)
+	case danmakuConnectionAuthenticating:
+		if endpoint == "" {
+			return "已建立通道，正在等待服务器确认……"
+		}
+		return "已建立通道，正在等待服务器确认 · 节点 " + endpoint
+	case danmakuConnectionConnected:
+		status := "弹幕已连接"
+		if endpoint != "" {
+			status += " · 节点 " + endpoint
+		}
+		if snapshot.onlineKnown {
+			status += fmt.Sprintf(" · 当前人气 %d", snapshot.online)
+		}
+		return status
+	case danmakuConnectionRetrying:
+		status := "弹幕连接未确认"
+		if state.confirmed {
+			status = "弹幕连接中断"
+		} else if endpoint == "" {
+			status = "弹幕连接失败"
+		}
+		details := make([]string, 0, 3)
+		if !state.confirmed && endpoint == "" {
+			details = append(details, fmt.Sprintf("第 %d 次", state.attempt))
+		}
+		if state.lastError != "" {
+			details = append(details, tview.Escape(state.lastError))
+		}
+		if endpoint != "" {
+			details = append(details, "节点 "+endpoint)
+		}
+		if len(details) > 0 {
+			status += "（" + strings.Join(details, "，") + "）"
+		}
+		if state.confirmed {
+			return status + "，" + formatDanmakuRetryDelay(state.retryDelay) + "后自动重连……"
+		}
+		return status + "，" + formatDanmakuRetryDelay(state.retryDelay) + "后重试……"
+	default:
+		return "弹幕连接状态未知"
 	}
-	return fmt.Sprintf("%s · 当前人气 %d", status, snapshot.online)
+}
+
+func formatDanmakuSendAcceptedStatus(count int, connected bool) string {
+	if count <= 0 {
+		if !connected {
+			return "弹幕已发送（弹幕服务正在连接，暂未收到实时回显）。"
+		}
+		return "弹幕已发送，正在等待直播间显示……"
+	}
+	if !connected {
+		return fmt.Sprintf("第 %d 条弹幕已发送（弹幕服务正在连接，暂未收到实时回显）。", count)
+	}
+	return fmt.Sprintf("第 %d 条弹幕已发送，正在等待直播间显示……", count)
+}
+
+func formatDanmakuSendTimeoutStatus(count int, connected bool) string {
+	if count <= 0 {
+		if !connected {
+			return "弹幕已发送（弹幕服务未连接，未收到实时回显）。"
+		}
+		return "弹幕已发送（若直播间未显示，可能被 B 站审核过滤）。"
+	}
+	if !connected {
+		return fmt.Sprintf("第 %d 条弹幕已发送（弹幕服务未连接，未收到实时回显）。", count)
+	}
+	return fmt.Sprintf("第 %d 条弹幕已发送（若直播间未显示，可能被 B 站审核过滤）。", count)
+}
+
+func formatDanmakuSendConfirmedStatus(count int) string {
+	if count <= 0 {
+		return "弹幕已在直播间显示。"
+	}
+	return fmt.Sprintf("第 %d 条弹幕已在直播间显示。", count)
 }
 
 func newDanmakuUserCardPanel() (*tview.Flex, *tview.TextView, *tview.Form) {
@@ -2852,13 +2814,8 @@ func newDanmakuUserCardPanel() (*tview.Flex, *tview.TextView, *tview.Form) {
 	actions.SetBackgroundColor(panelColor)
 	actions.SetButtonsAlign(tview.AlignCenter)
 	actions.SetBorderPadding(0, 0, 0, 0)
-	actions.SetButtonStyle(tcell.StyleDefault.
-		Background(accentColor).
-		Foreground(buttonTextColor))
-	actions.SetButtonActivatedStyle(tcell.StyleDefault.
-		Background(accentActiveColor).
-		Foreground(buttonActiveTextColor).
-		Bold(true))
+	actions.SetButtonStyle(actionButtonStyle(false))
+	actions.SetButtonActivatedStyle(actionButtonStyle(true))
 
 	panel := tview.NewFlex().SetDirection(tview.FlexRow)
 	panel.SetBackgroundColor(panelColor)
@@ -2875,63 +2832,6 @@ func newDanmakuUserCardPanel() (*tview.Flex, *tview.TextView, *tview.Form) {
 	actionArea.AddItem(actions, 1, 0, true)
 	panel.AddItem(actionArea, 2, 0, true)
 	return panel, content, actions
-}
-
-func newDanmakuHelpPanel(onClose func()) (*tview.Flex, *tview.TextView, *tview.Button) {
-	content := tview.NewTextView()
-	content.SetDynamicColors(true)
-	content.SetTextAlign(tview.AlignLeft)
-	content.SetWordWrap(true)
-	content.SetScrollable(true)
-	content.SetBackgroundColor(panelColor)
-	content.SetBorderPadding(1, 0, 2, 2)
-
-	keyColor := accentColor.String()
-	secColor := accentActiveColor.String()
-
-	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("[::b][%s]【 弹幕互动 】[-::-]\n", secColor))
-	sb.WriteString(fmt.Sprintf(" [%s]Enter[-]          发送弹幕（即发即清空，支持连续输入）\n", keyColor))
-	sb.WriteString(fmt.Sprintf(" [%s]Ctrl+U[-]         清空当前输入框内容\n", keyColor))
-	sb.WriteString(fmt.Sprintf(" [%s]Ctrl+L[-]         清空本地弹幕滚动历史（不影响直播间）\n", keyColor))
-	sb.WriteString(fmt.Sprintf(" [%s]点击用户名/回车[-] 弹出观众资料卡（可关注、@TA、管理禁言）\n\n", keyColor))
-
-	sb.WriteString(fmt.Sprintf("[::b][%s]【 看板与工具 】[-::-]\n", secColor))
-	sb.WriteString(fmt.Sprintf(" [%s]Ctrl+R / Alt+R[-] 切换「房间观众（高能榜）」与「大航海（舰队）」\n", keyColor))
-	sb.WriteString(fmt.Sprintf(" [%s]Ctrl+G / Alt+G[-] 打开「本次直播收礼明细与收益看板」（流水与贡献榜）\n", keyColor))
-	sb.WriteString(fmt.Sprintf(" [%s]Ctrl+M / Alt+M[-] 打开「房间综合管理中心」（房管/禁言/黑名单/屏蔽词）\n", keyColor))
-	sb.WriteString(fmt.Sprintf(" [%s]Alt+H  / Ctrl+H[-] 返回房间概览与开播设置\n\n", keyColor))
-
-	sb.WriteString(fmt.Sprintf("[::b][%s]【 系统与退出 】[-::-]\n", secColor))
-	sb.WriteString(fmt.Sprintf(" [%s]Ctrl+? / Alt+?[-] 打开或关闭本快捷键帮助弹窗\n", keyColor))
-	sb.WriteString(fmt.Sprintf(" [%s]Esc[-]            返回上一级 / 确认下播并退出当前房间\n", keyColor))
-	sb.WriteString(fmt.Sprintf(" [%s]Ctrl+C[-]         立即强制退出程序\n", keyColor))
-
-	content.SetText(sb.String())
-
-	closeBtn := tview.NewButton(" 关闭 (Esc / Enter) ")
-	closeBtn.SetStyle(tcell.StyleDefault.Background(accentColor).Foreground(buttonTextColor))
-	closeBtn.SetActivatedStyle(tcell.StyleDefault.Background(accentActiveColor).Foreground(buttonActiveTextColor).Bold(true))
-	closeBtn.SetSelectedFunc(onClose)
-
-	btnRow := tview.NewFlex().SetDirection(tview.FlexColumn)
-	btnRow.SetBackgroundColor(panelColor)
-	btnRow.AddItem(nil, 0, 1, false)
-	btnRow.AddItem(closeBtn, 24, 0, true)
-	btnRow.AddItem(nil, 0, 1, false)
-
-	panel := tview.NewFlex().SetDirection(tview.FlexRow)
-	panel.SetBackgroundColor(panelColor)
-	panel.SetBorder(true)
-	panel.SetBorderColor(tview.Styles.BorderColor)
-	panel.SetTitle(" ⌨  快捷键与操作指南 ")
-	panel.SetTitleColor(tview.Styles.TitleColor)
-
-	panel.AddItem(content, 0, 1, false)
-	panel.AddItem(btnRow, 1, 0, true)
-	panel.AddItem(nil, 1, 0, false)
-
-	return panel, content, closeBtn
 }
 
 type danmakuUserRegionRegistry struct {
@@ -2960,7 +2860,7 @@ func (registry *danmakuUserRegionRegistry) Register(message api.DanmakuMessage) 
 	id := fmt.Sprintf("danmaku-user-%d", registry.next)
 	registry.items[id] = message
 	registry.order = append(registry.order, id)
-	// TextView 最多保留 danmakuHistoryLimit 行；多留一倍余量可覆盖换行文本，
+	// TextView 最多保留 danmakuHistoryLimit 行，多留一倍余量可覆盖换行文本，
 	// 同时避免长时间直播让点击区域索引无限增长。
 	if len(registry.order) > danmakuHistoryLimit*2 {
 		oldest := registry.order[0]
@@ -3008,16 +2908,27 @@ func appendDanmakuEvent(chat *tview.TextView, event api.DanmakuEvent, prependLin
 	if prependLineBreak {
 		separator = "\n"
 	}
-	stampText := fmt.Sprintf("[%s]%s[-]", mutedColor.String(), stamp.Format("15:04:05"))
+	styledText := func(text string, color tcell.Color, bold bool) string {
+		if noColor {
+			if bold {
+				return "[::b]" + text + "[-:-:-]"
+			}
+			return text
+		}
+		if bold {
+			return fmt.Sprintf("[%s::b]%s[-:-:-]", color.String(), text)
+		}
+		return fmt.Sprintf("[%s]%s[-]", color.String(), text)
+	}
+	stampText := styledText(stamp.Format("15:04:05"), mutedColor, false)
 	usernameText := tview.Escape(username)
+	if event.Kind != api.DanmakuEventWarning {
+		usernameText = styledText(usernameText, prefixColor, true)
+	}
 	if len(registries) > 0 && registries[0] != nil && event.Kind != api.DanmakuEventWarning {
 		if regionID := registries[0].Register(message); regionID != "" {
-			usernameText = fmt.Sprintf("[\"%s\"][%s::b]%s[-:-:-][\"\"]", regionID, prefixColor.String(), usernameText)
-		} else {
-			usernameText = fmt.Sprintf("[%s::b]%s[-:-:-]", prefixColor.String(), usernameText)
+			usernameText = fmt.Sprintf("[\"%s\"]%s[\"\"]", regionID, usernameText)
 		}
-	} else if event.Kind != api.DanmakuEventWarning {
-		usernameText = fmt.Sprintf("[%s::b]%s[-:-:-]", prefixColor.String(), usernameText)
 	}
 
 	var line string
@@ -3027,13 +2938,13 @@ func appendDanmakuEvent(chat *tview.TextView, event api.DanmakuEvent, prependLin
 		if message.Price <= 0 {
 			priceLabel = "醒目留言"
 		}
-		line = fmt.Sprintf("%s%s [%s::b][%s][-:-:-] %s：%s", separator, stampText, prefixColor.String(), priceLabel, usernameText, tview.Escape(strings.TrimSpace(message.Text)))
+		line = fmt.Sprintf("%s%s %s %s：%s", separator, stampText, styledText("["+priceLabel+"]", prefixColor, true), usernameText, tview.Escape(strings.TrimSpace(message.Text)))
 	case api.DanmakuEventGuard:
-		line = fmt.Sprintf("%s%s [%s::b][大航海][-:-:-] %s %s", separator, stampText, prefixColor.String(), usernameText, tview.Escape(strings.TrimSpace(message.Text)))
+		line = fmt.Sprintf("%s%s %s %s %s", separator, stampText, styledText("[大航海]", prefixColor, true), usernameText, tview.Escape(strings.TrimSpace(message.Text)))
 	case api.DanmakuEventWarning:
-		line = fmt.Sprintf("%s%s [%s::b]⚠ [超管警告] %s[-:-:-]", separator, stampText, errorColor.String(), tview.Escape(strings.TrimSpace(message.Text)))
+		line = fmt.Sprintf("%s%s %s", separator, stampText, styledText("⚠ [超管警告] "+tview.Escape(strings.TrimSpace(message.Text)), errorColor, true))
 	case api.DanmakuEventGift:
-		line = fmt.Sprintf("%s%s [%s::b][礼物][-:-:-] %s %s", separator, stampText, prefixColor.String(), usernameText, tview.Escape(strings.TrimSpace(message.Text)))
+		line = fmt.Sprintf("%s%s %s %s %s", separator, stampText, styledText("[礼物]", prefixColor, true), usernameText, tview.Escape(strings.TrimSpace(message.Text)))
 	default:
 		line = fmt.Sprintf("%s%s %s：%s", separator, stampText, usernameText, tview.Escape(strings.TrimSpace(message.Text)))
 	}
@@ -3069,7 +2980,7 @@ func prependDanmakuMention(draft, username string, maxLength int) (string, bool)
 }
 
 func danmakuUserCardHeight(text string, width int) int {
-	// 浮窗边框占 2 列，正文左右各留 2 列；底部按钮、上下留白和边框共 5 行。
+	// 浮窗边框占 2 列，正文左右各留 2 列，底部按钮、上下留白和边框共 5 行。
 	contentWidth := max(width-6, 1)
 	rows := 0
 	for _, line := range strings.Split(text, "\n") {
@@ -3257,7 +3168,7 @@ func renderOnlineRank(view *tview.TextView, snapshot liveDanmakuSnapshot, mode r
 			}
 			guardColor := accentColor
 			if member.GuardLevel == 1 {
-				guardColor = tcell.NewHexColor(0xd97706) // 总督
+				guardColor = themeColor(tcell.NewHexColor(0xd97706)) // 总督
 			} else if member.GuardLevel == 2 {
 				guardColor = accentActiveColor // 提督
 			}
@@ -3333,7 +3244,7 @@ func onlineGuardLabel(level int) string {
 	}
 }
 
-func renderDanmakuHistory(chat *tview.TextView, history []api.DanmakuEvent, placeholder string, registries ...*danmakuUserRegionRegistry) {
+func renderDanmakuHistory(chat *tview.TextView, history []api.DanmakuEvent, registries ...*danmakuUserRegionRegistry) {
 	var registry *danmakuUserRegionRegistry
 	if len(registries) > 0 {
 		registry = registries[0]
@@ -3341,7 +3252,6 @@ func renderDanmakuHistory(chat *tview.TextView, history []api.DanmakuEvent, plac
 	}
 	chat.SetText("")
 	if len(history) == 0 {
-		chat.SetText(placeholder)
 		return
 	}
 	for index, event := range history {
@@ -3358,13 +3268,15 @@ func updateDanmakuHistory(chat *tview.TextView, snapshot liveDanmakuSnapshot, re
 		registry = registries[0]
 	}
 	if len(snapshot.history) == 0 {
-		registry.Reset()
-		chat.SetText(snapshot.placeholder)
+		if registry != nil {
+			registry.Reset()
+		}
+		chat.SetText("")
 		chat.ScrollToBeginning()
 		return snapshot.historyRevision
 	}
 	if snapshot.historyRevision < renderedRevision {
-		renderDanmakuHistory(chat, snapshot.history, snapshot.placeholder, registry)
+		renderDanmakuHistory(chat, snapshot.history, registry)
 		return snapshot.historyRevision
 	}
 	added := snapshot.historyRevision - renderedRevision
@@ -3372,7 +3284,18 @@ func updateDanmakuHistory(chat *tview.TextView, snapshot liveDanmakuSnapshot, re
 		return renderedRevision
 	}
 	if added > uint64(len(snapshot.history)) {
-		renderDanmakuHistory(chat, snapshot.history, snapshot.placeholder, registry)
+		renderDanmakuHistory(chat, snapshot.history, registry)
+		return snapshot.historyRevision
+	}
+
+	// 检查当前聊天框实际已渲染的行数。若历史长度与增量不吻合（例如存在连击原地修改已有消息），
+	// 则完整重绘历史，确保连击数字在原地跳动更新，不产生重复多余的追加行。
+	currentRendered := 0
+	if txt := chat.GetText(true); txt != "" {
+		currentRendered = strings.Count(txt, "\n") + 1
+	}
+	if len(snapshot.history) != currentRendered+int(added) {
+		renderDanmakuHistory(chat, snapshot.history, registry)
 		return snapshot.historyRevision
 	}
 
@@ -3413,124 +3336,8 @@ func danmakuSnapshotConfirmsSend(snapshot liveDanmakuSnapshot, afterRevision uin
 	return false
 }
 
-// danmakuStreamConnection 和 danmakuStreamConnector 让重连循环独立于 WebSocket 实现。
-// 这样既便于理解生命周期，也能测试认证响应不会意外终止消息消费循环。
-type danmakuStreamConnection interface {
-	Events() <-chan api.DanmakuEvent
-	Errors() <-chan error
-	Close()
-}
-
-type danmakuStreamConnector func(context.Context) (danmakuStreamConnection, error)
-
-func runDanmakuStreamWithConnector(ctx context.Context, connect danmakuStreamConnector, queueUI func(func()), handleEvent func(api.DanmakuEvent), status, chat *tview.TextView, done chan<- struct{}) {
-	defer close(done)
-	// TCP/WebSocket 连接成功不足以说明弹幕已连接，认证可能紧接着失败。
-	// 只有收到服务器首个事件后才把会话标记为已建立。
-	attempt := 0
-	for {
-		attempt++
-		currentAttempt := attempt
-		queueUI(func() { status.SetText(fmt.Sprintf("正在连接弹幕服务（第 %d 次）……", currentAttempt)) })
-		stream, err := connect(ctx)
-		if err != nil {
-			if ctx.Err() != nil {
-				return
-			}
-			queueUI(func() {
-				status.SetText(fmt.Sprintf("弹幕连接失败（第 %d 次），5 秒后重试：%s", currentAttempt, tview.Escape(err.Error())))
-				chat.SetText("暂时无法连接弹幕服务器。\n\n" + tview.Escape(err.Error()) + "\n\n正在自动重试……")
-			})
-			if !waitDanmakuRetry(ctx, 5*time.Second) {
-				return
-			}
-			continue
-		}
-
-		queueUI(func() { status.SetText("已建立通道，正在等待服务器确认……") })
-		endpoint := ""
-		if details, ok := stream.(interface{ Endpoint() string }); ok {
-			endpoint = details.Endpoint()
-		}
-		endpointLabel := tview.Escape(formatDanmakuEndpoint(endpoint))
-		connectedStatus := "弹幕已连接，消息会实时显示。"
-		if endpointLabel != "" {
-			connectedStatus = "弹幕已连接 · 节点 " + endpointLabel
-		}
-		confirmedConnection := false
-		streamEnded := false
-		disconnectReason := ""
-		events := stream.Events()
-		errors := stream.Errors()
-		for !streamEnded {
-			select {
-			case <-ctx.Done():
-				stream.Close()
-				streamEnded = true
-			case event, ok := <-events:
-				if !ok {
-					events = nil
-					streamEnded = errors == nil
-					continue
-				}
-				if !confirmedConnection && event.Kind == api.DanmakuEventConnected {
-					confirmedConnection = true
-					queueUI(func() {
-						if strings.HasPrefix(chat.GetText(true), "正在连接") || strings.HasPrefix(chat.GetText(true), "暂时无法") {
-							chat.SetText("")
-						}
-						// 重连使用与首次连接相同的确认状态文本。
-						// WebSocket 拨号成功但认证尚未完成时，不能宣称“已恢复”。
-						status.SetText(connectedStatus)
-					})
-				}
-				handleEvent(event)
-				if event.Kind == api.DanmakuEventConnected {
-					// 认证事件已经更新状态，继续消费当前连接；普通弹幕只会在服务器确认后到达。
-					continue
-				}
-				if event.Kind == api.DanmakuEventOnline {
-					queueUI(func() {
-						if endpointLabel == "" {
-							status.SetText(fmt.Sprintf("弹幕已连接 · 当前人气 %d", event.Online))
-						} else {
-							status.SetText(fmt.Sprintf("弹幕已连接 · 节点 %s · 当前人气 %d", endpointLabel, event.Online))
-						}
-					})
-				}
-			case streamErr, ok := <-errors:
-				if ok && streamErr != nil {
-					disconnectReason = tview.Escape(streamErr.Error())
-					queueUI(func() { status.SetText("弹幕连接异常：" + tview.Escape(streamErr.Error())) })
-				} else if !ok {
-					errors = nil
-					streamEnded = events == nil
-				}
-			}
-		}
-		stream.Close()
-		if ctx.Err() != nil {
-			return
-		}
-		reason := ""
-		if disconnectReason != "" {
-			reason = "（" + disconnectReason
-			if endpointLabel != "" {
-				reason += "；节点 " + endpointLabel
-			}
-			reason += "）"
-		} else if endpointLabel != "" {
-			reason = "（节点 " + endpointLabel + "）"
-		}
-		if confirmedConnection {
-			queueUI(func() { status.SetText("弹幕连接中断" + reason + "，5 秒后自动重连……") })
-		} else {
-			queueUI(func() { status.SetText("弹幕连接未确认" + reason + "，5 秒后重试……") })
-		}
-		if !waitDanmakuRetry(ctx, 5*time.Second) {
-			return
-		}
-	}
+func formatDanmakuRetryDelay(delay time.Duration) string {
+	return fmt.Sprintf("%d 秒", int(delay/time.Second))
 }
 
 func formatDanmakuEndpoint(endpoint string) string {
@@ -3539,15 +3346,4 @@ func formatDanmakuEndpoint(endpoint string) string {
 		return parsed.Host
 	}
 	return strings.TrimSpace(endpoint)
-}
-
-func waitDanmakuRetry(ctx context.Context, delay time.Duration) bool {
-	timer := time.NewTimer(delay)
-	defer timer.Stop()
-	select {
-	case <-ctx.Done():
-		return false
-	case <-timer.C:
-		return true
-	}
 }

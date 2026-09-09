@@ -57,6 +57,7 @@ type DanmakuOverviewOptions struct {
 
 type homeWorkspaceComponents struct {
 	root          tview.Primitive
+	overview      *tview.TextView
 	actionBar     *tview.Flex
 	buttons       []*tview.Button
 	setStatusText func()
@@ -112,10 +113,18 @@ func newHomeWorkspace(
 	status.SetDynamicColors(true)
 	status.SetTextAlign(tview.AlignCenter)
 	status.SetBackgroundColor(panelColor)
+	status.SetScrollable(true)
 	status.SetBorder(true)
 	status.SetBorderColor(tview.Styles.BorderColor)
-	status.SetTitle(" ♡ 直播概览 ♡ ")
+	const overviewTitle = " ♡ 直播概览 ♡ "
+	status.SetTitle(overviewTitle)
 	status.SetTitleColor(tview.Styles.TitleColor)
+	status.SetFocusFunc(func() {
+		setFocusBorder(status.Box, true)
+	})
+	status.SetBlurFunc(func() {
+		setFocusBorder(status.Box, false)
+	})
 
 	noticeView := tview.NewTextView()
 	noticeView.SetDynamicColors(true)
@@ -123,7 +132,6 @@ func newHomeWorkspace(
 	noticeView.SetWrap(false)
 	noticeView.SetBackgroundColor(panelColor)
 
-	statusDisplay := &displayOnlyPrimitive{Primitive: status}
 	noticeDisplay := &displayOnlyPrimitive{Primitive: noticeView}
 	roomNotice := ""
 
@@ -290,12 +298,12 @@ func newHomeWorkspace(
 	body = tview.NewFlex()
 	body.SetDirection(tview.FlexRow)
 	body.SetBackgroundColor(panelColor)
-	body.AddItem(statusDisplay, 0, 1, false)
+	body.AddItem(status, 0, 1, true)
 	body.AddItem(noticeDisplay, 0, 0, false)
 	body.AddItem(actionBar, 1, 0, true)
 	setStatusText()
 
-	footerText := "Tab 选择　Enter 执行　Esc / Alt+H 返回弹幕"
+	footerText := "Tab 选择　Enter 执行　Esc 返回弹幕"
 	root := centeredPage(
 		nil,
 		body,
@@ -374,6 +382,7 @@ func newHomeWorkspace(
 
 	return &homeWorkspaceComponents{
 		root:          root,
+		overview:      status,
 		actionBar:     actionBar,
 		buttons:       buttons,
 		setStatusText: setStatusText,
@@ -385,6 +394,53 @@ func newHomeWorkspace(
 		},
 		stopRefresh: stop,
 	}
+}
+
+func navigateHomeWorkspace(app *tview.Application, workspace *homeWorkspaceComponents, event *tcell.EventKey) bool {
+	if workspace == nil || workspace.overview == nil || len(workspace.buttons) == 0 {
+		return false
+	}
+	current := app.GetFocus()
+	if event.Key() == tcell.KeyTab || event.Key() == tcell.KeyBacktab {
+		focusables := make([]tview.Primitive, 0, len(workspace.buttons)+1)
+		focusables = append(focusables, workspace.overview)
+		for _, button := range workspace.buttons {
+			focusables = append(focusables, button)
+		}
+		next := 0
+		if event.Key() == tcell.KeyBacktab {
+			next = len(focusables) - 1
+		}
+		for index, primitive := range focusables {
+			if current != primitive {
+				continue
+			}
+			if event.Key() == tcell.KeyBacktab {
+				next = (index - 1 + len(focusables)) % len(focusables)
+			} else {
+				next = (index + 1) % len(focusables)
+			}
+			break
+		}
+		app.SetFocus(focusables[next])
+		return true
+	}
+	if event.Key() != tcell.KeyLeft && event.Key() != tcell.KeyRight {
+		return false
+	}
+	for index, button := range workspace.buttons {
+		if current != button {
+			continue
+		}
+		next := index + 1
+		if event.Key() == tcell.KeyLeft {
+			next = index - 1
+		}
+		next = (next + len(workspace.buttons)) % len(workspace.buttons)
+		app.SetFocus(workspace.buttons[next])
+		return true
+	}
+	return false
 }
 
 // RunHome 显示直播概览，并在同一个 TUI 中处理资料编辑和直播预览。
@@ -474,33 +530,10 @@ func RunHome(ctx context.Context, startedAt time.Time, roomID string, settings *
 			}
 			return event
 		}
-		switch event.Key() {
-		case tcell.KeyTab, tcell.KeyBacktab, tcell.KeyRight, tcell.KeyLeft:
-			isPrev := event.Key() == tcell.KeyBacktab || event.Key() == tcell.KeyLeft
-			for index, button := range ws.buttons {
-				if app.GetFocus() != button {
-					continue
-				}
-				next := index + 1
-				if isPrev {
-					next = index - 1
-				}
-				if next < 0 {
-					next = len(ws.buttons) - 1
-				} else if next >= len(ws.buttons) {
-					next = 0
-				}
-				app.SetFocus(ws.buttons[next])
-				return nil
-			}
-			if len(ws.buttons) > 0 {
-				next := 0
-				if isPrev {
-					next = len(ws.buttons) - 1
-				}
-				app.SetFocus(ws.buttons[next])
-			}
+		if navigateHomeWorkspace(app, ws, event) {
 			return nil
+		}
+		switch event.Key() {
 		case tcell.KeyEscape:
 			pages.ShowPage("confirm-stop")
 			app.SetFocus(confirm)
@@ -542,13 +575,18 @@ func formatStreamHealth(health streamruntime.Health) string {
 		if strings.Contains(health.LastError, "正在确认") {
 			state = "正在确认"
 		}
-		color = "#d68a4b"
+		color = themeColor(tcell.NewHexColor(0xd68a4b)).String()
 	} else if health.Active {
-		state = "推流正常"
-		color = accentColor.String()
+		if health.BitrateKbps <= 0 && health.Duration > 4*time.Second {
+			state = "推流卡顿"
+			color = themeColor(tcell.NewHexColor(0xd68a4b)).String()
+		} else {
+			state = "推流正常"
+			color = accentColor.String()
+		}
 	}
 	if health.LastError != "" {
-		if health.Reconnecting {
+		if health.Reconnecting || health.Active {
 			return fmt.Sprintf("[%s]%s%s[-] · %s", color, mode, state, tview.Escape(health.LastError))
 		}
 		return fmt.Sprintf("[%s]%s异常[-] · %s", errorColor.String(), mode, tview.Escape(health.LastError))
@@ -600,13 +638,6 @@ func liveInfoSummaryWithStats(roomID string, settings api.LiveSettings, areas []
 		fmt.Sprintf("[%s]分区[-]　%s", labelColor, tview.Escape(areaName)),
 		fmt.Sprintf("[%s]封面[-]　%s", labelColor, cover),
 	}
-	if sessionStats != nil {
-		giftSummary := "暂未收到"
-		if sessionStats.GiftCount > 0 {
-			giftSummary = fmt.Sprintf("%d 次 / 共 %d 个", sessionStats.GiftEvents, sessionStats.GiftCount)
-		}
-		lines = append(lines, fmt.Sprintf("[%s]本场礼物[-]　%s", labelColor, giftSummary))
-	}
 	if snapshot != nil {
 		if sessionStats != nil && sessionStats.PopularityKnown {
 			lines = append(lines, fmt.Sprintf("[%s]当前人气[-]　%d", labelColor, sessionStats.Popularity))
@@ -657,13 +688,8 @@ func summaryValue(value, fallback string) string {
 func newActionButton(label string, selected func()) *tview.Button {
 	return tview.NewButton(label).
 		SetSelectedFunc(selected).
-		SetStyle(tcell.StyleDefault.
-			Background(accentColor).
-			Foreground(buttonTextColor)).
-		SetActivatedStyle(tcell.StyleDefault.
-			Background(accentActiveColor).
-			Foreground(buttonActiveTextColor).
-			Bold(true))
+		SetStyle(actionButtonStyle(false)).
+		SetActivatedStyle(actionButtonStyle(true))
 }
 
 func populateCenteredActionBar(bar *tview.Flex, buttons []*tview.Button) {

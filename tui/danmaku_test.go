@@ -42,13 +42,12 @@ func TestDanmakuStreamContinuesAfterAuthentication(t *testing.T) {
 
 	done := make(chan struct{})
 	var observed []api.DanmakuEventKind
-	chat := tview.NewTextView().SetText("正在连接弹幕服务器……")
+	var states []danmakuConnectionState
 	connectCalls := 0
 	connect := func(context.Context) (danmakuStreamConnection, error) {
 		connectCalls++
 		return stream, nil
 	}
-	queueUI := func(update func()) { update() }
 	onEvent := func(event api.DanmakuEvent) {
 		observed = append(observed, event.Kind)
 		if event.Kind == api.DanmakuEventMessage {
@@ -59,10 +58,8 @@ func TestDanmakuStreamContinuesAfterAuthentication(t *testing.T) {
 	go runDanmakuStreamWithConnector(
 		ctx,
 		connect,
-		queueUI,
+		func(state danmakuConnectionState) { states = append(states, state) },
 		onEvent,
-		tview.NewTextView(),
-		chat,
 		done,
 	)
 
@@ -78,13 +75,128 @@ func TestDanmakuStreamContinuesAfterAuthentication(t *testing.T) {
 	if len(observed) != 2 || observed[0] != api.DanmakuEventConnected || observed[1] != api.DanmakuEventMessage {
 		t.Fatalf("observed events = %#v, want connected then message", observed)
 	}
-	if got := chat.GetText(true); got != "" {
-		t.Fatalf("chat placeholder after connection = %q, want empty", got)
+	if len(states) < 3 || states[0].phase != danmakuConnectionConnecting ||
+		states[1].phase != danmakuConnectionAuthenticating ||
+		states[2].phase != danmakuConnectionConnected {
+		t.Fatalf("connection states = %#v, want connecting, authenticating, connected", states)
 	}
 	select {
 	case <-stream.closed:
 	default:
 		t.Fatal("stream was not closed")
+	}
+}
+
+func TestDanmakuRetryDelayBacksOffAndCaps(t *testing.T) {
+	want := []time.Duration{
+		time.Second,
+		2 * time.Second,
+		5 * time.Second,
+		10 * time.Second,
+		15 * time.Second,
+		15 * time.Second,
+	}
+	for index, expected := range want {
+		if got := danmakuRetryDelay(index + 1); got != expected {
+			t.Fatalf("retry delay %d = %v, want %v", index+1, got, expected)
+		}
+	}
+	if got := danmakuRetryDelay(0); got != time.Second {
+		t.Fatalf("retry delay after confirmed connection = %v, want 1s", got)
+	}
+}
+
+func TestDanmakuStreamReconnectsAfterUnconfirmedConnectionEnds(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	first := &fakeDanmakuStream{
+		events: make(chan api.DanmakuEvent),
+		errors: make(chan error),
+		closed: make(chan struct{}),
+	}
+	close(first.events)
+	close(first.errors)
+	second := &fakeDanmakuStream{
+		events: make(chan api.DanmakuEvent, 2),
+		errors: make(chan error),
+		closed: make(chan struct{}),
+	}
+	second.events <- api.DanmakuEvent{Kind: api.DanmakuEventConnected}
+	second.events <- api.DanmakuEvent{Kind: api.DanmakuEventMessage, Message: api.DanmakuMessage{Text: "重连成功"}}
+
+	connectCalls := 0
+	connect := func(context.Context) (danmakuStreamConnection, error) {
+		connectCalls++
+		if connectCalls == 1 {
+			return first, nil
+		}
+		return second, nil
+	}
+	done := make(chan struct{})
+	var states []danmakuConnectionState
+	go runDanmakuStreamWithConnector(
+		ctx,
+		connect,
+		func(state danmakuConnectionState) { states = append(states, state) },
+		func(event api.DanmakuEvent) {
+			if event.Message.Text == "重连成功" {
+				cancel()
+			}
+		},
+		done,
+	)
+
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("danmaku stream did not reconnect")
+	}
+	if connectCalls != 2 {
+		t.Fatalf("connector calls = %d, want 2", connectCalls)
+	}
+	foundRetry := false
+	for _, state := range states {
+		if state.phase == danmakuConnectionRetrying && !state.confirmed {
+			foundRetry = true
+			break
+		}
+	}
+	if !foundRetry {
+		t.Fatalf("connection states = %#v, want an unconfirmed retry", states)
+	}
+	select {
+	case <-first.closed:
+	default:
+		t.Fatal("first stream was not closed before reconnect")
+	}
+}
+
+func TestDanmakuStreamStopsWhileWaitingToReconnect(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	connectCalls := 0
+	go runDanmakuStreamWithConnector(
+		ctx,
+		func(context.Context) (danmakuStreamConnection, error) {
+			connectCalls++
+			return nil, context.DeadlineExceeded
+		},
+		func(state danmakuConnectionState) {
+			if state.phase == danmakuConnectionRetrying {
+				cancel()
+			}
+		},
+		func(api.DanmakuEvent) {},
+		done,
+	)
+
+	select {
+	case <-done:
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("danmaku stream did not stop after cancelling reconnect wait")
+	}
+	if connectCalls != 1 {
+		t.Fatalf("connector calls = %d, want 1", connectCalls)
 	}
 }
 
@@ -164,6 +276,55 @@ func TestLiveDanmakuSessionSubscriptionStartsWithRefresh(t *testing.T) {
 	}
 }
 
+func TestLiveDanmakuSessionTracksConnectionStateSeparatelyFromStatusText(t *testing.T) {
+	session := &LiveDanmakuSession{subscribers: make(map[chan struct{}]struct{})}
+	session.updateConnectionState(danmakuConnectionState{
+		phase:     danmakuConnectionConnected,
+		endpoint:  "example.test:443",
+		confirmed: true,
+	})
+	if snapshot := session.snapshot(); !snapshot.connection.connected() {
+		t.Fatalf("connected snapshot = %#v, want connected", snapshot)
+	}
+	session.updateConnectionState(danmakuConnectionState{
+		phase:      danmakuConnectionRetrying,
+		lastError:  "unexpected EOF",
+		retryDelay: time.Second,
+		confirmed:  true,
+	})
+	if snapshot := session.snapshot(); snapshot.connection.connected() {
+		t.Fatalf("disconnected snapshot = %#v, want disconnected", snapshot)
+	}
+}
+
+func TestLiveDanmakuSessionDeduplicatesLiveStateNotifications(t *testing.T) {
+	session := &LiveDanmakuSession{subscribers: make(map[chan struct{}]struct{})}
+	live := api.DanmakuEvent{Kind: api.DanmakuEventSystem, Command: "LIVE"}
+	preparing := api.DanmakuEvent{Kind: api.DanmakuEventSystem, Command: "PREPARING"}
+
+	session.handleEvent(live)
+	session.handleEvent(live)
+	session.handleEvent(preparing)
+	session.handleEvent(preparing)
+	session.handleEvent(live)
+
+	snapshot := session.snapshot()
+	if len(snapshot.history) != 3 {
+		t.Fatalf("live state history length = %d, want 3", len(snapshot.history))
+	}
+	if snapshot.historyRevision != 3 {
+		t.Fatalf("live state history revision = %d, want 3", snapshot.historyRevision)
+	}
+	commands := []string{
+		snapshot.history[0].Command,
+		snapshot.history[1].Command,
+		snapshot.history[2].Command,
+	}
+	if strings.Join(commands, ",") != "LIVE,PREPARING,LIVE" {
+		t.Fatalf("live state history = %v", commands)
+	}
+}
+
 func TestObservePopularityKeepsLatestValue(t *testing.T) {
 	session := &LiveDanmakuSession{subscribers: make(map[chan struct{}]struct{})}
 	now := time.Now()
@@ -177,31 +338,27 @@ func TestObservePopularityKeepsLatestValue(t *testing.T) {
 }
 
 func TestMatchesControlShortcutSupportsLegacyAndModifiedRuneEvents(t *testing.T) {
-	legacy := tcell.NewEventKey(tcell.KeyCtrlH, 0, tcell.ModNone)
-	rawControl := tcell.NewEventKey(tcell.KeyRune, '\b', tcell.ModNone)
-	enhanced := tcell.NewEventKey(tcell.KeyRune, 'H', tcell.ModCtrl|tcell.ModShift)
-	plain := tcell.NewEventKey(tcell.KeyRune, 'h', tcell.ModNone)
-	if !matchesControlShortcut(legacy, tcell.KeyCtrlH, 'h') {
-		t.Fatal("legacy Ctrl+H event was not recognized")
+	legacy := tcell.NewEventKey(tcell.KeyCtrlU, 0, tcell.ModNone)
+	rawControl := tcell.NewEventKey(tcell.KeyRune, rune(tcell.KeyCtrlU), tcell.ModNone)
+	enhanced := tcell.NewEventKey(tcell.KeyRune, 'U', tcell.ModCtrl|tcell.ModShift)
+	plain := tcell.NewEventKey(tcell.KeyRune, 'u', tcell.ModNone)
+	if !matchesControlShortcut(legacy, tcell.KeyCtrlU, 'u') {
+		t.Fatal("legacy Ctrl+U event was not recognized")
 	}
-	if !matchesControlShortcut(rawControl, tcell.KeyCtrlH, 'h') {
-		t.Fatal("raw control-byte Ctrl+H event was not recognized")
+	if !matchesControlShortcut(rawControl, tcell.KeyCtrlU, 'u') {
+		t.Fatal("raw control-byte Ctrl+U event was not recognized")
 	}
-	if !matchesControlShortcut(enhanced, tcell.KeyCtrlH, 'h') {
-		t.Fatal("modified-rune Ctrl+H event was not recognized")
+	if !matchesControlShortcut(enhanced, tcell.KeyCtrlU, 'u') {
+		t.Fatal("modified-rune Ctrl+U event was not recognized")
 	}
-	if matchesControlShortcut(plain, tcell.KeyCtrlH, 'h') {
-		t.Fatal("plain h was recognized as Ctrl+H")
-	}
-	alt := tcell.NewEventKey(tcell.KeyRune, 'h', tcell.ModAlt)
-	if !matchesModifiedRuneShortcut(alt, tcell.ModAlt, 'h') {
-		t.Fatal("Alt+H event was not recognized")
+	if matchesControlShortcut(plain, tcell.KeyCtrlU, 'u') {
+		t.Fatal("plain u was recognized as Ctrl+U")
 	}
 }
 
 func TestDanmakuStatusDoesNotDuplicateViewerCount(t *testing.T) {
 	snapshot := liveDanmakuSnapshot{
-		status:       "弹幕已连接，消息会实时显示。",
+		connection:   danmakuConnectionState{phase: danmakuConnectionConnected, confirmed: true},
 		online:       88,
 		onlineKnown:  true,
 		viewerOnline: 23,
@@ -214,12 +371,24 @@ func TestDanmakuStatusDoesNotDuplicateViewerCount(t *testing.T) {
 
 func TestDanmakuStatusPreservesConnectedNode(t *testing.T) {
 	snapshot := liveDanmakuSnapshot{
-		status:      "弹幕已连接 · 节点 broadcast.example:443 · 当前人气 42",
+		connection:  danmakuConnectionState{phase: danmakuConnectionConnected, endpoint: "broadcast.example:443", confirmed: true},
 		online:      88,
 		onlineKnown: true,
 	}
 	if got := formatDanmakuSessionStatus(snapshot); got != "弹幕已连接 · 节点 broadcast.example:443 · 当前人气 88" {
 		t.Fatalf("danmaku status = %q", got)
+	}
+}
+
+func TestDanmakuStatusFormatsRetryDetailsTogether(t *testing.T) {
+	snapshot := liveDanmakuSnapshot{connection: danmakuConnectionState{
+		phase:      danmakuConnectionRetrying,
+		attempt:    3,
+		lastError:  "unexpected EOF",
+		retryDelay: 5 * time.Second,
+	}}
+	if got := formatDanmakuSessionStatus(snapshot); got != "弹幕连接失败（第 3 次，unexpected EOF），5 秒后重试……" {
+		t.Fatalf("retry status = %q", got)
 	}
 }
 
@@ -308,7 +477,7 @@ func TestUpdateDanmakuHistoryHandlesClearAndCoalescedAppend(t *testing.T) {
 	chat := tview.NewTextView().SetMaxLines(danmakuHistoryLimit)
 	old := api.DanmakuEvent{Kind: api.DanmakuEventMessage, Message: api.DanmakuMessage{Username: "旧用户", Text: "旧弹幕"}}
 	fresh := api.DanmakuEvent{Kind: api.DanmakuEventMessage, Message: api.DanmakuMessage{Username: "新用户", Text: "新弹幕"}}
-	renderDanmakuHistory(chat, []api.DanmakuEvent{old}, "")
+	renderDanmakuHistory(chat, []api.DanmakuEvent{old})
 
 	// 修订号增加两次代表一次清空和一次新增；此时必须完整渲染当前历史。
 	revision := updateDanmakuHistory(chat, liveDanmakuSnapshot{history: []api.DanmakuEvent{fresh}, historyRevision: 3}, 1)
@@ -345,58 +514,30 @@ func TestDanmakuSnapshotConfirmationSupportsLegacyMessageWithoutUID(t *testing.T
 	}
 }
 
-func TestDanmakuInputCaptureHandlesBackspaceWithoutNavigating(t *testing.T) {
-	reply := tview.NewInputField()
-	reply.SetText("测试文本")
-
-	app := tview.NewApplication()
-	app.SetFocus(reply)
-
-	handler := func(event *tcell.EventKey) *tcell.EventKey {
-		switch {
-		case matchesControlShortcut(event, tcell.KeyCtrlH, 'h') || matchesModifiedRuneShortcut(event, tcell.ModAlt, 'h'):
-			if reply.HasFocus() {
-				if event.Key() == tcell.KeyCtrlH || event.Key() == tcell.KeyBackspace {
-					return event
-				}
-				if event.Key() == tcell.KeyRune && (event.Rune() == '\b' || event.Rune() == 8) {
-					return tcell.NewEventKey(tcell.KeyBackspace, 0, tcell.ModNone)
-				}
-			}
-			return nil
-		default:
-			return event
-		}
+func TestDanmakuSendStatusFormatters(t *testing.T) {
+	got := formatDanmakuSendAcceptedStatus(1, true)
+	if got != "第 1 条弹幕已发送，正在等待直播间显示……" {
+		t.Fatalf("formatDanmakuSendAcceptedStatus(1, true) = %q", got)
 	}
-
-	// 1. 测试标准 KeyCtrlH / KeyBackspace（ASCII 8）
-	bsEvent := tcell.NewEventKey(tcell.KeyCtrlH, 0, tcell.ModNone)
-	if got := handler(bsEvent); got == nil {
-		t.Fatal("KeyCtrlH (Backspace) was intercepted as navigation instead of being passed to input field")
+	got = formatDanmakuSendAcceptedStatus(2, false)
+	if got != "第 2 条弹幕已发送（弹幕服务正在连接，暂未收到实时回显）。" {
+		t.Fatalf("formatDanmakuSendAcceptedStatus(2, false) = %q", got)
 	}
-
-	// 2. 测试 rune '\b'
-	rawControl := tcell.NewEventKey(tcell.KeyRune, '\b', tcell.ModNone)
-	if got := handler(rawControl); got == nil || got.Key() != tcell.KeyBackspace {
-		t.Fatal("Raw rune '\\b' was intercepted as navigation instead of being converted to KeyBackspace")
+	got = formatDanmakuSendTimeoutStatus(1, true)
+	if got != "第 1 条弹幕已发送（若直播间未显示，可能被 B 站审核过滤）。" {
+		t.Fatalf("formatDanmakuSendTimeoutStatus(1, true) = %q", got)
 	}
-
-	// 3. 测试 Alt+H 仍能触发导航
-	altH := tcell.NewEventKey(tcell.KeyRune, 'h', tcell.ModAlt)
-	if got := handler(altH); got != nil {
-		t.Fatal("Alt+H was not intercepted as navigation")
+	got = formatDanmakuSendTimeoutStatus(2, false)
+	if got != "第 2 条弹幕已发送（弹幕服务未连接，未收到实时回显）。" {
+		t.Fatalf("formatDanmakuSendTimeoutStatus(2, false) = %q", got)
 	}
-}
-
-func TestRoomManagementShortcutSupportsDistinctCtrlMAndAltM(t *testing.T) {
-	for _, modifier := range []tcell.ModMask{tcell.ModCtrl, tcell.ModAlt} {
-		event := tcell.NewEventKey(tcell.KeyRune, 'm', modifier)
-		if !matchesRoomManagementShortcut(event) {
-			t.Fatalf("M with modifier %v was not recognized", modifier)
-		}
+	got = formatDanmakuSendConfirmedStatus(3)
+	if got != "第 3 条弹幕已在直播间显示。" {
+		t.Fatalf("formatDanmakuSendConfirmedStatus(3) = %q", got)
 	}
-	if matchesRoomManagementShortcut(tcell.NewEventKey(tcell.KeyEnter, 0, tcell.ModNone)) {
-		t.Fatal("Enter was mistaken for the room management shortcut")
+	got = formatDanmakuSendConfirmedStatus(0)
+	if got != "弹幕已在直播间显示。" {
+		t.Fatalf("formatDanmakuSendConfirmedStatus(0) = %q", got)
 	}
 }
 
@@ -654,369 +795,129 @@ func TestAppendDanmakuEventSpecialKinds(t *testing.T) {
 	}
 }
 
-func TestGiftPanelRenderAndAggregation(t *testing.T) {
-	applyTheme()
-	var selected api.DanmakuMessage
-	closed := false
-	panel := newGiftPanel(func(msg api.DanmakuMessage) {
-		selected = msg
-	}, func() {
-		closed = true
-	})
+func TestGiftComboInPlaceUpdate(t *testing.T) {
+	session := &LiveDanmakuSession{
+		history:     make([]api.DanmakuEvent, 0),
+		subscribers: make(map[chan struct{}]struct{}),
+	}
 
 	now := time.Now()
-	snapshot := liveDanmakuSnapshot{
-		stats: api.LiveSessionStats{
-			GiftGoldCoin:   25000, // 25 CNY
-			SuperChatPrice: 50,    // 50 CNY
-			GuardCount:     1,
-		},
-		gifts: []api.DanmakuEvent{
-			{
-				Kind: api.DanmakuEventGift,
-				Message: api.DanmakuMessage{
-					UserID:     "201",
-					Username:   "大哥A",
-					Text:       "投喂 摩天大楼 ×1 (25000电池)",
-					Price:      25,
-					GuardLevel: 0,
-					Timestamp:  now,
-				},
-			},
-			{
-				Kind: api.DanmakuEventSuperChat,
-				Message: api.DanmakuMessage{
-					UserID:     "202",
-					Username:   "醒目B",
-					Text:       "醒目留言 ¥50: 加油！",
-					Price:      50,
-					GuardLevel: 3,
-					Timestamp:  now,
-				},
-			},
+	// 第一击：辣条 x1 (combo 1)
+	first := api.DanmakuEvent{
+		Kind: api.DanmakuEventGift,
+		Message: api.DanmakuMessage{
+			UserID:        "1001",
+			Username:      "水友A",
+			GiftName:      "辣条",
+			GiftCount:     1,
+			GiftCombo:     1,
+			BatchComboID:  "batch_001",
+			GiftTotalCoin: 100,
+			Text:          "投喂 辣条 ×1",
+			Timestamp:     now,
 		},
 	}
+	session.handleEvent(first)
 
-	panel.Update(snapshot)
-
-	// Summary check
-	summaryText := panel.summaryView.GetText(true)
-	if !strings.Contains(summaryText, "总收益折合") || !strings.Contains(summaryText, "¥75.00") {
-		t.Fatalf("gift panel summary = %q, want total ¥75.00", summaryText)
+	if len(session.history) != 1 {
+		t.Fatalf("history len = %d, want 1", len(session.history))
 	}
-
-	// Tab Log check (倒序：最新收到的醒目B在第一行)
-	if panel.table.GetRowCount() != 3 { // 1 header + 2 rows
-		t.Fatalf("gift table row count = %d, want 3", panel.table.GetRowCount())
-	}
-	nameCell := panel.table.GetCell(1, 1).Text
-	if !strings.Contains(nameCell, "醒目B") {
-		t.Fatalf("row 1 name cell = %q, want 醒目B", nameCell)
+	if session.history[0].Message.GiftCombo != 1 {
+		t.Fatalf("gift combo = %d, want 1", session.history[0].Message.GiftCombo)
 	}
 
-	// Select row 1 in Tab Log
-	panel.table.Select(1, 0)
-	if handler := panel.table.InputHandler(); handler != nil {
-		handler(tcell.NewEventKey(tcell.KeyEnter, 0, tcell.ModNone), nil)
-		if selected.Username != "醒目B" || selected.UserID != "202" {
-			t.Fatalf("selected user = %#v", selected)
-		}
+	// 第二击：同用户同批次辣条 (combo 2)
+	second := api.DanmakuEvent{
+		Kind: api.DanmakuEventGift,
+		Message: api.DanmakuMessage{
+			UserID:        "1001",
+			Username:      "水友A",
+			GiftName:      "辣条",
+			GiftCount:     1,
+			GiftCombo:     2,
+			BatchComboID:  "batch_001",
+			GiftTotalCoin: 200,
+			Text:          "投喂 辣条 ×1 (连击x2)",
+			Timestamp:     now.Add(500 * time.Millisecond),
+		},
+	}
+	session.handleEvent(second)
+
+	// 连击合并后历史长度仍为 1，但内容已更新为连击x2
+	if len(session.history) != 1 {
+		t.Fatalf("history len after combo = %d, want 1 (in-place update)", len(session.history))
+	}
+	if session.history[0].Message.GiftCombo != 2 {
+		t.Fatalf("gift combo = %d, want 2", session.history[0].Message.GiftCombo)
+	}
+	if !strings.Contains(session.history[0].Message.Text, "连击x2") {
+		t.Fatalf("gift text = %q, want containing 连击x2", session.history[0].Message.Text)
 	}
 
-	// Switch to Leaderboard Tab
-	panel.currentTab = giftTabRank
-	panel.render()
-	if panel.table.GetRowCount() != 3 {
-		t.Fatalf("rank table row count = %d, want 3", panel.table.GetRowCount())
-	}
-	firstRankUser := panel.table.GetCell(1, 1).Text
-	if !strings.Contains(firstRankUser, "醒目B") { // 50 CNY > 25 CNY
-		t.Fatalf("expected 醒目B to be rank 1, got %q", firstRankUser)
-	}
-
-	// Tab key cycling test
-	inputCap := panel.table.GetInputCapture()
-	if inputCap == nil {
-		t.Fatalf("expected table input capture handler")
-	}
-	// From Rank tab, Tab should switch to Log tab
-	inputCap(tcell.NewEventKey(tcell.KeyTab, 0, tcell.ModNone))
-	if panel.currentTab != giftTabLog {
-		t.Fatalf("expected currentTab to be giftTabLog after Tab, got %v", panel.currentTab)
-	}
-	// From Log tab, Tab should switch back to Rank tab
-	inputCap(tcell.NewEventKey(tcell.KeyTab, 0, tcell.ModNone))
-	if panel.currentTab != giftTabRank {
-		t.Fatalf("expected currentTab to be giftTabRank after second Tab, got %v", panel.currentTab)
+	// 测试 updateDanmakuHistory 在连击原地更新时会触发重新渲染而不是在末尾硬追加新行
+	chat := tview.NewTextView().SetMaxLines(danmakuHistoryLimit)
+	rev := updateDanmakuHistory(chat, liveDanmakuSnapshot{
+		history:         []api.DanmakuEvent{first},
+		historyRevision: 1,
+	}, 0)
+	textBefore := chat.GetText(true)
+	if !strings.Contains(textBefore, "投喂 辣条 ×1") || strings.Contains(textBefore, "连击x2") {
+		t.Fatalf("initial chat render error: %q", textBefore)
 	}
 
-	// Close button test
-	closedByBtn := false
-	panel.onClose = func() { closedByBtn = true }
-	if handler := panel.closeBtn.InputHandler(); handler != nil {
-		handler(tcell.NewEventKey(tcell.KeyEnter, 0, tcell.ModNone), nil)
-		if !closedByBtn {
-			t.Fatalf("expected closeBtn to invoke onClose")
-		}
+	// 连击更新快照：history 长度仍为 1，revision 变为 2
+	rev = updateDanmakuHistory(chat, liveDanmakuSnapshot{
+		history:         []api.DanmakuEvent{session.history[0]},
+		historyRevision: 2,
+	}, rev)
+	textAfter := chat.GetText(true)
+	if !strings.Contains(textAfter, "连击x2") {
+		t.Fatalf("chat text after combo update = %q, want containing 连击x2", textAfter)
 	}
-
-	// 'q' key close test
-	closedByQ := false
-	panel.onClose = func() { closedByQ = true }
-	inputCap(tcell.NewEventKey(tcell.KeyRune, 'q', tcell.ModNone))
-	if !closedByQ {
-		t.Fatalf("expected 'q' to invoke onClose")
-	}
-
-	// Update no-op test: identical snapshot should not modify row count or rebuild table
-	panel.currentTab = giftTabLog
-	panel.render()
-	rowCountBefore := panel.table.GetRowCount()
-	panel.Update(snapshot)
-	if panel.table.GetRowCount() != rowCountBefore {
-		t.Fatalf("Update with identical snapshot altered row count: %d -> %d", rowCountBefore, panel.table.GetRowCount())
-	}
-
-	// Empty state test: 0 gifts
-	emptyPanel := newGiftPanel(nil, nil)
-	emptyPanel.Update(liveDanmakuSnapshot{})
-	if emptyPanel.table.GetRowCount() < 2 {
-		t.Fatalf("empty table should have at least 2 rows (header + empty placeholder), got %d", emptyPanel.table.GetRowCount())
-	}
-	placeholderText := emptyPanel.table.GetCell(1, 1).Text
-	if !strings.Contains(placeholderText, "暂未收到打赏记录") {
-		t.Fatalf("empty table placeholder = %q, want 暂未收到打赏记录", placeholderText)
-	}
-	emptyPanel.currentTab = giftTabRank
-	emptyPanel.render()
-	rankPlaceholder := emptyPanel.table.GetCell(1, 1).Text
-	if !strings.Contains(rankPlaceholder, "暂无送礼观众") {
-		t.Fatalf("empty rank table placeholder = %q, want 暂无送礼观众", rankPlaceholder)
-	}
-
-	// Esc test
-	closed = false
-	panel.onClose = func() { closed = true }
-	inputCap(tcell.NewEventKey(tcell.KeyEscape, 0, tcell.ModNone))
-	if !closed {
-		t.Fatalf("expected onClose to be called on Esc")
+	if strings.Count(textAfter, "水友A") != 1 {
+		t.Fatalf("expected single line for user A, got %d occurrences in %q", strings.Count(textAfter, "水友A"), textAfter)
 	}
 }
 
-func TestDanmakuHelpPanel(t *testing.T) {
-	applyTheme()
-	closed := false
-	panel, content, closeBtn := newDanmakuHelpPanel(func() {
-		closed = true
-	})
-
-	if panel == nil || content == nil || closeBtn == nil {
-		t.Fatalf("newDanmakuHelpPanel returned nil components")
+func TestGuardDeduplication(t *testing.T) {
+	session := &LiveDanmakuSession{
+		history:     make([]api.DanmakuEvent, 0),
+		subscribers: make(map[chan struct{}]struct{}),
 	}
-
-	title := panel.GetTitle()
-	if !strings.Contains(title, "快捷键与操作指南") {
-		t.Fatalf("help panel title = %q, want 快捷键与操作指南", title)
-	}
-
-	text := content.GetText(true)
-	requiredPhrases := []string{
-		"【 弹幕互动 】",
-		"Enter",
-		"Ctrl+U",
-		"Ctrl+L",
-		"【 看板与工具 】",
-		"Ctrl+R / Alt+R",
-		"Ctrl+G / Alt+G",
-		"Ctrl+M / Alt+M",
-		"【 系统与退出 】",
-		"Ctrl+? / Alt+?",
-		"Esc",
-		"Ctrl+C",
-	}
-	for _, phrase := range requiredPhrases {
-		if !strings.Contains(text, phrase) {
-			t.Fatalf("help text missing required phrase %q, full text:\n%s", phrase, text)
-		}
-	}
-
-	// Test close button
-	if closeBtn.GetLabel() == "" {
-		t.Fatalf("close button has empty label")
-	}
-	// Simulate button select
-	if handler := closeBtn.InputHandler(); handler != nil {
-		handler(tcell.NewEventKey(tcell.KeyEnter, 0, tcell.ModNone), nil)
-		if !closed {
-			t.Fatalf("expected close button to invoke onClose callback")
-		}
-	}
-}
-
-func TestGiftPanelLeaderboardMultiUser(t *testing.T) {
-	applyTheme()
-	panel := newGiftPanel(nil, nil)
-
 	now := time.Now()
-	snapshot := liveDanmakuSnapshot{
-		stats: api.LiveSessionStats{
-			GiftGoldCoin:   10000, // 10 CNY
-			SuperChatPrice: 100,   // 100 CNY
-			SuperChatCount: 2,
-			GuardCount:     1,
-		},
-		gifts: []api.DanmakuEvent{
-			{
-				Kind: api.DanmakuEventGift,
-				Message: api.DanmakuMessage{
-					UserID:        "100",
-					Username:      "普通观众",
-					GiftName:      "辣条",
-					GiftCount:     10,
-					GiftCoinType:  "gold",
-					GiftTotalCoin: 10000,
-					GiftCombo:     2,
-					Timestamp:     now.Add(-3 * time.Minute),
-				},
-			},
-			{
-				Kind: api.DanmakuEventSuperChat,
-				Message: api.DanmakuMessage{
-					UserID:     "101",
-					Username:   "富哥",
-					Text:       "开播大吉！",
-					Price:      100,
-					GuardLevel: 0,
-					Timestamp:  now.Add(-2 * time.Minute),
-				},
-			},
-			{
-				Kind: api.DanmakuEventGuard,
-				Message: api.DanmakuMessage{
-					UserID:     "102",
-					Username:   "大哥船长",
-					GiftName:   "舰长",
-					GiftCount:  1,
-					Price:      198,
-					GuardLevel: 3,
-					Timestamp:  now.Add(-1 * time.Minute),
-				},
-			},
+
+	// 模拟 GUARD_BUY
+	buy := api.DanmakuEvent{
+		Kind: api.DanmakuEventGuard,
+		Message: api.DanmakuMessage{
+			UserID:     "5001",
+			Username:   "船长大哥",
+			Text:       "登船成为 舰长 ×1个月",
+			GuardLevel: 3,
+			Timestamp:  now,
 		},
 	}
+	session.handleEvent(buy)
 
-	panel.Update(snapshot)
+	// 模拟同时到达的 USER_TOAST_MSG
+	toast := api.DanmakuEvent{
+		Kind: api.DanmakuEventGuard,
+		Message: api.DanmakuMessage{
+			UserID:     "5001",
+			Username:   "船长大哥",
+			Text:       "登船成为 舰长 ×1月",
+			GuardLevel: 3,
+			Timestamp:  now.Add(100 * time.Millisecond),
+		},
+	}
+	session.handleEvent(toast)
 
-	// Check summary: total = 10 (gift) + 100 (SC) + 198 (Guard) = 308.00
-	summary := panel.summaryView.GetText(true)
-	if !strings.Contains(summary, "¥308.00") {
-		t.Fatalf("expected total ¥308.00 in summary, got: %s", summary)
-	}
-
-	// Check rank: 大哥船长(198) > 富哥(100) > 普通观众(10)
-	panel.currentTab = giftTabRank
-	panel.render()
-
-	if panel.table.GetRowCount() != 4 { // 1 header + 3 users
-		t.Fatalf("rank row count = %d, want 4", panel.table.GetRowCount())
-	}
-	rank1Name := panel.table.GetCell(1, 1).Text
-	if !strings.Contains(rank1Name, "大哥船长") {
-		t.Errorf("rank 1 want 大哥船长, got %q", rank1Name)
-	}
-	rank1Val := panel.table.GetCell(1, 3).Text
-	if !strings.Contains(rank1Val, "¥198.00") {
-		t.Errorf("rank 1 value want ¥198.00, got %q", rank1Val)
-	}
-
-	rank2Name := panel.table.GetCell(2, 1).Text
-	if !strings.Contains(rank2Name, "富哥") {
-		t.Errorf("rank 2 want 富哥, got %q", rank2Name)
-	}
-	rank3Name := panel.table.GetCell(3, 1).Text
-	if !strings.Contains(rank3Name, "普通观众") {
-		t.Errorf("rank 3 want 普通观众, got %q", rank3Name)
+	// 防重机制应确保只生成 1 条大航海历史记录
+	if len(session.history) != 1 {
+		t.Fatalf("history len = %d, want 1 after duplicate guard event", len(session.history))
 	}
 }
 
 type assertError string
 
 func (err assertError) Error() string { return string(err) }
-
-func TestMatchesHelpShortcut(t *testing.T) {
-	cases := []struct {
-		name     string
-		event    *tcell.EventKey
-		expected bool
-	}{
-		{
-			name:     "nil event",
-			event:    nil,
-			expected: false,
-		},
-		{
-			name:     "plain question mark without modifier (typing in input box)",
-			event:    tcell.NewEventKey(tcell.KeyRune, '?', tcell.ModNone),
-			expected: false,
-		},
-		{
-			name:     "plain slash without modifier",
-			event:    tcell.NewEventKey(tcell.KeyRune, '/', tcell.ModNone),
-			expected: false,
-		},
-		{
-			name:     "plain full-width question mark (Chinese)",
-			event:    tcell.NewEventKey(tcell.KeyRune, '？', tcell.ModNone),
-			expected: false,
-		},
-		{
-			name:     "Ctrl+?",
-			event:    tcell.NewEventKey(tcell.KeyRune, '?', tcell.ModCtrl),
-			expected: true,
-		},
-		{
-			name:     "Ctrl+/",
-			event:    tcell.NewEventKey(tcell.KeyRune, '/', tcell.ModCtrl),
-			expected: true,
-		},
-		{
-			name:     "Alt+?",
-			event:    tcell.NewEventKey(tcell.KeyRune, '?', tcell.ModAlt),
-			expected: true,
-		},
-		{
-			name:     "Alt+/",
-			event:    tcell.NewEventKey(tcell.KeyRune, '/', tcell.ModAlt),
-			expected: true,
-		},
-		{
-			name:     "KeyCtrlUnderscore (traditional terminal Ctrl+/)",
-			event:    tcell.NewEventKey(tcell.KeyCtrlUnderscore, 0, tcell.ModNone),
-			expected: true,
-		},
-		{
-			name:     "KeyF1",
-			event:    tcell.NewEventKey(tcell.KeyF1, 0, tcell.ModNone),
-			expected: true,
-		},
-		{
-			name:     "Unrelated plain rune",
-			event:    tcell.NewEventKey(tcell.KeyRune, 'r', tcell.ModNone),
-			expected: false,
-		},
-		{
-			name:     "Unrelated Ctrl key",
-			event:    tcell.NewEventKey(tcell.KeyCtrlR, 0, tcell.ModCtrl),
-			expected: false,
-		},
-	}
-
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			got := matchesHelpShortcut(tc.event)
-			if got != tc.expected {
-				t.Fatalf("matchesHelpShortcut() = %v, want %v", got, tc.expected)
-			}
-		})
-	}
-}

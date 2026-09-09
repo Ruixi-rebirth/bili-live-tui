@@ -6,12 +6,41 @@ import (
 	"time"
 
 	"bili-live-tui/internal/api"
-	"github.com/rivo/tview"
 )
 
 const danmakuHistoryLimit = 500
 
 const onlineRankRefreshInterval = 15 * time.Second
+
+type danmakuConnectionPhase uint8
+
+const (
+	danmakuConnectionConnecting danmakuConnectionPhase = iota
+	danmakuConnectionAuthenticating
+	danmakuConnectionConnected
+	danmakuConnectionRetrying
+)
+
+type danmakuConnectionState struct {
+	phase      danmakuConnectionPhase
+	attempt    int
+	endpoint   string
+	lastError  string
+	retryDelay time.Duration
+	confirmed  bool
+}
+
+func (state danmakuConnectionState) connected() bool {
+	return state.phase == danmakuConnectionConnected
+}
+
+type danmakuStreamConnection interface {
+	Events() <-chan api.DanmakuEvent
+	Errors() <-chan error
+	Close()
+}
+
+type danmakuStreamConnector func(context.Context) (danmakuStreamConnection, error)
 
 // LiveDanmakuSession 独立于任意终端页面管理 WebSocket。
 // 弹幕页和概览可以反复创建，而会话继续接收消息并保存有限长度的内存历史。
@@ -23,8 +52,7 @@ type LiveDanmakuSession struct {
 	mu              sync.RWMutex
 	history         []api.DanmakuEvent
 	historyRevision uint64
-	status          string
-	placeholder     string
+	connection      danmakuConnectionState
 	draft           string
 	online          int64
 	onlineKnown     bool
@@ -37,8 +65,8 @@ type LiveDanmakuSession struct {
 	guardKnown      bool
 	guardMembers    []api.GuardMember
 	guardError      string
-	gifts           []api.DanmakuEvent
 	stats           api.LiveSessionStats
+	liveState       string
 	subscribers     map[chan struct{}]struct{}
 	closed          bool
 }
@@ -46,8 +74,7 @@ type LiveDanmakuSession struct {
 type liveDanmakuSnapshot struct {
 	history         []api.DanmakuEvent
 	historyRevision uint64
-	status          string
-	placeholder     string
+	connection      danmakuConnectionState
 	draft           string
 	online          int64
 	onlineKnown     bool
@@ -59,7 +86,6 @@ type liveDanmakuSnapshot struct {
 	guardKnown      bool
 	guardMembers    []api.GuardMember
 	guardError      string
-	gifts           []api.DanmakuEvent
 	stats           api.LiveSessionStats
 }
 
@@ -84,27 +110,17 @@ func newLiveDanmakuSessionWithConnector(ctx context.Context, connect danmakuStre
 		ctx:         sessionCtx,
 		cancel:      cancel,
 		done:        make(chan struct{}),
-		status:      "正在连接弹幕服务……",
-		placeholder: "正在连接弹幕服务器……",
+		connection:  danmakuConnectionState{phase: danmakuConnectionConnecting, attempt: 1},
 		subscribers: make(map[chan struct{}]struct{}),
 	}
-
-	statusView := tview.NewTextView().SetText(session.status)
-	chatView := tview.NewTextView().SetText(session.placeholder)
-	queueState := func(update func()) {
-		update()
-		session.updateConnectionState(statusView.GetText(true), chatView.GetText(true))
-	}
-	go runDanmakuStreamWithConnector(sessionCtx, connect, queueState, session.handleEvent, statusView, chatView, session.done)
+	go runDanmakuStreamWithConnector(sessionCtx, connect, session.updateConnectionState, session.handleEvent, session.done)
 	return session
 }
 
-func (s *LiveDanmakuSession) updateConnectionState(status, placeholder string) {
+func (s *LiveDanmakuSession) updateConnectionState(state danmakuConnectionState) {
 	s.mu.Lock()
-	changed := s.status != status || s.placeholder != placeholder
-	s.status = status
-	s.placeholder = placeholder
-	if changed {
+	if s.connection != state {
+		s.connection = state
 		s.notifyLocked()
 	}
 	s.mu.Unlock()
@@ -119,10 +135,62 @@ func (s *LiveDanmakuSession) handleEvent(event api.DanmakuEvent) {
 		return
 	}
 	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if event.Kind == api.DanmakuEventSystem && (event.Command == "LIVE" || event.Command == "PREPARING") {
+		if s.liveState == event.Command {
+			return
+		}
+		s.liveState = event.Command
+	}
 	if event.Kind == api.DanmakuEventGift || event.Kind == api.DanmakuEventSuperChat || event.Kind == api.DanmakuEventGuard {
 		s.stats.Observe(event)
-		s.gifts = append(s.gifts, event)
 	}
+
+	// 大航海防重：B 站上舰常同时推送 GUARD_BUY 与 USER_TOAST_MSG，避免短时间内重复记录同一笔开通
+	if event.Kind == api.DanmakuEventGuard {
+		for i := len(s.history) - 1; i >= 0 && i >= len(s.history)-5; i-- {
+			h := s.history[i]
+			if h.Kind == api.DanmakuEventGuard &&
+				h.Message.UserID != "" && h.Message.UserID == event.Message.UserID &&
+				event.Message.Timestamp.Sub(h.Message.Timestamp) < 5*time.Second {
+				return
+			}
+		}
+	}
+
+	// 连击礼物合并：当用户连续送出同种礼物时原地更新连击次数与总价值，避免暴风刷屏
+	if event.Kind == api.DanmakuEventGift && (event.Message.GiftCombo > 1 || event.Message.BatchComboID != "") {
+		for i := len(s.history) - 1; i >= 0 && i >= len(s.history)-10; i-- {
+			h := &s.history[i]
+			if h.Kind != api.DanmakuEventGift {
+				continue
+			}
+			sameUser := (event.Message.UserID != "" && h.Message.UserID == event.Message.UserID) ||
+				(event.Message.Username != "" && h.Message.Username == event.Message.Username)
+			sameGift := h.Message.GiftName == event.Message.GiftName
+			withinWindow := event.Message.Timestamp.Sub(h.Message.Timestamp) < 15*time.Second
+			sameBatch := event.Message.BatchComboID != "" && h.Message.BatchComboID == event.Message.BatchComboID
+
+			if sameUser && sameGift && (sameBatch || withinWindow) {
+				if event.Message.GiftCombo > h.Message.GiftCombo {
+					h.Message.GiftCombo = event.Message.GiftCombo
+				}
+				if event.Message.GiftTotalCoin > h.Message.GiftTotalCoin {
+					h.Message.GiftTotalCoin = event.Message.GiftTotalCoin
+				}
+				if event.Message.BatchComboID != "" {
+					h.Message.BatchComboID = event.Message.BatchComboID
+				}
+				h.Message.Text = event.Message.Text
+				h.Message.Timestamp = event.Message.Timestamp
+				s.historyRevision++
+				s.notifyLocked()
+				return
+			}
+		}
+	}
+
 	s.history = append(s.history, event)
 	if overflow := len(s.history) - danmakuHistoryLimit; overflow > 0 {
 		copy(s.history, s.history[overflow:])
@@ -130,7 +198,6 @@ func (s *LiveDanmakuSession) handleEvent(event api.DanmakuEvent) {
 	}
 	s.historyRevision++
 	s.notifyLocked()
-	s.mu.Unlock()
 }
 
 func (s *LiveDanmakuSession) snapshot() liveDanmakuSnapshot {
@@ -139,8 +206,7 @@ func (s *LiveDanmakuSession) snapshot() liveDanmakuSnapshot {
 	return liveDanmakuSnapshot{
 		history:         append([]api.DanmakuEvent(nil), s.history...),
 		historyRevision: s.historyRevision,
-		status:          s.status,
-		placeholder:     s.placeholder,
+		connection:      s.connection,
 		draft:           s.draft,
 		online:          s.online,
 		onlineKnown:     s.onlineKnown,
@@ -152,7 +218,6 @@ func (s *LiveDanmakuSession) snapshot() liveDanmakuSnapshot {
 		guardKnown:      s.guardKnown,
 		guardMembers:    append([]api.GuardMember(nil), s.guardMembers...),
 		guardError:      s.guardError,
-		gifts:           append([]api.DanmakuEvent(nil), s.gifts...),
 		stats:           s.stats,
 	}
 }
@@ -169,6 +234,9 @@ func (s *LiveDanmakuSession) pollOnlineRank(client *api.Client, roomID, sessdata
 		s.mu.Lock()
 		defer s.mu.Unlock()
 		changed := false
+		if rankErr != nil || guardErr != nil {
+			client.CloseIdleConnections()
+		}
 		if rankErr != nil {
 			if s.onlineRankError != rankErr.Error() {
 				s.onlineRankError = rankErr.Error()
@@ -258,7 +326,6 @@ func (s *LiveDanmakuSession) ClearHistory() {
 	s.mu.Lock()
 	s.history = nil
 	s.historyRevision++
-	s.placeholder = "暂无弹幕记录。"
 	s.notifyLocked()
 	s.mu.Unlock()
 }
@@ -319,6 +386,130 @@ func (s *LiveDanmakuSession) seedPopularityFromRoom(client *api.Client, roomID s
 	cancel()
 	if err == nil && snapshot.OnlineKnown {
 		s.ObservePopularity(snapshot.Online, time.Now())
+	}
+}
+
+func runDanmakuStreamWithConnector(
+	ctx context.Context,
+	connect danmakuStreamConnector,
+	updateState func(danmakuConnectionState),
+	handleEvent func(api.DanmakuEvent),
+	done chan<- struct{},
+) {
+	defer close(done)
+	failures := 0
+	for {
+		attempt := failures + 1
+		updateState(danmakuConnectionState{phase: danmakuConnectionConnecting, attempt: attempt})
+		stream, err := connect(ctx)
+		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			failures++
+			delay := danmakuRetryDelay(failures)
+			updateState(danmakuConnectionState{
+				phase:      danmakuConnectionRetrying,
+				attempt:    attempt,
+				lastError:  err.Error(),
+				retryDelay: delay,
+			})
+			if !waitDanmakuRetry(ctx, delay) {
+				return
+			}
+			continue
+		}
+
+		endpoint := ""
+		if details, ok := stream.(interface{ Endpoint() string }); ok {
+			endpoint = details.Endpoint()
+		}
+		updateState(danmakuConnectionState{
+			phase:    danmakuConnectionAuthenticating,
+			attempt:  attempt,
+			endpoint: endpoint,
+		})
+
+		confirmed := false
+		ended := false
+		lastError := ""
+		events := stream.Events()
+		errors := stream.Errors()
+		for !ended {
+			select {
+			case <-ctx.Done():
+				stream.Close()
+				ended = true
+			case event, ok := <-events:
+				if !ok {
+					events = nil
+					ended = errors == nil
+					continue
+				}
+				if !confirmed && event.Kind == api.DanmakuEventConnected {
+					confirmed = true
+					updateState(danmakuConnectionState{
+						phase:     danmakuConnectionConnected,
+						attempt:   attempt,
+						endpoint:  endpoint,
+						confirmed: true,
+					})
+				}
+				handleEvent(event)
+			case streamErr, ok := <-errors:
+				if ok && streamErr != nil {
+					lastError = streamErr.Error()
+				} else if !ok {
+					errors = nil
+					ended = events == nil
+				}
+			}
+		}
+		stream.Close()
+		if ctx.Err() != nil {
+			return
+		}
+
+		if confirmed {
+			failures = 0
+		} else {
+			failures++
+		}
+		delay := danmakuRetryDelay(failures)
+		updateState(danmakuConnectionState{
+			phase:      danmakuConnectionRetrying,
+			attempt:    attempt,
+			endpoint:   endpoint,
+			lastError:  lastError,
+			retryDelay: delay,
+			confirmed:  confirmed,
+		})
+		if !waitDanmakuRetry(ctx, delay) {
+			return
+		}
+	}
+}
+
+func danmakuRetryDelay(failures int) time.Duration {
+	delays := [...]time.Duration{time.Second, 2 * time.Second, 5 * time.Second, 10 * time.Second, 15 * time.Second}
+	if failures <= 0 {
+		return delays[0]
+	}
+	index := failures - 1
+	if index >= len(delays) {
+		index = len(delays) - 1
+	}
+	return delays[index]
+}
+
+func waitDanmakuRetry(ctx context.Context, delay time.Duration) bool {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
 	}
 }
 

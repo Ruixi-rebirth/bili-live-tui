@@ -66,16 +66,16 @@ func TestDisplayOnlyPrimitiveCannotReceiveFocus(t *testing.T) {
 	flex.MouseHandler()(tview.MouseMove, tcell.NewEventMouse(1, 1, tcell.ButtonNone, tcell.ModNone), func(tview.Primitive) {})
 }
 
-func TestLiveInfoSummaryShowsSessionGiftStats(t *testing.T) {
+func TestLiveInfoSummaryMetadata(t *testing.T) {
 	summary := liveInfoSummaryWithStats("123", api.LiveSettings{
 		Title:  "测试直播",
 		AreaID: "376",
-	}, nil, nil, &api.LiveSessionStats{
-		GiftEvents: 2,
-		GiftCount:  5,
-	})
-	if !strings.Contains(summary, "本场礼物[-]　2 次 / 共 5 个") {
-		t.Fatalf("summary does not contain session gift stats: %s", summary)
+	}, nil, nil, nil)
+	if !strings.Contains(summary, "房间号[-]　123") || !strings.Contains(summary, "标题[-]　测试直播") {
+		t.Fatalf("summary does not contain room info: %s", summary)
+	}
+	if strings.Contains(summary, "本场礼物") {
+		t.Fatalf("summary should not contain gift stats: %s", summary)
 	}
 }
 
@@ -112,6 +112,19 @@ func TestFormatStreamHealth(t *testing.T) {
 	confirmingText := formatStreamHealth(streamruntime.Health{Mode: streamruntime.ModeFFmpegTest, Reconnecting: true, LastError: "FFmpeg 已启动，正在确认有效编码帧"})
 	if !strings.Contains(confirmingText, "正在确认") || strings.Contains(confirmingText, "正在重连") {
 		t.Fatalf("confirming health text = %q", confirmingText)
+	}
+	stalledText := formatStreamHealth(streamruntime.Health{
+		Mode:        streamruntime.ModeOBS,
+		Active:      true,
+		Duration:    10 * time.Second,
+		BitrateKbps: 0,
+		LastError:   "推流无上传数据，网络可能已中断",
+	})
+	if !strings.Contains(stalledText, "推流卡顿") || !strings.Contains(stalledText, "网络可能已中断") {
+		t.Fatalf("stalled health text = %q", stalledText)
+	}
+	if strings.Contains(stalledText, "推流正常") {
+		t.Fatalf("stalled stream must not be reported as normal: %q", stalledText)
 	}
 }
 
@@ -165,6 +178,9 @@ func TestNewHomeWorkspace(t *testing.T) {
 	if ws.root == nil {
 		t.Fatalf("ws.root is nil")
 	}
+	if ws.overview == nil {
+		t.Fatal("overview must be focusable")
+	}
 	if len(ws.buttons) != 4 {
 		t.Fatalf("expected 4 buttons (返回弹幕, 预览直播, 修改资料, 下播退出), got %d", len(ws.buttons))
 	}
@@ -180,6 +196,14 @@ func TestNewHomeWorkspace(t *testing.T) {
 	}
 	if label := ws.buttons[3].GetLabel(); label != "下播退出" {
 		t.Errorf("button 3 label = %q, want 下播退出", label)
+	}
+
+	app.SetFocus(ws.buttons[len(ws.buttons)-1])
+	if !navigateHomeWorkspace(app, ws, tcell.NewEventKey(tcell.KeyTab, 0, tcell.ModNone)) || app.GetFocus() != ws.overview {
+		t.Fatalf("Tab from final overview button did not focus scrollable overview: %v", app.GetFocus())
+	}
+	if !navigateHomeWorkspace(app, ws, tcell.NewEventKey(tcell.KeyTab, 0, tcell.ModNone)) || app.GetFocus() != ws.buttons[0] {
+		t.Fatalf("Tab from overview did not focus first button: %v", app.GetFocus())
 	}
 
 	// Trigger "返回弹幕"
@@ -198,4 +222,3 @@ func TestNewHomeWorkspace(t *testing.T) {
 		}
 	}
 }
-

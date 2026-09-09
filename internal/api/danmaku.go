@@ -24,22 +24,25 @@ import (
 const (
 	// DefaultDanmakuMaxLength 只在 B 站的账号/房间约束暂时无法取得时使用。
 	// 正常发送应优先使用 GetDanmakuMaxLength 返回的动态值。
-	DefaultDanmakuMaxLength    = 40
-	danmakuHeaderLength        = 16
-	danmakuProtocolPlain       = 0
-	danmakuProtocolHeartbeat   = 1
-	danmakuProtocolAuth        = 1
-	danmakuProtocolZlib        = 2
-	danmakuProtocolBrotli      = 3
-	danmakuOperationHeartbeat  = 2
-	danmakuOperationOnline     = 3
-	danmakuOperationCommand    = 5
-	danmakuOperationAuth       = 7
-	danmakuOperationAuthReply  = 8
-	danmakuHeartbeatInterval   = 30 * time.Second
-	danmakuWebSocketReadLimit  = 8 << 20
-	danmakuDecodedPayloadLimit = 16 << 20
-	danmakuPacketNestingLimit  = 4
+	DefaultDanmakuMaxLength      = 40
+	danmakuHeaderLength          = 16
+	danmakuProtocolPlain         = 0
+	danmakuProtocolHeartbeat     = 1
+	danmakuProtocolAuth          = 1
+	danmakuProtocolZlib          = 2
+	danmakuProtocolBrotli        = 3
+	danmakuOperationHeartbeat    = 2
+	danmakuOperationOnline       = 3
+	danmakuOperationCommand      = 5
+	danmakuOperationAuth         = 7
+	danmakuOperationAuthReply    = 8
+	danmakuHeartbeatInterval     = 30 * time.Second
+	danmakuAuthenticationTimeout = 12 * time.Second
+	danmakuReadTimeout           = 75 * time.Second
+	danmakuWriteTimeout          = 8 * time.Second
+	danmakuWebSocketReadLimit    = 8 << 20
+	danmakuDecodedPayloadLimit   = 16 << 20
+	danmakuPacketNestingLimit    = 4
 )
 
 // GetDanmakuMaxLength 返回 B 站网页端为当前账号和直播间下发的弹幕字数上限。
@@ -393,7 +396,7 @@ func (c *Client) getDanmakuInfoAt(ctx context.Context, path, roomID, sessdata, b
 		query.Set("room_id", strings.TrimSpace(roomID))
 	} else {
 		query.Set("id", strings.TrimSpace(roomID))
-		// 这些参数来自当前直播网页客户端；其中 web_location 用于让 B 站风控层
+		// 这些参数来自当前直播网页客户端，其中 web_location 用于让 B 站风控层
 		// 区分直播间页面请求和普通 API 探测。
 		query.Set("type", "0")
 		query.Set("web_location", "444.8")
@@ -492,6 +495,7 @@ type DanmakuMessage struct {
 	GiftCoinType  string // "gold"（付费电池/金瓜子）或 "silver"（免费银瓜子）
 	GiftTotalCoin int64  // 瓜子总价值（1000 金瓜子 = 10 电池 = 1 元）
 	GiftCombo     int    // 连击数
+	BatchComboID  string // 连击批次 ID
 	Price         int    // SC 醒目留言金额（元）或舰长折合人民币金额（元）
 	Duration      int    // SC 醒目留言悬挂保留时长（秒）
 	Timestamp     time.Time
@@ -506,7 +510,7 @@ type DanmakuEvent struct {
 }
 
 // LiveSessionStats 统计只有认证弹幕流才能观察到的本场数据。
-// 人气来自弹幕心跳；礼物统计限定在本场会话内，因为 B 站公开房间接口没有可靠的累计礼物总数。
+// 人气来自弹幕心跳，礼物统计限定在本场会话内，因为 B 站公开房间接口没有可靠的累计礼物总数。
 type LiveSessionStats struct {
 	GiftEvents      int64
 	GiftCount       int64
@@ -545,8 +549,7 @@ func (stats *LiveSessionStats) Observe(event DanmakuEvent) {
 	}
 }
 
-// DanmakuStream 管理一个已认证的直播弹幕 WebSocket。
-// 流结束时会关闭 Events 和 Errors；离开弹幕页时调用方应调用 Close。
+// DanmakuStream 管理一个直播弹幕 WebSocket，流结束时关闭 Events 和 Errors。
 type DanmakuStream struct {
 	conn       *websocket.Conn
 	endpoint   string
@@ -663,6 +666,10 @@ func danmakuWebSocketHeaders(roomID, sessdata, biliJCT string, identity danmakuI
 
 func (s *DanmakuStream) run(ctx context.Context, token, roomID string, identity danmakuIdentity) {
 	defer s.finish()
+	if err := s.conn.SetReadDeadline(time.Now().Add(danmakuAuthenticationTimeout)); err != nil {
+		s.emitError(fmt.Errorf("设置弹幕认证超时失败: %w", err))
+		return
+	}
 	authBody := danmakuAuthPayload(token, roomID, identity)
 	if err := s.writePacket(danmakuOperationAuth, danmakuProtocolAuth, authBody); err != nil {
 		s.emitError(fmt.Errorf("发送弹幕认证失败: %w", err))
@@ -739,23 +746,32 @@ func (c *Client) resolveDanmakuIdentity(ctx context.Context, sessdata, biliJCT s
 	}
 
 	c.danmakuIdentityMu.Lock()
-	defer c.danmakuIdentityMu.Unlock()
-	if c.danmakuIdentityFor == sessdata && c.danmakuIdentity.UID > 0 && c.danmakuIdentity.Buvid != "" && time.Since(c.danmakuIdentityAt) < danmakuIdentityCacheTTL {
-		return c.danmakuIdentity, nil
+	if c.danmakuIdentityFor == sessdata &&
+		c.danmakuIdentity.UID > 0 &&
+		c.danmakuIdentity.Buvid != "" &&
+		time.Since(c.danmakuIdentityAt) < danmakuIdentityCacheTTL {
+		identity := c.danmakuIdentity
+		c.danmakuIdentityMu.Unlock()
+		return identity, nil
 	}
+	c.danmakuIdentityMu.Unlock()
 
 	uid, err := c.getDanmakuUID(ctx, sessdata, biliJCT)
 	if err != nil {
+		c.CloseIdleConnections()
 		return danmakuIdentity{}, err
 	}
 	buvid, err := c.getDanmakuBuvid(ctx, sessdata, biliJCT)
 	if err != nil {
+		c.CloseIdleConnections()
 		return danmakuIdentity{}, err
 	}
 	identity := danmakuIdentity{UID: uid, Buvid: buvid}
+	c.danmakuIdentityMu.Lock()
 	c.danmakuIdentity = identity
 	c.danmakuIdentityFor = sessdata
 	c.danmakuIdentityAt = time.Now()
+	c.danmakuIdentityMu.Unlock()
 	return identity, nil
 }
 
@@ -773,10 +789,12 @@ func (c *Client) getDanmakuUID(ctx context.Context, sessdata, biliJCT string) (i
 	req.Header.Set("Cookie", browserCookie(sessdata, biliJCT))
 	resp, err := c.HTTPClient.Do(req)
 	if err != nil {
+		c.CloseIdleConnections()
 		return 0, fmt.Errorf("获取弹幕用户身份失败: %w", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		c.CloseIdleConnections()
 		return 0, fmt.Errorf("获取弹幕用户身份失败：远程服务器返回 HTTP %d", resp.StatusCode)
 	}
 	var raw struct {
@@ -814,10 +832,12 @@ func (c *Client) getDanmakuBuvid(ctx context.Context, sessdata, biliJCT string) 
 	req.Header.Set("Cookie", browserCookie(sessdata, biliJCT))
 	resp, err := c.HTTPClient.Do(req)
 	if err != nil {
+		c.CloseIdleConnections()
 		return "", fmt.Errorf("获取弹幕设备标识失败: %w", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		c.CloseIdleConnections()
 		return "", fmt.Errorf("获取弹幕设备标识失败：远程服务器返回 HTTP %d", resp.StatusCode)
 	}
 	var raw struct {
@@ -858,6 +878,7 @@ func danmakuBrowserCookie(sessdata, biliJCT string, identity danmakuIdentity) st
 
 func (s *DanmakuStream) readLoop(readErrors chan<- error) {
 	defer close(readErrors)
+	authenticated := false
 	for {
 		_, data, err := s.conn.ReadMessage()
 		if err != nil {
@@ -866,8 +887,22 @@ func (s *DanmakuStream) readLoop(readErrors chan<- error) {
 		}
 		events, parseErr := parseDanmakuPackets(data)
 		if parseErr != nil {
-			s.emitError(parseErr)
-			continue
+			readErrors <- parseErr
+			return
+		}
+		if !authenticated {
+			for _, event := range events {
+				if event.Kind == DanmakuEventConnected {
+					authenticated = true
+					break
+				}
+			}
+		}
+		if authenticated {
+			if err := s.conn.SetReadDeadline(time.Now().Add(danmakuReadTimeout)); err != nil {
+				readErrors <- fmt.Errorf("刷新弹幕读取超时失败: %w", err)
+				return
+			}
 		}
 		for _, event := range events {
 			if !s.emitEvent(event) {
@@ -912,6 +947,9 @@ func (s *DanmakuStream) writePacket(operation uint32, version uint16, body []byt
 	binary.BigEndian.PutUint32(packet[8:12], operation)
 	binary.BigEndian.PutUint32(packet[12:16], 1)
 	copy(packet[16:], body)
+	if err := s.conn.SetWriteDeadline(time.Now().Add(danmakuWriteTimeout)); err != nil {
+		return err
+	}
 	return s.conn.WriteMessage(websocket.BinaryMessage, packet)
 }
 
@@ -1069,6 +1107,8 @@ func parseDanmakuCommand(body []byte) (DanmakuEvent, bool, error) {
 		return parseDanmuMessage(envelope.Info, command)
 	case "SEND_GIFT":
 		return parseGift(envelope.Data, command)
+	case "COMBO_SEND":
+		return parseComboSend(envelope.Data, command)
 	case "SUPER_CHAT_MESSAGE", "SUPER_CHAT_MESSAGE_JPN":
 		return parseSuperChat(envelope.Data, command)
 	case "GUARD_BUY":
@@ -1124,7 +1164,7 @@ func parseDanmuMessage(raw json.RawMessage, command string) (DanmakuEvent, bool,
 		}
 	}
 	// 新版弹幕包会在 info[0][15].user 中附带更完整且结构化的用户信息。
-	// 旧包仍以上面的数组字段为准；这里仅覆盖实际存在的值。
+	// 旧包仍以上面的数组字段为准，这里仅覆盖实际存在的值。
 	applyStructuredDanmakuUser(fields[0], &message)
 	if strings.TrimSpace(message.Text) == "" {
 		return DanmakuEvent{}, false, nil
@@ -1134,16 +1174,25 @@ func parseDanmuMessage(raw json.RawMessage, command string) (DanmakuEvent, bool,
 
 func parseGift(raw json.RawMessage, command string) (DanmakuEvent, bool, error) {
 	var data struct {
-		UID         flexibleID    `json:"uid"`
-		Uname       string        `json:"uname"`
-		GiftName    string        `json:"giftName"`
-		Num         flexibleInt64 `json:"num"`
-		Action      string        `json:"action"`
-		CoinType    string        `json:"coin_type"`
-		TotalCoin   flexibleInt64 `json:"total_coin"`
-		ComboNum    flexibleInt64 `json:"combo_num"`
-		WealthLevel flexibleInt64 `json:"wealth_level"`
-		MedalInfo   struct {
+		UID            flexibleID    `json:"uid"`
+		Uname          string        `json:"uname"`
+		GiftName       string        `json:"giftName"`
+		Num            flexibleInt64 `json:"num"`
+		Action         string        `json:"action"`
+		CoinType       string        `json:"coin_type"`
+		TotalCoin      flexibleInt64 `json:"total_coin"`
+		ComboNum       flexibleInt64 `json:"combo_num"`
+		BatchComboID   string        `json:"batch_combo_id"`
+		WealthLevel    flexibleInt64 `json:"wealth_level"`
+		BatchComboSend *struct {
+			BatchComboID  string        `json:"batch_combo_id"`
+			BatchComboNum flexibleInt64 `json:"batch_combo_num"`
+			BlindGift     *struct {
+				OriginalGiftName string `json:"original_gift_name"`
+				GiftAction       string `json:"gift_action"`
+			} `json:"blind_gift"`
+		} `json:"batch_combo_send"`
+		MedalInfo struct {
 			MedalName  string        `json:"medal_name"`
 			MedalLevel flexibleInt64 `json:"medal_level"`
 			GuardLevel flexibleInt64 `json:"guard_level"`
@@ -1163,6 +1212,19 @@ func parseGift(raw json.RawMessage, command string) (DanmakuEvent, bool, error) 
 	if action == "" {
 		action = "送出"
 	}
+	batchComboID := strings.TrimSpace(data.BatchComboID)
+	combo := int(data.ComboNum)
+	if data.BatchComboSend != nil {
+		if batchComboID == "" {
+			batchComboID = strings.TrimSpace(data.BatchComboSend.BatchComboID)
+		}
+		if combo <= 0 && data.BatchComboSend.BatchComboNum > 0 {
+			combo = int(data.BatchComboSend.BatchComboNum)
+		}
+		if data.BatchComboSend.BlindGift != nil && strings.TrimSpace(data.BatchComboSend.BlindGift.GiftAction) != "" {
+			action = strings.TrimSpace(data.BatchComboSend.BlindGift.GiftAction)
+		}
+	}
 	var details []string
 	if data.CoinType == "gold" && data.TotalCoin > 0 {
 		battery := int64(data.TotalCoin) / 100
@@ -1170,7 +1232,6 @@ func parseGift(raw json.RawMessage, command string) (DanmakuEvent, bool, error) 
 			details = append(details, fmt.Sprintf("%d电池", battery))
 		}
 	}
-	combo := int(data.ComboNum)
 	if combo > 1 {
 		details = append(details, fmt.Sprintf("连击x%d", combo))
 	}
@@ -1189,12 +1250,85 @@ func parseGift(raw json.RawMessage, command string) (DanmakuEvent, bool, error) 
 		GiftCoinType:  data.CoinType,
 		GiftTotalCoin: int64(data.TotalCoin),
 		GiftCombo:     combo,
+		BatchComboID:  batchComboID,
 		MedalName:     strings.TrimSpace(data.MedalInfo.MedalName),
 		MedalLevel:    int(data.MedalInfo.MedalLevel),
 		GuardLevel:    int(data.MedalInfo.GuardLevel),
 		WealthLevel:   int(data.WealthLevel),
 		Timestamp:     time.Now(),
 	}}, true, nil
+}
+
+func parseComboSend(raw json.RawMessage, command string) (DanmakuEvent, bool, error) {
+	var data struct {
+		UID            flexibleID    `json:"uid"`
+		Uname          string        `json:"uname"`
+		GiftName       string        `json:"gift_name"`
+		GiftNum        flexibleInt64 `json:"gift_num"`
+		ComboNum       flexibleInt64 `json:"combo_num"`
+		BatchComboNum  flexibleInt64 `json:"batch_combo_num"`
+		BatchComboID   string        `json:"batch_combo_id"`
+		ComboTotalCoin flexibleInt64 `json:"combo_total_coin"`
+		Action         string        `json:"action"`
+		MedalInfo      struct {
+			MedalName  string        `json:"medal_name"`
+			MedalLevel flexibleInt64 `json:"medal_level"`
+			GuardLevel flexibleInt64 `json:"guard_level"`
+		} `json:"medal_info"`
+	}
+	if err := json.Unmarshal(raw, &data); err != nil {
+		return DanmakuEvent{}, false, fmt.Errorf("解析连击消息失败: %w", err)
+	}
+	giftName := strings.TrimSpace(data.GiftName)
+	if giftName == "" {
+		return DanmakuEvent{}, false, nil
+	}
+	combo := int(data.BatchComboNum)
+	if combo <= 0 {
+		combo = int(data.ComboNum)
+	}
+	count := int(data.GiftNum)
+	if count <= 0 {
+		count = 1
+	}
+	action := strings.TrimSpace(data.Action)
+	if action == "" {
+		action = "投喂"
+	}
+	var details []string
+	if data.ComboTotalCoin > 0 {
+		battery := int64(data.ComboTotalCoin) / 100
+		if battery > 0 {
+			details = append(details, fmt.Sprintf("%d电池", battery))
+		}
+	}
+	if combo > 1 {
+		details = append(details, fmt.Sprintf("连击x%d", combo))
+	}
+	detailText := ""
+	if len(details) > 0 {
+		detailText = fmt.Sprintf(" (%s)", strings.Join(details, " · "))
+	}
+	text := fmt.Sprintf("%s %s ×%d%s", action, giftName, count, detailText)
+	return DanmakuEvent{
+		Kind:    DanmakuEventGift,
+		Command: command,
+		Message: DanmakuMessage{
+			Username:      strings.TrimSpace(data.Uname),
+			UserID:        string(data.UID),
+			Text:          text,
+			GiftName:      giftName,
+			GiftCount:     count,
+			GiftAction:    action,
+			GiftTotalCoin: int64(data.ComboTotalCoin),
+			GiftCombo:     combo,
+			BatchComboID:  strings.TrimSpace(data.BatchComboID),
+			MedalName:     strings.TrimSpace(data.MedalInfo.MedalName),
+			MedalLevel:    int(data.MedalInfo.MedalLevel),
+			GuardLevel:    int(data.MedalInfo.GuardLevel),
+			Timestamp:     time.Now(),
+		},
+	}, true, nil
 }
 
 func parseSuperChat(raw json.RawMessage, command string) (DanmakuEvent, bool, error) {
@@ -1640,8 +1774,10 @@ func (c *Client) SendDanmakuWithLimit(ctx context.Context, roomID, sessdata, bil
 	headers.Set("Referer", "https://live.bilibili.com/"+strings.TrimSpace(roomID))
 	headers.Set("Origin", "https://live.bilibili.com")
 	headers.Set("User-Agent", biliBrowserUserAgent)
-	if err := c.postFormWithHeaders(ctx, path, params, &result, headers); err != nil {
-		return err
+	headers.Set("Accept", "application/json")
+	sendErr := c.postFormWithHeaders(ctx, path, params, &result, headers)
+	if sendErr != nil {
+		return fmt.Errorf("%w: %w", ErrDanmakuDeliveryUnknown, sendErr)
 	}
 	if isProhibitedDanmakuResponse(result.Code, result.Message, result.Msg) {
 		return ErrDanmakuProhibited
@@ -1657,6 +1793,15 @@ func (c *Client) SendDanmakuWithLimit(ctx context.Context, roomID, sessdata, bil
 		return fmt.Errorf("B 站拒绝发送（错误码 %d）：%s", result.Code, message)
 	}
 	return nil
+}
+
+// ErrDanmakuDeliveryUnknown 表示请求过程中断，无法判断 B 站是否已经收到弹幕。
+// 调用方不应自动重试，否则响应丢失时可能发送出重复内容。
+var ErrDanmakuDeliveryUnknown = errors.New("无法确认弹幕是否已发送")
+
+// IsDanmakuDeliveryUnknown 判断发送结果是否因连接中断而无法确认。
+func IsDanmakuDeliveryUnknown(err error) bool {
+	return errors.Is(err, ErrDanmakuDeliveryUnknown)
 }
 
 // ErrDanmakuShielded 表示弹幕被 B 站拦截，可能包含屏蔽词。
