@@ -36,8 +36,10 @@ const (
 )
 
 type roomManagerTab struct {
-	label string
-	load  func()
+	label      string
+	actionMode string
+	page       *int // 非分页栏目为 nil，栏目切换时重置为第一页。
+	load       func()
 }
 
 type roomManagerWorkspace struct {
@@ -455,7 +457,7 @@ func (w *roomManagerWorkspace) showTableView() {
 }
 
 func (w *roomManagerWorkspace) showEmptyView(message string) {
-	w.loading = (message == "正在加载……")
+	w.loading = false
 	w.inputVisible = false
 	emptyContent := fmt.Sprintf("[%s::b]%s[-:-:-]",
 		tview.Styles.PrimaryTextColor.String(),
@@ -468,7 +470,7 @@ func (w *roomManagerWorkspace) showEmptyView(message string) {
 	}
 }
 
-func (w *roomManagerWorkspace) showLoading(_ string) uint64 {
+func (w *roomManagerWorkspace) showLoading() uint64 {
 	w.generation++
 	generation := w.generation
 	w.retryAction = nil
@@ -477,6 +479,7 @@ func (w *roomManagerWorkspace) showLoading(_ string) uint64 {
 	w.updateActionBar("default")
 	w.section.SetText("[" + mutedColor.String() + "]正在加载……[-]")
 	w.showEmptyView("正在加载……")
+	w.loading = true
 	return generation
 }
 
@@ -496,7 +499,7 @@ func (w *roomManagerWorkspace) showError(generation uint64, title string, err er
 	if strings.HasSuffix(title, "失败") {
 		cardTitle = title
 	}
-	w.setNotice(cardTitle+"："+compactDanmakuManagementError(err), true)
+	w.setNotice(cardTitle+"："+err.Error(), true)
 	errCard := fmt.Sprintf("[%s::b]%s[-:-:-]\n\n[%s]%s[-]",
 		errorColor.String(),
 		tview.Escape(cardTitle),
@@ -512,13 +515,17 @@ func (w *roomManagerWorkspace) showError(generation uint64, title string, err er
 
 func (w *roomManagerWorkspace) runAction() {
 	action := w.pendingAction
+	if action == nil {
+		return
+	}
 	label := w.pendingLabel
+	reload := w.reload
 	w.pendingAction = nil
 	w.confirmVisible = false
 	w.deps.Pages.HidePage("room-manager-confirm")
 	w.focusContentAfterLoad = true
 	w.deps.App.SetFocus(w.navigation)
-	generation := w.showLoading(label)
+	generation := w.showLoading()
 	w.setNotice("正在"+label+"……", false)
 	go func() {
 		requestCtx, cancelRequest := context.WithTimeout(w.deps.Context, 10*time.Second)
@@ -526,16 +533,27 @@ func (w *roomManagerWorkspace) runAction() {
 		err := action(requestCtx)
 		w.deps.QueueUI(func() {
 			if !w.visible || generation != w.generation {
+				// 只丢弃过期的页面更新，不能丢弃已经提交到服务器的操作结果。
+				// 不重载用户新打开的栏目，也不抢走当前焦点。
+				message := label + "成功"
+				if err != nil {
+					message = label + "失败：" + err.Error()
+				}
+				if w.visible {
+					w.setNotice(message, err != nil)
+				} else {
+					w.deps.Status.SetText(tview.Escape(strings.Join(strings.Fields(message), " ")))
+				}
 				return
 			}
 			if err != nil {
 				w.setNotice(label+"失败："+err.Error(), true)
-				w.showError(generation, label, err, w.reload)
+				w.showError(generation, label, err, reload)
 				return
 			}
 			w.setNotice(label+"成功。", false)
-			if w.reload != nil {
-				w.reload()
+			if reload != nil {
+				reload()
 			} else {
 				w.showRoot()
 			}
@@ -594,81 +612,47 @@ func (w *roomManagerWorkspace) returnToList() {
 }
 
 func (w *roomManagerWorkspace) prevPage() {
-	if !w.canPrevPage || len(w.tabs) == 0 || w.tabIndex >= len(w.tabs) {
-		return
-	}
-	switch w.tabs[w.tabIndex].label {
-	case "房管":
-		if w.adminPage > 1 {
-			w.focusContentAfterLoad = true
-			w.adminPage--
-			w.loadAdmins()
-		}
-	case "禁言":
-		if w.mutedPage > 1 {
-			w.focusContentAfterLoad = true
-			w.mutedPage--
-			w.loadMutedUsers()
-		}
-	case "黑名单":
-		if w.blacklistPage > 1 {
-			w.focusContentAfterLoad = true
-			w.blacklistPage--
-			w.loadBlacklistedUsers()
-		}
-	}
+	w.changePage(-1)
 }
 
 func (w *roomManagerWorkspace) nextPage() {
-	if !w.canNextPage || len(w.tabs) == 0 || w.tabIndex >= len(w.tabs) {
+	w.changePage(1)
+}
+
+func (w *roomManagerWorkspace) changePage(delta int) {
+	if w.loading || w.tabIndex < 0 || w.tabIndex >= len(w.tabs) {
 		return
 	}
-	switch w.tabs[w.tabIndex].label {
-	case "房管":
-		if w.adminPage < w.adminTotalPages {
-			w.focusContentAfterLoad = true
-			w.adminPage++
-			w.loadAdmins()
-		}
-	case "禁言":
-		if w.mutedPage < w.mutedTotalPages {
-			w.focusContentAfterLoad = true
-			w.mutedPage++
-			w.loadMutedUsers()
-		}
-	case "黑名单":
-		if w.canNextPage {
-			w.focusContentAfterLoad = true
-			w.blacklistPage++
-			w.loadBlacklistedUsers()
-		}
+	if delta != -1 && delta != 1 {
+		return
 	}
+	if (delta < 0 && !w.canPrevPage) || (delta > 0 && !w.canNextPage) {
+		return
+	}
+	tab := w.tabs[w.tabIndex]
+	if tab.page == nil || *tab.page+delta < 1 {
+		return
+	}
+	w.focusContentAfterLoad = true
+	*tab.page += delta
+	tab.load()
 }
 
 func (w *roomManagerWorkspace) showRoot() {
 	w.tabs = w.tabs[:0]
 	if w.capabilities.IsAnchor {
-		w.tabs = append(w.tabs, roomManagerTab{label: "房管", load: func() {
-			w.adminPage = 1
-			w.loadAdmins()
-		}})
+		w.tabs = append(w.tabs, roomManagerTab{label: "房管", actionMode: "admin", page: &w.adminPage, load: w.loadAdmins})
 	}
 	if w.capabilities.CanMute(0) {
-		w.tabs = append(w.tabs, roomManagerTab{label: "禁言", load: func() {
-			w.mutedPage = 1
-			w.loadMutedUsers()
-		}})
+		w.tabs = append(w.tabs, roomManagerTab{label: "禁言", actionMode: "mute", page: &w.mutedPage, load: w.loadMutedUsers})
 	}
 	if w.capabilities.IsAnchor {
-		w.tabs = append(w.tabs, roomManagerTab{label: "全局禁言", load: w.loadRoomSilent})
+		w.tabs = append(w.tabs, roomManagerTab{label: "全局禁言", actionMode: "default", load: w.loadRoomSilent})
 	}
 	if w.capabilities.CanBlacklist(0) && w.capabilities.AnchorID != "" {
-		w.tabs = append(w.tabs, roomManagerTab{label: "黑名单", load: func() {
-			w.blacklistPage = 1
-			w.loadBlacklistedUsers()
-		}})
+		w.tabs = append(w.tabs, roomManagerTab{label: "黑名单", actionMode: "blacklist", page: &w.blacklistPage, load: w.loadBlacklistedUsers})
 	}
-	w.tabs = append(w.tabs, roomManagerTab{label: "屏蔽词", load: w.loadKeywords})
+	w.tabs = append(w.tabs, roomManagerTab{label: "屏蔽词", actionMode: "keyword", load: w.loadKeywords})
 	if w.tabIndex >= len(w.tabs) {
 		w.tabIndex = 0
 	}
@@ -695,17 +679,9 @@ func (w *roomManagerWorkspace) selectTab(index int) {
 	w.navigation.SetCurrentItem(index)
 	w.navSyncing = false
 	tab := w.tabs[index]
-	switch tab.label {
-	case "房管":
-		w.baseActionMode = "admin"
-	case "禁言":
-		w.baseActionMode = "mute"
-	case "黑名单":
-		w.baseActionMode = "blacklist"
-	case "屏蔽词":
-		w.baseActionMode = "keyword"
-	default:
-		w.baseActionMode = "default"
+	w.baseActionMode = tab.actionMode
+	if tab.page != nil {
+		*tab.page = 1
 	}
 	w.canPrevPage = false
 	w.canNextPage = false

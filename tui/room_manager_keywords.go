@@ -10,7 +10,7 @@ import (
 
 func (w *roomManagerWorkspace) loadKeywords() {
 	w.baseActionMode = "keyword"
-	generation := w.showLoading("屏蔽词")
+	generation := w.showLoading()
 	w.reload = w.loadKeywords
 	go func() {
 		ctx, cancel := context.WithTimeout(w.deps.Context, 10*time.Second)
@@ -42,7 +42,7 @@ func (w *roomManagerWorkspace) loadKeywords() {
 				}
 				row := index + 1
 				w.tableActions[row] = action
-				w.table.SetCell(row, 0, roomManagerTableTextCell(keyword, 34, 2))
+				w.table.SetCell(row, 0, roomManagerTableTextCell(tview.Escape(keyword), 34, 2))
 				w.table.SetCell(row, 1, roomManagerTableActionCell("删除", errorColor, action))
 			}
 			if len(result.Keywords) == 0 {

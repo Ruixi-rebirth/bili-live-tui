@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -50,6 +51,49 @@ func TestConfigureAndResolveExecutablePath(t *testing.T) {
 	}
 	if filepath.Clean(resolved) != filepath.Clean(configured) {
 		t.Fatalf("resolved path = %q, configured = %q", resolved, configured)
+	}
+}
+
+func TestConfigureExecutablePathAcceptsNullConfig(t *testing.T) {
+	if runtime.GOOS != "linux" && runtime.GOOS != "windows" {
+		t.Skip("configuration isolation uses XDG_CONFIG_HOME or APPDATA")
+	}
+	configDir := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", configDir)
+	t.Setenv("APPDATA", configDir)
+	path, err := executablePathsFilePath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteJSONAtomically(path, nil); err != nil {
+		t.Fatal(err)
+	}
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ConfigureExecutablePath("test-tool", "测试工具", executable); err != nil {
+		t.Fatalf("cannot configure an executable after reading JSON null: %v", err)
+	}
+	paths, err := loadExecutablePaths()
+	if err != nil || paths["test-tool"] != executable {
+		t.Fatalf("configured paths = %v, error = %v", paths, err)
+	}
+}
+
+func TestResolvingExecutableDoesNotCreateConfigDirectory(t *testing.T) {
+	if runtime.GOOS != "linux" && runtime.GOOS != "windows" {
+		t.Skip("configuration isolation uses XDG_CONFIG_HOME or APPDATA")
+	}
+	configDir := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", configDir)
+	t.Setenv("APPDATA", configDir)
+	_, err := ResolveExecutable("missing-tool", "缺失工具", "definitely-missing-tool")
+	if !errors.Is(err, ErrExecutableNotFound) {
+		t.Fatalf("expected configurable missing executable error: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(configDir, "bili-live-tui")); !os.IsNotExist(err) {
+		t.Fatalf("read-only executable lookup created a directory: %v", err)
 	}
 }
 
