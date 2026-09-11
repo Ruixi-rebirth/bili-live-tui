@@ -14,7 +14,7 @@ import (
 
 func ensureRoomCanStart(snapshot api.RoomSnapshot) error {
 	if snapshot.LiveStatus == 1 {
-		return fmt.Errorf("检测到直播间已经开播，请先下播后再开始（可使用 bili-live-tui --stop 一键下播）")
+		return fmt.Errorf("检测到直播间已经开播，请先下播后再开始（可使用 bili-live-tui stop 一键下播）")
 	}
 	return nil
 }

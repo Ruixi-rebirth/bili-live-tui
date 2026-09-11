@@ -2,6 +2,7 @@ package tui
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"strings"
@@ -85,5 +86,152 @@ loaded:
 		case <-deadline:
 			t.Fatalf("search results did not receive focus: %T", app.GetFocus())
 		}
+	}
+}
+
+// 测试显式执行 UI 队列，避免用睡眠猜测网络回调和页面切换的先后顺序。
+func newManagementTestWorkspace(t *testing.T) (*roomManagerWorkspace, <-chan func()) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	updates := make(chan func(), 16)
+	app := tview.NewApplication()
+	pages := tview.NewPages().AddPage("main", tview.NewBox(), true, true)
+	w := newRoomManagerWorkspace(roomManagerDependencies{
+		Context: ctx, App: app, Pages: pages,
+		Capabilities: func() api.RoomManagementCapabilities { return api.RoomManagementCapabilities{} },
+		QueueUI: func(f func()) {
+			select {
+			case updates <- f:
+			case <-ctx.Done():
+			}
+		},
+		Status: tview.NewTextView().SetDynamicColors(true), ReturnToChat: func() {}, Quit: func() {},
+	})
+	w.visible = true
+	pages.SwitchToPage("room-manager")
+	app.SetFocus(w.navigation)
+	return w, updates
+}
+
+func applyManagementTestUpdate(t *testing.T, updates <-chan func()) {
+	t.Helper()
+	select {
+	case update := <-updates:
+		update()
+	case <-time.After(3 * time.Second):
+		t.Fatal("room manager did not submit a UI update")
+	}
+}
+
+func TestRoomManagerLoadingDoesNotDependOnCopy(t *testing.T) {
+	w, _ := newManagementTestWorkspace(t)
+	w.showLoading()
+	if !w.loading {
+		t.Fatal("loading state was not set")
+	}
+	w.showEmptyView("正在加载……")
+	if w.loading {
+		t.Fatal("display text was interpreted as a loading state")
+	}
+	w.focusContent()
+	if w.deps.App.GetFocus() != w.backButton {
+		t.Fatal("empty state did not allow focusing the return button")
+	}
+}
+
+func TestRoomManagerTabBehaviorDoesNotDependOnLabel(t *testing.T) {
+	w, _ := newManagementTestWorkspace(t)
+	page, loads := 7, 0
+	w.tabs = []roomManagerTab{{label: "任意新名称", actionMode: "keyword", page: &page, load: func() { loads++ }}}
+	w.navigation.AddItem(w.tabs[0].label, "", 0, nil)
+	w.selectTab(0)
+	if page != 1 || loads != 1 || w.baseActionMode != "keyword" || w.currentButtons[0] != w.addKeywordButton {
+		t.Fatalf("tab metadata was not applied: page=%d loads=%d mode=%q", page, loads, w.baseActionMode)
+	}
+	w.canNextPage = true
+	w.nextPage()
+	if page != 2 || loads != 2 {
+		t.Fatalf("pagination depends on label: page=%d loads=%d", page, loads)
+	}
+	w.canPrevPage = true
+	w.prevPage()
+	if page != 1 || loads != 3 {
+		t.Fatalf("previous page failed: page=%d loads=%d", page, loads)
+	}
+	w.prevPage()
+	w.canNextPage = false
+	w.nextPage()
+	w.canNextPage = true
+	w.loading = true
+	w.nextPage()
+	if page != 1 || loads != 3 {
+		t.Fatal("out-of-range or loading pagination was accepted")
+	}
+}
+
+func TestRoomManagerActionReportsResultAfterNavigation(t *testing.T) {
+	for _, location := range []string{"another_tab", "chat"} {
+		for _, result := range []string{"success", "failure"} {
+			t.Run(location+"_"+result, func(t *testing.T) {
+				w, updates := newManagementTestWorkspace(t)
+				w.pendingLabel = "添加禁言用户"
+				w.pendingAction = func(context.Context) error {
+					if result == "failure" {
+						return errors.New("服务器拒绝请求")
+					}
+					return nil
+				}
+				w.reload = func() { t.Fatal("old operation reloaded a page after navigation") }
+				w.runAction()
+				if location == "chat" {
+					w.close()
+				} else {
+					w.showLoading()
+					w.setNotice("", false)
+				}
+				focused := tview.NewInputField()
+				w.deps.App.SetFocus(focused)
+				applyManagementTestUpdate(t, updates)
+				if w.deps.App.GetFocus() != focused {
+					t.Fatal("completed operation stole focus")
+				}
+				message := w.notice.GetText(true)
+				if location == "chat" {
+					message = w.deps.Status.GetText(true)
+				}
+				want := "添加禁言用户成功"
+				if result == "failure" {
+					want = "添加禁言用户失败：服务器拒绝请求"
+				}
+				if message != want {
+					t.Fatalf("operation feedback = %q, want %q", message, want)
+				}
+			})
+		}
+	}
+}
+
+func TestRoomManagerKeywordsEscapeTerminalMarkup(t *testing.T) {
+	w, updates := newManagementTestWorkspace(t)
+	w.deps.RoomID = "1"
+	w.deps.Sessdata = "test-session"
+	w.deps.BiliJCT = "test-csrf"
+	w.deps.Client = api.NewClient(&http.Client{Transport: managementTestTransport(func(*http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: 200, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{"code":0,"data":{"keyword_list":[{"keyword":"[red]测试"}]}}`))}, nil
+	})})
+	w.loadKeywords()
+	applyManagementTestUpdate(t, updates)
+	if got := w.table.GetCell(1, 0).Text; got != tview.Escape("[red]测试") {
+		t.Fatalf("keyword is interpreted as terminal markup: %q", got)
+	}
+}
+
+func TestRoomManagerErrorNoticeEscapesOnlyOnce(t *testing.T) {
+	w, _ := newManagementTestWorkspace(t)
+	generation := w.showLoading()
+	w.showError(generation, "加载", errors.New("[red]错误[-]"), nil)
+	if got := w.notice.GetText(true); got != "加载 失败：[red]错误[-]" {
+		t.Fatalf("error notice contains extra escape markers: %q", got)
 	}
 }

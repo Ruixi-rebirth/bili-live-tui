@@ -174,6 +174,10 @@ func readExecutablePathsUnlocked() (map[string]string, error) {
 		}
 		return nil, err
 	}
+	// JSON null 会把初始化好的 map 重新置空，后续手动配置仍应能够写入。
+	if paths == nil {
+		paths = make(map[string]string)
+	}
 	return paths, nil
 }
 
@@ -190,9 +194,6 @@ func executablePathsFilePath() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	directory := filepath.Join(configRoot, "bili-live-tui")
-	if err := os.MkdirAll(directory, 0o700); err != nil {
-		return "", err
-	}
-	return filepath.Join(directory, executablePathsFileName), nil
+	// 仅计算路径。创建目录由原子写入负责，查找执行文件不应产生落盘副作用。
+	return filepath.Join(configRoot, "bili-live-tui", executablePathsFileName), nil
 }

@@ -103,6 +103,7 @@ func newRootCmd() *cobra.Command {
 集开播设置、自动联动、实时弹幕与房管治理于一体。`,
 		SilenceUsage:  true,
 		SilenceErrors: true,
+		Args:          cobra.NoArgs,
 		PreRun: func(cmd *cobra.Command, args []string) {
 			allNoColor := noColorFlag || os.Getenv("NO_COLOR") != ""
 			tui.SetNoColor(allNoColor)
@@ -114,11 +115,12 @@ func newRootCmd() *cobra.Command {
 
 	rootCmd.SetUsageTemplate(localizedUsageTemplate)
 	rootCmd.Flags().BoolVar(&noColorFlag, "no-color", false, "禁用界面颜色高亮")
-	rootCmd.Flags().BoolVar(&onceFlag, "once", false, "单次会话模式：不读取本地已有凭据与设置，也绝不保存任何数据到本地")
+	rootCmd.Flags().BoolVar(&onceFlag, "once", false, "单次会话模式：不读取或保存登录凭据与开播设置，不写诊断日志")
 
 	statusCmd := &cobra.Command{
 		Use:   "status",
-		Short: "查看当前直播间开播状态与推流状态",
+		Short: "查看 B 站直播间的资料与开播状态",
+		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runStatus(cmd.Context())
 		},
@@ -126,7 +128,8 @@ func newRootCmd() *cobra.Command {
 
 	stopCmd := &cobra.Command{
 		Use:   "stop",
-		Short: "一键向 B 站发送下播请求并停止推流",
+		Short: "向 B 站发送下播请求（不直接控制其他进程的推流）",
+		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runStop(cmd.Context())
 		},
@@ -135,6 +138,7 @@ func newRootCmd() *cobra.Command {
 	logoutCmd := &cobra.Command{
 		Use:   "logout",
 		Short: "退出登录并清除本机保存的凭据",
+		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runLogout()
 		},
@@ -147,105 +151,6 @@ func newRootCmd() *cobra.Command {
 	localizeCommand(rootCmd)
 
 	return rootCmd
-}
-
-func runLogout() error {
-	removed, err := config.RemoveAuth()
-	if err != nil {
-		return fmt.Errorf("清除本地凭证失败: %w", err)
-	}
-	if removed {
-		fmt.Println("✅ 已成功退出登录并清除本机凭据")
-	} else {
-		fmt.Println("本地未发现已保存的登录凭据，当前处于未登录状态")
-	}
-	return nil
-}
-
-type appContext struct {
-	client        *api.Client
-	auth          *config.AuthData
-	roomID        string
-	diagnosticLog *diagnostics.Logger
-}
-
-func initAppContext(ctx context.Context, persist bool) (*appContext, error) {
-	diagnosticLog, _ := diagnostics.Open()
-	if diagnosticLog != nil {
-		diagnosticLog.Printf("程序启动")
-	}
-
-	client := api.NewClient(nil)
-	var auth *config.AuthData
-	var err error
-	if persist {
-		auth, err = config.LoadAuth()
-	}
-	if !persist || err != nil {
-		auth, err = performLogin(ctx, persist)
-		if err != nil {
-			if !errors.Is(err, context.Canceled) {
-				if diagnosticLog != nil {
-					diagnosticLog.Printf("扫码登录失败: %v", err)
-				}
-				return nil, fmt.Errorf("登录失败: %w", err)
-			}
-			return nil, err
-		}
-	}
-
-	roomID, err := client.GetMyRoomID(ctx, auth.SESSDATA)
-	if err != nil && isAuthenticationError(err) {
-		fmt.Println("登录凭证已失效，请重新扫码登录")
-		auth, err = performLogin(ctx, persist)
-		if err != nil {
-			if !errors.Is(err, context.Canceled) {
-				if diagnosticLog != nil {
-					diagnosticLog.Printf("重新登录失败: %v", err)
-				}
-				return nil, fmt.Errorf("重新登录失败: %w", err)
-			}
-			return nil, err
-		}
-		roomID, err = client.GetMyRoomID(ctx, auth.SESSDATA)
-	}
-	if err != nil {
-		if diagnosticLog != nil {
-			diagnosticLog.Printf("获取房间号失败: %v", err)
-		}
-		return nil, fmt.Errorf("获取房间号失败: %w", err)
-	}
-
-	return &appContext{
-		client:        client,
-		auth:          auth,
-		roomID:        roomID,
-		diagnosticLog: diagnosticLog,
-	}, nil
-}
-
-func runStatus(ctx context.Context) error {
-	app, err := initAppContext(ctx, true)
-	if err != nil {
-		return err
-	}
-	if app.diagnosticLog != nil {
-		defer app.diagnosticLog.Close()
-	}
-	handleStatusAction(ctx, app.client, app.roomID)
-	return nil
-}
-
-func runStop(ctx context.Context) error {
-	app, err := initAppContext(ctx, true)
-	if err != nil {
-		return err
-	}
-	if app.diagnosticLog != nil {
-		defer app.diagnosticLog.Close()
-	}
-	handleStopAction(app.client, app.roomID, app.auth.AccessToken, app.diagnosticLog)
-	return nil
 }
 
 func main() {
@@ -446,7 +351,7 @@ func runTUI(ctx context.Context, persist bool) error {
 			detail = "未返回详细原因"
 		}
 		diagnosticLog.Printf("本地推流意外停止: %s", detail)
-		fmt.Fprintf(os.Stderr, "本地推流已意外断开（%s）。\n程序未自动调用 B 站下播接口，直播间当前状态请以 B 站为准。重新开播前请确认没有其他客户端正在推流，若需下播请执行 bili-live-tui --stop\n", detail)
+		fmt.Fprintf(os.Stderr, "本地推流已意外断开（%s）。\n程序未自动调用 B 站下播接口，直播间当前状态请以 B 站为准。重新开播前请确认没有其他客户端正在推流，若需下播请执行 bili-live-tui stop\n", detail)
 	}
 
 	if liveStream != nil {
@@ -471,39 +376,6 @@ func stopLiveSync(client *api.Client, roomID, accessToken string) error {
 	stopCtx, cancelStop := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancelStop()
 	return client.StopLive(stopCtx, roomID, accessToken)
-}
-
-func handleStatusAction(ctx context.Context, client *api.Client, roomID string) {
-	snapshot, err := client.GetRoomSnapshot(ctx, roomID)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "获取房间状态失败: %v\n", err)
-		return
-	}
-	statusText := "未开播"
-	var extraStatus string
-	if snapshot.LiveStatus == 1 {
-		statusText = "开播中 🔴"
-		if !snapshot.LiveTime.IsZero() {
-			duration := time.Since(snapshot.LiveTime).Truncate(time.Second)
-			extraStatus = fmt.Sprintf("开播时间: %s\n已播时长: %s\n", snapshot.LiveTime.Format("2006-01-02 15:04:05"), duration)
-		}
-	}
-	fmt.Printf("直播间号: %s\n房间标题: %s\n直播分区: %s\n当前状态: %s\n%s", roomID, snapshot.Title, snapshot.AreaName, statusText, extraStatus)
-}
-
-func handleStopAction(client *api.Client, roomID string, accessToken string, logger *diagnostics.Logger) {
-	fmt.Printf("正在向 B 站请求结束房间 %s 的直播……\n", roomID)
-	if err := stopLiveSync(client, roomID, accessToken); err != nil {
-		if logger != nil {
-			logger.Printf("命令行下播失败: %v", err)
-		}
-		fmt.Fprintf(os.Stderr, "下播失败: %v\n", err)
-		return
-	}
-	if logger != nil {
-		logger.Printf("命令行下播成功 room=%s", roomID)
-	}
-	fmt.Printf("✅ 直播间 %s 已成功下播！\n", roomID)
 }
 
 func handleLiveTakeover(

@@ -11,7 +11,7 @@ import (
 )
 
 func (w *roomManagerWorkspace) loadAdmins() {
-	generation := w.showLoading("房管")
+	generation := w.showLoading()
 	w.reload = w.loadAdmins
 	requestedPage := w.adminPage
 	if !w.seniorAdminKnown && !w.seniorAdminLoading && strings.TrimSpace(w.capabilities.AnchorID) != "" {
@@ -100,7 +100,7 @@ func (w *roomManagerWorkspace) loadAdmins() {
 }
 
 func (w *roomManagerWorkspace) loadMutedUsers() {
-	generation := w.showLoading("禁言名单")
+	generation := w.showLoading()
 	w.reload = w.loadMutedUsers
 	requestedPage := w.mutedPage
 	go func() {
@@ -180,7 +180,7 @@ func (w *roomManagerWorkspace) loadMutedUsers() {
 }
 
 func (w *roomManagerWorkspace) loadBlacklistedUsers() {
-	generation := w.showLoading("直播间黑名单")
+	generation := w.showLoading()
 	w.reload = w.loadBlacklistedUsers
 	requestedPage, anchorID := w.blacklistPage, w.capabilities.AnchorID
 	go func() {
@@ -248,7 +248,7 @@ func (w *roomManagerWorkspace) loadBlacklistedUsers() {
 func (w *roomManagerWorkspace) loadRoomSilent() {
 	w.triggerCloseRoomSilent = nil
 	w.baseActionMode = "default"
-	generation := w.showLoading("全局禁言")
+	generation := w.showLoading()
 	w.reload = w.loadRoomSilent
 	go func() {
 		requestCtx, cancelRequest := context.WithTimeout(w.deps.Context, 10*time.Second)
@@ -361,7 +361,7 @@ func (w *roomManagerWorkspace) searchUsers(operation roomManagerUserOperation, q
 	w.searchOp = operation
 	w.searchQuery = query
 	w.focusContentAfterLoad = true
-	generation := w.showLoading("查找用户")
+	generation := w.showLoading()
 	w.section.SetText(fmt.Sprintf("[%s]正在查找 %s……[-]", mutedColor.String(), tview.Escape(query)))
 	w.setFlowBack("返回列表", w.returnToList, false)
 	go func() {
@@ -374,7 +374,7 @@ func (w *roomManagerWorkspace) searchUsers(operation roomManagerUserOperation, q
 			}
 			if err != nil {
 				w.section.SetText(fmt.Sprintf("[%s]查找失败[-]", errorColor.String()))
-				w.setNotice(compactDanmakuManagementError(err), true)
+				w.setNotice(err.Error(), true)
 				w.showEmptyView("未能完成用户查找")
 				w.setFlowBack("返回列表", w.returnToList, true)
 				w.restoreFocusAfterLoad()
