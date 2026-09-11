@@ -528,7 +528,7 @@ func (d *autoOpenDropDown) Focus(delegate func(tview.Primitive)) {
 // 远程地址在提交阶段下载，本地文件在表单内提前校验。
 // 这样可以尽早给出明确错误，避免房间资料已修改后才失败。
 func validateCoverInput(value string, hasExistingCover bool) error {
-	value = strings.TrimSpace(value)
+	value = normalizeCoverPath(value)
 	if value == "" {
 		if hasExistingCover {
 			return nil
@@ -543,7 +543,7 @@ func validateCoverInput(value string, hasExistingCover bool) error {
 		return nil
 	}
 
-	path := normalizeCoverPath(value)
+	path := value
 	info, err := os.Stat(path)
 	if err != nil {
 		return fmt.Errorf("找不到直播封面文件：%s", path)
@@ -566,6 +566,12 @@ func validateCoverInput(value string, hasExistingCover bool) error {
 
 func normalizeCoverPath(value string) string {
 	value = strings.TrimSpace(value)
+	if len(value) >= 2 {
+		first, last := value[0], value[len(value)-1]
+		if (first == '"' && last == '"') || (first == '\'' && last == '\'') {
+			value = strings.TrimSpace(value[1 : len(value)-1])
+		}
+	}
 	if value == "~" || strings.HasPrefix(value, "~/") || strings.HasPrefix(value, `~\`) {
 		if home, err := os.UserHomeDir(); err == nil {
 			if value == "~" {

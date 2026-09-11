@@ -584,3 +584,21 @@ func TestStartLiveButtonArrowNavigation(t *testing.T) {
 		t.Fatalf("Left arrow on cancelButton did not focus startButton: got %v focus %v", got, app.GetFocus())
 	}
 }
+
+func TestNormalizeCoverPath(t *testing.T) {
+	tests := []struct {
+		input string
+		want  string
+	}{
+		{`"C:\Users\test\Desktop\cover.jpg"`, `C:\Users\test\Desktop\cover.jpg`},
+		{`'C:\Users\test\Desktop\cover.jpg'`, `C:\Users\test\Desktop\cover.jpg`},
+		{`  "/home/user/cover.png"  `, `/home/user/cover.png`},
+		{`https://example.com/cover.jpg`, `https://example.com/cover.jpg`},
+		{`"https://example.com/cover.jpg"`, `https://example.com/cover.jpg`},
+	}
+	for _, tc := range tests {
+		if got := normalizeCoverPath(tc.input); got != tc.want {
+			t.Errorf("normalizeCoverPath(%q) = %q, want %q", tc.input, got, tc.want)
+		}
+	}
+}
