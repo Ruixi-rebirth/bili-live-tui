@@ -86,6 +86,10 @@ func localizeCommand(cmd *cobra.Command) {
 }
 
 func newRootCmd() *cobra.Command {
+	// 默认命令会启动交互式 TUI，允许 Windows 用户从资源管理器双击运行。
+	// 必须在 Execute 前关闭 Cobra 的 Explorer 拦截，不能放到 RunE 中。
+	cobra.MousetrapHelpText = ""
+
 	var (
 		noColorFlag bool
 		onceFlag    bool
